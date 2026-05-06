@@ -280,19 +280,44 @@ StmtPtr ReplaceDirectCall(const StmtPtr& stmt, const CallPtr& new_call) {
 
 bool ExprIsScalar(const ExprPtr& expr) { return expr && As<ScalarType>(expr->GetType()) != nullptr; }
 
-bool BranchIsScalarYieldOnly(const StmtPtr& stmt) {
-  auto yield = As<YieldStmt>(stmt);
-  if (!yield) {
-    auto seq = As<SeqStmts>(stmt);
-    if (!seq || seq->stmts_.size() != 1) {
-      return false;
-    }
-    yield = As<YieldStmt>(seq->stmts_[0]);
-  }
-  if (!yield || yield->value_.size() != 1) {
+bool IsScalarOnlyBranchPrefixStmt(const StmtPtr& stmt) {
+  if (As<ForStmt>(stmt) || As<WhileStmt>(stmt) || As<IfStmt>(stmt) || As<ScopeStmt>(stmt) || As<ReturnStmt>(stmt) ||
+      As<YieldStmt>(stmt)) {
     return false;
   }
-  return ExprIsScalar(yield->value_[0]);
+
+  if (auto call = GetDirectCall(stmt)) {
+    return IsBuiltinOp(call->op_->name_) && ExprIsScalar(call);
+  }
+
+  if (auto assign = As<AssignStmt>(stmt)) {
+    return As<ScalarType>(assign->var_->GetType()) != nullptr && ExprIsScalar(assign->value_);
+  }
+
+  if (auto eval = As<EvalStmt>(stmt)) {
+    return ExprIsScalar(eval->expr_);
+  }
+
+  return true;
+}
+
+bool BranchEndsWithScalarYield(const StmtPtr& stmt) {
+  auto yield = As<YieldStmt>(stmt);
+  if (yield) {
+    return yield->value_.size() == 1 && ExprIsScalar(yield->value_[0]);
+  }
+
+  auto seq = As<SeqStmts>(stmt);
+  if (!seq || seq->stmts_.empty()) {
+    return false;
+  }
+  for (size_t i = 0; i + 1 < seq->stmts_.size(); ++i) {
+    if (!IsScalarOnlyBranchPrefixStmt(seq->stmts_[i])) {
+      return false;
+    }
+  }
+  auto trailing_yield = As<YieldStmt>(seq->stmts_.back());
+  return trailing_yield && trailing_yield->value_.size() == 1 && ExprIsScalar(trailing_yield->value_[0]);
 }
 
 bool IsSupportedFlagIfStmt(const IfStmtPtr& if_stmt) {
@@ -302,7 +327,7 @@ bool IsSupportedFlagIfStmt(const IfStmtPtr& if_stmt) {
   if (!As<ScalarType>(if_stmt->return_vars_[0]->GetType())) {
     return false;
   }
-  return BranchIsScalarYieldOnly(if_stmt->then_body_) && BranchIsScalarYieldOnly(*if_stmt->else_body_);
+  return BranchEndsWithScalarYield(if_stmt->then_body_) && BranchEndsWithScalarYield(*if_stmt->else_body_);
 }
 
 bool ContainsNestedLoop(const StmtPtr& stmt) {
