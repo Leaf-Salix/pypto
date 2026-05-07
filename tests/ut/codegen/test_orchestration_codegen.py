@@ -210,8 +210,8 @@ class TestOrchestration:
 
         assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
         assert "for (int64_t bn = 0; bn < 2; bn += 1)" in code
-        assert "if (bn == 0)" in code
-        assert "if (bn == 1)" in code
+        assert re.search(r"if\s*\(\s*\(?bn == 0\)?\s*\)", code) is not None
+        assert re.search(r"if\s*\(\s*\(?bn == 1\)?\s*\)", code) is not None
         assert "params_t1.add_dep(task_result_0.task_id())" in code
         assert "params_t2.add_dep(task_result_1.task_id())" in code
         assert "params_t3.add_dep(task_result_2.task_id())" in code
