@@ -100,24 +100,24 @@ PyPTO has two scope flavours for orchestrator dependency tracking:
 
 ### 2.1 `ManualDepResolveMutator`
 
-For every kernel `Call` inside a manual scope, copy `Call.attrs["user_manual_dep_edges"]` (the Tensor-Var edges written by the parser when the DSL passed `deps=[var, ...]`) into `Call.attrs["manual_dep_edges"]`. The copy deduplicates edges while preserving the original user order. Auto-derivation of edges from data-flow was intentionally removed (it over-serialised parallel kernels sharing an `Out` parameter); the user controls the dep set explicitly via `deps=[...]`. The per-submit cap of 16 explicit deps (`PTO2_MAX_EXPLICIT_DEPS`) is enforced later at orchestration codegen, which raises a `pypto::ValueError` when the resolved edge list exceeds the cap.
+For every kernel `Call` inside a manual scope, copy `Call.attrs["user_manual_dep_edges"]` (the tensor or `Scalar[TASK_ID]` Vars written by the parser when the DSL passed `deps=[var, ...]`) into `Call.attrs["manual_dep_edges"]`. The copy deduplicates edges while preserving the original user order. Auto-derivation of edges from data-flow was intentionally removed (it over-serialised parallel kernels sharing an `Out` parameter); the user controls the dep set explicitly via `deps=[...]`. Codegen sizes `ArgWithDeps<N>` to the resolved dep count.
 
 ### 2.2 `TaskRelevantVarCollector` (closure analysis)
 
-Starting from the Tensor Vars named in every `kAttrManualDepEdges` set, propagate the "needs-a-TaskId-companion" property through:
+Starting from the Tensor Vars named in every `kAttrManualDepEdges` set, propagate the "needs-a-TaskId-companion" property through. Entries that are already `ScalarType(DataType::TASK_ID)`, such as `tid = pl.task_id_of(a); deps=[tid]`, are direct TaskId handles and pass through without allocating a second `__tid` companion:
 
 - **Var aliases** (`b = a` AssignStmts and `b = tuple[i]` TupleGetItem extracts).
 - **`ForStmt.iter_args` ↔ `init_value`** (a TaskId carry must exist for every iter_arg whose init flows from a tagged Var, and vice versa).
 - **`ForStmt.return_vars` ↔ `iter_args`** (the rv produced by a TaskId-carrying iter_arg is itself a TaskId carry).
 - **`YieldStmt` source ↔ destination** (bidirectional — both directions are needed: `deps=[<iter_arg>]` flows dest→src, while `deps=[<kernel_lhs>]` flows src→dest to the carry destination).
 
-The fixed-point closure builds three sets: `needs_tid_` (every Var needing a companion), `kernel_lhs_` (Vars that are LHS of a user kernel Call — they get the `system.task_id_of` synthesis path), and `import_vars_` (Vars in `needs_tid_` that have no AssignStmt def, typically function parameters used as iter_arg init values).
+The fixed-point closure builds three sets: `needs_tid_` (every non-TaskId Var needing a companion), `kernel_lhs_` (Vars that are LHS of a user kernel Call — they get the `system.task_id_of` synthesis path), and `import_vars_` (Vars in `needs_tid_` that have no AssignStmt def, typically function parameters used as iter_arg init values).
 
 ### 2.3 `PreallocateTaskIdVars`
 
 Allocate one TaskId companion per Var in `needs_tid_`:
 
-- Plain `Var` (non-IterArg, e.g. a kernel LHS or function param) → a fresh `Var` named `<name_hint>__tid` with type `ScalarType(DataType::TASK_ID)`.
+- Plain `Var` (non-IterArg, e.g. a kernel LHS or function param) → a fresh `Var` named `<name_hint>__tid` with type `ScalarType(DataType::TASK_ID)`. Existing `Scalar[TASK_ID]` Vars are reused as-is.
 - `IterArg` → a fresh `IterArg` with the same name suffix; its init value is wired to the outer Var's companion (looked up in the partial `tid_map_`). For nested loops this lookup needs the outer companion to exist first, so the IterArg allocation pass sweeps to fixed-point: iter_args whose init companion is not yet allocated are re-tried until the chain converges.
 
 The map `tid_map_: const Var* → VarPtr` is the single source of identity for companions; every other stage looks up through it to avoid pointer-identity drift.

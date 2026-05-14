@@ -97,6 +97,118 @@ class TestManualScopeParsing:
         assert len(b_user_deps) == 1
         assert b_user_deps[0].same_as(a_assign.var)
 
+    def test_deps_kwarg_accepts_task_id_var(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    tid = pl.task_id_of(a)
+                    b = self.k2(x, deps=[tid])
+                return b
+
+        fn = Prog.get_function("main")
+        assert fn is not None
+        scope = _first_runtime_scope(fn.body)
+        assert scope is not None
+        body = scope.body
+        stmts = list(body.stmts) if isinstance(body, ir.SeqStmts) else [body]
+        assert len(stmts) == 3
+        _, tid_assign, b_assign = stmts
+        assert isinstance(tid_assign, ir.AssignStmt)
+        assert isinstance(b_assign, ir.AssignStmt)
+        assert isinstance(tid_assign.value, ir.Call)
+        assert tid_assign.value.op.name == "system.task_id_of"
+        assert isinstance(tid_assign.var.type, ir.ScalarType)
+        assert tid_assign.var.type.dtype == pl.TASK_ID
+        b_call = b_assign.value
+        assert isinstance(b_call, ir.Call)
+        b_user_deps = b_call.attrs.get("user_manual_dep_edges", [])
+        assert len(b_user_deps) == 1
+        assert b_user_deps[0].same_as(tid_assign.var)
+
+    def test_deps_kwarg_accepts_mixed_tensor_and_task_id_vars(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    b = self.k2(x)
+                    tid = pl.task_id_of(b)
+                    c = self.k3(x, deps=[a, tid])
+                return c
+
+        fn = Prog.get_function("main")
+        assert fn is not None
+        scope = _first_runtime_scope(fn.body)
+        assert scope is not None
+        body = scope.body
+        stmts = list(body.stmts) if isinstance(body, ir.SeqStmts) else [body]
+        assert len(stmts) == 4
+        a_assign, _, tid_assign, c_assign = stmts
+        assert isinstance(a_assign, ir.AssignStmt)
+        assert isinstance(tid_assign, ir.AssignStmt)
+        assert isinstance(c_assign, ir.AssignStmt)
+        c_call = c_assign.value
+        assert isinstance(c_call, ir.Call)
+        c_user_deps = c_call.attrs.get("user_manual_dep_edges", [])
+        assert len(c_user_deps) == 2
+        assert c_user_deps[0].same_as(a_assign.var)
+        assert c_user_deps[1].same_as(tid_assign.var)
+
+    def test_deps_kwarg_rejects_inline_task_id_of(self):
+        with pytest.raises(Exception):  # noqa: B017 - parser raises ParserSyntaxError/ParserTypeError
+
+            @pl.program
+            class _Prog:
+                @pl.function(type=pl.FunctionType.InCore)
+                def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    return x
+
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    with pl.manual_scope():
+                        a = self.k1(x)
+                        b = self.k1(x, deps=[pl.task_id_of(a)])
+                    return b
+
+    def test_manual_scope_rejects_no_dep_wrapper(self):
+        with pytest.raises(Exception):  # noqa: B017 - parser raises ParserSyntaxError/ParserTypeError
+
+            @pl.program
+            class _Prog:
+                @pl.function(type=pl.FunctionType.InCore)
+                def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    return x
+
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                    with pl.manual_scope():
+                        a = self.k1(pl.no_dep(x))
+                    return a
+
     def test_deps_outside_manual_scope_is_rejected(self):
         with pytest.raises(Exception):  # noqa: B017 — parser raises ParserSyntaxError
 

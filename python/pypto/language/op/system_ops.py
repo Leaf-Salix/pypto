@@ -12,6 +12,7 @@
 Sync/barrier ops are straight pass-through (no Tensor/Tile args).
 tpush ops wrap the IR-level functions, unwrapping Tile to Expr.
 tpop ops accept optional shape/dtype kwargs to create typed results.
+task_id_of exposes explicit manual-scope dependency handles.
 """
 
 from pypto.ir.op import system_ops as _ir_ops
@@ -28,7 +29,7 @@ from pypto.ir.op.system_ops import (
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import Call, Span
 
-from ..typing import Scalar, Tile
+from ..typing import Scalar, Tensor, Tile
 
 __all__ = [
     "AUTO",
@@ -45,6 +46,7 @@ __all__ = [
     "aiv_initialize_pipe",
     "reserve_buffer",
     "import_peer_buffer",
+    "task_id_of",
     "tfree_to_aic",
     "tfree_to_aiv",
 ]
@@ -110,6 +112,12 @@ def tpop_from_aiv(
     """
     call = _ir_ops.tpop_from_aiv(shape=shape, dtype=dtype, split=split, id=id, span=span)
     return Tile(expr=call)
+
+
+def task_id_of(producer: Tensor, span: Span | None = None) -> Scalar:
+    """Return a ``pl.Scalar[pl.TASK_ID]`` handle for a kernel result."""
+    call = _ir_ops.task_id_of(producer.unwrap(), span=span)
+    return Scalar(DataType.TASK_ID, call)
 
 
 def reserve_buffer(*, name: str, size: int, base: int = AUTO, span: Span | None = None) -> Scalar:

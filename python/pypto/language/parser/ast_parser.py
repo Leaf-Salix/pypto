@@ -3622,6 +3622,12 @@ class ASTParser:
                     # Detect ``pl.no_dep(...)`` wrappers at call-arg positions and
                     # collect their indices for the arg_direction_overrides attr.
                     unwrapped_args, no_dep_indices = self._strip_no_dep_wrappers(call.args)
+                    if self._manual_scope_depth > 0 and no_dep_indices:
+                        raise ParserSyntaxError(
+                            "pl.no_dep(...) is not supported inside pl.manual_scope()",
+                            span=span,
+                            hint="Use deps=[...] in manual_scope to declare explicit task ordering.",
+                        )
                     args = [self.parse_expression(arg) for arg in unwrapped_args]
                     # Inside manual_scope, parse the optional ``deps=[var1, var2]`` kwarg
                     # into a list of VarPtr for the explicit-edge attr.
@@ -3746,6 +3752,12 @@ class ASTParser:
         # pl.tensor.{operation} (3-segment)
         if len(attrs) >= 3 and attrs[0] == "pl" and attrs[1] == "tensor":
             op_name = attrs[2]
+            if self._manual_scope_depth > 0 and op_name == "no_dep":
+                raise ParserSyntaxError(
+                    "pl.no_dep(...) is not supported inside pl.manual_scope()",
+                    span=self.span_tracker.get_span(call),
+                    hint="Use deps=[...] in manual_scope to declare explicit task ordering.",
+                )
             return self._parse_tensor_op(op_name, call)
 
         # pl.tile.{operation} (3-segment)
@@ -3770,6 +3782,12 @@ class ASTParser:
         # pl.{operation} (2-segment, unified dispatch or promoted ops)
         if len(attrs) >= 2 and attrs[0] == "pl" and attrs[1] not in ("tensor", "tile", "system", "array"):
             op_name = attrs[1]
+            if self._manual_scope_depth > 0 and op_name == "no_dep":
+                raise ParserSyntaxError(
+                    "pl.no_dep(...) is not supported inside pl.manual_scope()",
+                    span=self.span_tracker.get_span(call),
+                    hint="Use deps=[...] in manual_scope to declare explicit task ordering.",
+                )
             return self._parse_unified_op(op_name, call)
 
         raise UnsupportedFeatureError(
@@ -3783,7 +3801,8 @@ class ASTParser:
 
         Only valid inside a ``with pl.manual_scope():`` block. Each list entry
         must be a tensor variable produced by a prior ``self.kernel(...)`` call
-        in the same manual scope. The parser cannot fully validate the
+        in the same manual scope, or a ``Scalar[TASK_ID]`` variable produced by
+        ``pl.task_id_of(...)``. The parser cannot fully validate the
         producer-Var relationship (that's a verifier job); it only enforces
         that each entry resolves to an ``ir.Var``.
 
@@ -3794,19 +3813,27 @@ class ASTParser:
             return []
         if not isinstance(deps_kw.value, (ast.List, ast.Tuple)):
             raise ParserTypeError(
-                f"'{method_name}' deps= must be a list/tuple of tensor variables",
+                f"'{method_name}' deps= must be a list/tuple of tensor or TASK_ID variables",
                 span=span,
-                hint="Use deps=[other_tensor_var] where other_tensor_var was "
-                "assigned by a prior self.kernel(...) call in the same manual_scope.",
+                hint="Use deps=[other_tensor_var, task_id_var] where task_id_var is assigned "
+                "from pl.task_id_of(...).",
             )
         out: list[ir.Var] = []
         for elt in deps_kw.value.elts:
             expr = self.parse_expression(elt)
-            if not isinstance(expr, ir.Var) or not isinstance(expr.type, ir.TensorType):
+            is_task_id_var = (
+                isinstance(expr, ir.Var)
+                and isinstance(expr.type, ir.ScalarType)
+                and expr.type.dtype == DataType.TASK_ID
+            )
+            if not isinstance(expr, ir.Var) or not (
+                isinstance(expr.type, ir.TensorType) or is_task_id_var
+            ):
                 raise ParserTypeError(
-                    f"'{method_name}' deps= entries must be tensor variables, got '{ast.unparse(elt)}'",
+                    f"'{method_name}' deps= entries must be tensor or TASK_ID variables, got '{ast.unparse(elt)}'",
                     span=span,
-                    hint="Each entry must be a name produced by a prior self.kernel(...) call.",
+                    hint="Inline expressions are not supported; assign task ids first, "
+                    "for example tid = pl.task_id_of(result); deps=[tid].",
                 )
             out.append(expr)
         return out

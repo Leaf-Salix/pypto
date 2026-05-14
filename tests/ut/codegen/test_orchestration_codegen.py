@@ -2973,6 +2973,77 @@ class TestManualScopeCodegen:
         assert "params_t2.add_dep(a__ssa_v0__tid);" in code
         assert "params_t2.add_dep(b__ssa_v0__tid);" in code
 
+    def test_manual_scope_emits_task_id_var_dep(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    tid = pl.task_id_of(a)
+                    b = self.k2(x, deps=[tid])
+                return b
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert "PTO2TaskId tid__ssa_v0 = task_0_outs.task_id();" in code
+        assert "ArgWithDeps<1> params_t1;" in code
+        assert "params_t1.add_dep(tid__ssa_v0);" in code
+        assert "tid__ssa_v0__tid" not in code
+
+    def test_manual_scope_emits_mixed_tensor_and_task_id_deps(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    b = self.k2(x)
+                    tid = pl.task_id_of(b)
+                    c = self.k3(x, deps=[a, tid])
+                return c
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert "PTO2TaskId a__ssa_v0__tid = task_0_outs.task_id();" in code
+        assert "PTO2TaskId tid__ssa_v0 = task_1_outs.task_id();" in code
+        assert "ArgWithDeps<2> params_t2;" in code
+        assert "params_t2.add_dep(a__ssa_v0__tid);" in code
+        assert "params_t2.add_dep(tid__ssa_v0);" in code
+        assert "tid__ssa_v0__tid" not in code
+
     def test_auto_scope_does_not_emit_task_id_capture(self):
         """Sanity: auto scope keeps the legacy fire-and-forget submit."""
         backend.reset_for_testing()
