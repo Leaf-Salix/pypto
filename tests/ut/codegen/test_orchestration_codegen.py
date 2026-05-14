@@ -3000,9 +3000,9 @@ class TestManualScopeCodegen:
         code = _generate_orch_code(transformed)
 
         assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
-        assert "PTO2TaskId tid__ssa_v0 = task_0_outs.task_id();" in code
+        assert "PTO2TaskId tid = task_0_outs.task_id();" in code
         assert "ArgWithDeps<1> params_t1;" in code
-        assert "params_t1.add_dep(tid__ssa_v0);" in code
+        assert "params_t1.add_dep(tid);" in code
         assert "tid__ssa_v0__tid" not in code
 
     def test_manual_scope_emits_mixed_tensor_and_task_id_deps(self):
@@ -3038,10 +3038,10 @@ class TestManualScopeCodegen:
 
         assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
         assert "PTO2TaskId a__ssa_v0__tid = task_0_outs.task_id();" in code
-        assert "PTO2TaskId tid__ssa_v0 = task_1_outs.task_id();" in code
+        assert "PTO2TaskId tid = task_1_outs.task_id();" in code
         assert "ArgWithDeps<2> params_t2;" in code
         assert "params_t2.add_dep(a__ssa_v0__tid);" in code
-        assert "params_t2.add_dep(tid__ssa_v0);" in code
+        assert "params_t2.add_dep(tid);" in code
         assert "tid__ssa_v0__tid" not in code
 
     def test_auto_scope_does_not_emit_task_id_capture(self):
