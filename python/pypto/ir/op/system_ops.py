@@ -16,6 +16,7 @@ System operations handle hardware synchronization and cross-core communication:
 - tpop_from_aic / tpop_from_aiv: Pop tile data from cross-core pipe
 - aic_initialize_pipe / aiv_initialize_pipe: Initialize cross-core pipes
 - reserve_buffer / import_peer_buffer: Cross-core buffer management (i32 SSA results)
+- task_id_of: Obtain a PTO2TaskId handle from a kernel result
 """
 
 from typing import Protocol, runtime_checkable
@@ -132,6 +133,12 @@ def bar_m(*, span: Span | None = None) -> Call:
 def bar_all(*, span: Span | None = None) -> Call:
     """Global barrier synchronization."""
     return _create_barrier_op("system.bar_all", span=span)
+
+
+def task_id_of(producer: Expr, span: Span | None = None) -> Call:
+    """Return the task id handle associated with a kernel result."""
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _ir_core.create_op_call("system.task_id_of", [producer], {}, actual_span)
 
 
 # Sentinel value: compiler auto-assigns the buffer base address

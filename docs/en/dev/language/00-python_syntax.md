@@ -337,7 +337,8 @@ user opt out and manage ordering explicitly:
 | ------- | ----------- | ------ |
 | `pl.no_dep(arg)` | per-call argument | At a kernel call site, the wrapped argument's `ArgDirection` becomes `NoDep`. Auto-tracking ignores that slot for this submission only. **Auto scope only** — has no semantic effect inside `pl.manual_scope`. |
 | `with pl.manual_scope():` | per-region | Lowers to `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`. Inside, the runtime never auto-tracks; the user must declare **every** required ordering edge explicitly via `deps=[...]`. |
-| `kernel(..., deps=[var, ...])` | per-call (manual_scope only) | Declares explicit task-id edges. Each entry must be a tensor `Var` produced by a prior `self.kernel(...)` in the same `manual_scope`, an iter_arg/return-var carrying such a producer through a loop, or a function parameter passed in as an initial seed. |
+| `pl.task_id_of(result)` | per-producer (manual_scope only) | Returns an opaque `pl.Scalar[pl.TASK_ID]` handle for a prior kernel result. Assign it to a local before using it in `deps=[...]`. |
+| `kernel(..., deps=[var, ...])` | per-call (manual_scope only) | Declares explicit task-id edges. Each entry must be either a tensor `Var` produced by a prior `self.kernel(...)` in the same `manual_scope`, an iter_arg/return-var carrying such a producer through a loop, a function parameter passed in as an initial seed, or a `pl.Scalar[pl.TASK_ID]` variable produced by `pl.task_id_of(...)`. |
 
 Manual scope is **declare-only**: omitting a `deps=[scratch]` on `stage2` will not be backfilled by the pass, even if `stage2` reads what `stage1` wrote. Auto-derivation from data flow was removed because it produced false edges whenever a buffer was reused in-place across unrelated kernels.
 
@@ -352,10 +353,25 @@ def main(self, x: pl.Tensor[[64], pl.FP32],
     return out
 ```
 
+Users may also name the producer TaskId explicitly and pass that handle to a
+later call:
+
+```python
+with pl.manual_scope():
+    a = self.stage1(x, scratch)
+    tid = pl.task_id_of(a)
+    out = self.stage2(scratch, out, deps=[tid])
+```
+
+`deps=[pl.task_id_of(a)]` is intentionally not accepted: `deps=` entries are
+variables, so assign the handle first. `pl.task_invalid()` and
+`pl.task_is_valid()` are not DSL APIs; they remain internal IR helpers.
+
 Inside `with pl.manual_scope():`, the manual-scope lowering phase of
 [DeriveCallDirections](../passes/33-derive_call_directions.md)
 (implemented internally by `LowerManualDepsToTaskId`)
-resolves each `deps=[var, ...]` entry to a TaskId companion of the producer,
+resolves tensor `deps=[var, ...]` entries to TaskId companions of their
+producers, passes explicit `Scalar[TASK_ID]` entries through unchanged,
 attaches it to the call's `manual_dep_edges` attr, and threads matching TaskId
 iter_args / return-vars / yields through every enclosing `pl.range` /
 `pl.parallel`. There is no cap on the number of edges per call — codegen

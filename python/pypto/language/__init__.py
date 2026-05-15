@@ -87,6 +87,7 @@ from .op.system_ops import (
     aiv_initialize_pipe,
     import_peer_buffer,
     reserve_buffer,
+    task_id_of,
     tfree_to_aic,
     tfree_to_aiv,
     tpop_from_aic,
@@ -220,6 +221,7 @@ UINT32 = DataType.UINT32
 UINT64 = DataType.UINT64
 BOOL = DataType.BOOL
 INDEX = DataType.INDEX
+TASK_ID = DataType.TASK_ID
 
 __all__ = [
     "jit",
@@ -359,6 +361,7 @@ __all__ = [
     "aiv_initialize_pipe",
     "reserve_buffer",
     "import_peer_buffer",
+    "task_id_of",
     "tfree_to_aic",
     "tfree_to_aiv",
     # Promoted tensor-only
@@ -415,4 +418,5 @@ __all__ = [
     "UINT64",
     "BOOL",
     "INDEX",
+    "TASK_ID",
 ]

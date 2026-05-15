@@ -335,7 +335,8 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | -------- | ---- | ---- |
 | `pl.no_dep(arg)` | per-call 参数 | kernel 调用点上，被包装的参数其 `ArgDirection` 变为 `NoDep`。该次提交对该槽位不进入自动跟踪。**仅 auto scope 生效**——在 `pl.manual_scope` 内没有语义。 |
 | `with pl.manual_scope():` | per-region | 下沉为 `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`。区域内 runtime 不做自动跟踪；用户必须通过 `deps=[...]` **显式声明每一条**需要的排序边。 |
-| `kernel(..., deps=[var, ...])` | per-call（仅 manual_scope 内） | 声明显式 task-id 边。每个条目必须是：同一 `manual_scope` 内由先前 `self.kernel(...)` 产生的 tensor `Var`，或在循环中承载该 producer 的 iter_arg / return_var，或作为初始种子传入的函数参数。 |
+| `pl.task_id_of(result)` | per-producer（仅 manual_scope 内） | 为先前 kernel 结果返回一个不透明的 `pl.Scalar[pl.TASK_ID]` handle。使用前需先赋值给局部变量，再放入 `deps=[...]`。 |
+| `kernel(..., deps=[var, ...])` | per-call（仅 manual_scope 内） | 声明显式 task-id 边。每个条目必须是：同一 `manual_scope` 内由先前 `self.kernel(...)` 产生的 tensor `Var`、在循环中承载该 producer 的 iter_arg / return_var、作为初始种子传入的函数参数，或由 `pl.task_id_of(...)` 产生的 `pl.Scalar[pl.TASK_ID]` 变量。 |
 
 Manual scope 是**只看声明**的：即使 `stage2` 读取了 `stage1` 写过的 buffer，
 若用户没写 `deps=[scratch]`，pass 也不会替你补上。之前的数据流自动推导
@@ -352,10 +353,23 @@ def main(self, x: pl.Tensor[[64], pl.FP32],
     return out
 ```
 
+用户也可以显式命名 producer 的 TaskId，再把该 handle 传给后续调用：
+
+```python
+with pl.manual_scope():
+    a = self.stage1(x, scratch)
+    tid = pl.task_id_of(a)
+    out = self.stage2(scratch, out, deps=[tid])
+```
+
+`deps=[pl.task_id_of(a)]` 不被接受：`deps=` 条目必须是变量，因此需要先赋值。
+`pl.task_invalid()` 与 `pl.task_is_valid()` 不是 DSL API，仍然只是内部 IR helper。
+
 `with pl.manual_scope():` 内由
 [DeriveCallDirections](../passes/33-derive_call_directions.md)
 pass 的 manual scope 降级阶段（内部实现为 `LowerManualDepsToTaskId`）
-把每个 `deps=[var, ...]` 解析为 producer 的 TaskId 配套、写入 call 的
+把 tensor `deps=[var, ...]` 条目解析为 producer 的 TaskId 配套，显式
+`Scalar[TASK_ID]` 条目保持直通，并写入 call 的
 `manual_dep_edges`，并为每个外层 `pl.range` / `pl.parallel` 同步追加
 TaskId iter_arg / return_var / yield 项。不再对每 call 边数设上限——
 codegen 按实际依赖数生成 `ArgWithDeps<N>`。

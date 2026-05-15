@@ -100,24 +100,24 @@ PyPTO 中 orchestrator 的依赖跟踪有两种作用域：
 
 ### 2.1 `ManualDepResolveMutator`
 
-对 manual 作用域内的每个 kernel `Call`，把 `Call.attrs["user_manual_dep_edges"]`（DSL 写 `deps=[var, ...]` 时由 parser 写入的 Tensor-Var 边）复制到 `Call.attrs["manual_dep_edges"]`。复制时去重并保持用户原始顺序。从 data-flow 自动推导 dep 边的能力已被有意移除（它会过度串行化共享 `Out` 参数的并行 kernel）；现在用户通过 `deps=[...]` 显式控制依赖集合。每次 submit 的 16 个显式 dep 上限（`PTO2_MAX_EXPLICIT_DEPS`）在 orchestration codegen 阶段统一校验，超过时抛出 `pypto::ValueError`。
+对 manual 作用域内的每个 kernel `Call`，把 `Call.attrs["user_manual_dep_edges"]`（DSL 写 `deps=[var, ...]` 时由 parser 写入的 tensor 或 `Scalar[TASK_ID]` Var）复制到 `Call.attrs["manual_dep_edges"]`。复制时去重并保持用户原始顺序。从 data-flow 自动推导 dep 边的能力已被有意移除（它会过度串行化共享 `Out` 参数的并行 kernel）；现在用户通过 `deps=[...]` 显式控制依赖集合。codegen 会按解析后的依赖数生成 `ArgWithDeps<N>`。
 
 ### 2.2 `TaskRelevantVarCollector`（闭包分析）
 
-从每个 `kAttrManualDepEdges` 集合中提到的 Tensor Var 出发，把"需要 TaskId 同伴"的标记沿以下边传播：
+从每个 `kAttrManualDepEdges` 集合中提到的 Tensor Var 出发，把"需要 TaskId 同伴"的标记沿以下边传播。已经是 `ScalarType(DataType::TASK_ID)` 的条目（例如 `tid = pl.task_id_of(a); deps=[tid]`）是直接 TaskId handle，会直通而不再分配二次 `__tid` companion：
 
 - **Var 别名**（`b = a` AssignStmt 与 `b = tuple[i]` TupleGetItem 解包）。
 - **`ForStmt.iter_args` ↔ `init_value`**（如果 iter_arg 的初值来自被标记的 Var，则其本身也需要 TaskId carry，反之亦然）。
 - **`ForStmt.return_vars` ↔ `iter_args`**（带 TaskId 的 iter_arg 产生的 return var 也带 TaskId）。
 - **`YieldStmt` 源 ↔ 目标**（双向均需要：`deps=[<iter_arg>]` 从 dest 流向 src；`deps=[<kernel_lhs>]` 从 src 流向 carry destination）。
 
-不动点闭包构建三个集合：`needs_tid_`（需要同伴的所有 Var）、`kernel_lhs_`（作为 user kernel Call 的 LHS 的 Var，使用 `system.task_id_of` 合成路径）、`import_vars_`（在 `needs_tid_` 中且没有 AssignStmt 定义的 Var，典型情况是作为 iter_arg 初值的函数参数）。
+不动点闭包构建三个集合：`needs_tid_`（需要同伴的所有非 TaskId Var）、`kernel_lhs_`（作为 user kernel Call 的 LHS 的 Var，使用 `system.task_id_of` 合成路径）、`import_vars_`（在 `needs_tid_` 中且没有 AssignStmt 定义的 Var，典型情况是作为 iter_arg 初值的函数参数）。
 
 ### 2.3 `PreallocateTaskIdVars`
 
 为 `needs_tid_` 中的每个 Var 分配一个 TaskId 同伴：
 
-- 普通 `Var`（非 IterArg，例如 kernel LHS 或函数参数）→ 一个名为 `<name_hint>__tid`、类型为 `ScalarType(DataType::TASK_ID)` 的新 `Var`。
+- 普通 `Var`（非 IterArg，例如 kernel LHS 或函数参数）→ 一个名为 `<name_hint>__tid`、类型为 `ScalarType(DataType::TASK_ID)` 的新 `Var`。已有的 `Scalar[TASK_ID]` Var 会按原变量复用。
 - `IterArg` → 一个带相同后缀名的新 `IterArg`；其初值挂到外层 Var 同伴上（通过部分构建的 `tid_map_` 查询）。嵌套循环里，这要求外层同伴先存在，所以 IterArg 分配子阶段会在循环内不动点扫描：初值同伴尚未分配的 iter_arg 会被重新尝试直到链条收敛。
 
 `tid_map_: const Var* → VarPtr` 是同伴身份的唯一来源；其他子阶段都通过它查找以避免指针身份漂移。
