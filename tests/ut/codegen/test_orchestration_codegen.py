@@ -3352,6 +3352,164 @@ class TestManualScopeCodegen:
         # array carry), proving the legacy 16-cap is gone.
         assert f"ArgWithDeps<{ABOVE_LEGACY_CAP}>" in code, code
 
+    # ── TaskId-explicit deps ───────────────────────────────────────────
+
+    def test_manual_scope_sequential_taskid_chain(self):
+        """Three-stage chain: A→tid1→B→tid2→C.  Each hop uses an explicit
+        ``pl.task_id_of`` handle."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    tid1 = pl.task_id_of(a)
+                    b = self.k2(x, deps=[tid1])
+                    tid2 = pl.task_id_of(b)
+                    c = self.k3(x, deps=[tid2])
+                return c
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert "PTO2TaskId tid1 = task_0_outs.task_id();" in code
+        assert "PTO2TaskId tid2 = task_1_outs.task_id();" in code
+        assert "params_t1.add_dep(tid1);" in code
+        assert "params_t2.add_dep(tid2);" in code
+        assert "tid1__ssa_v0__tid" not in code
+        assert "tid2__ssa_v0__tid" not in code
+
+    def test_manual_scope_taskid_multiple_consumers(self):
+        """One explicit TaskId handle reused by two downstream kernels."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    tid = pl.task_id_of(a)
+                    b = self.k2(x, deps=[tid])
+                    c = self.k3(x, deps=[tid])
+                return c
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert "PTO2TaskId tid = task_0_outs.task_id();" in code
+        assert "params_t1.add_dep(tid);" in code
+        assert "params_t2.add_dep(tid);" in code
+        assert "tid__ssa_v0__tid" not in code
+
+    def test_manual_scope_multiple_taskid_deps(self):
+        """``deps=[tid_a, tid_b]`` — two explicit TaskId handles from
+        two different producers."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    b = self.k2(x)
+                    tid_a = pl.task_id_of(a)
+                    tid_b = pl.task_id_of(b)
+                    c = self.k3(x, deps=[tid_a, tid_b])
+                return c
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert "PTO2TaskId tid_a = task_0_outs.task_id();" in code
+        assert "PTO2TaskId tid_b = task_1_outs.task_id();" in code
+        assert "ArgWithDeps<2> params_t2;" in code
+        assert "params_t2.add_dep(tid_a);" in code
+        assert "params_t2.add_dep(tid_b);" in code
+        assert "tid_a__ssa_v0__tid" not in code
+        assert "tid_b__ssa_v0__tid" not in code
+
+    def test_manual_scope_taskid_in_range_loop(self):
+        """TaskId handle used inside a ``pl.range`` loop — same iteration."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    for i in pl.range(4):
+                        a = self.k1(x)
+                        tid = pl.task_id_of(a)
+                        x = self.k2(x, deps=[tid])
+                return x
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
+        assert ".task_id()" in code
+        assert ".add_dep(" in code
+        assert "tid__ssa_v0__tid" not in code
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

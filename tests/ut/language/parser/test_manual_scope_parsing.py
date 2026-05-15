@@ -225,6 +225,107 @@ class TestManualScopeParsing:
                     b = self.k1(x, deps=[a])
                     return b
 
+    def test_deps_taskid_sequential_chain(self):
+        """Three-stage chain with explicit TaskId at each hop."""
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    tid1 = pl.task_id_of(a)
+                    b = self.k2(x, deps=[tid1])
+                    tid2 = pl.task_id_of(b)
+                    c = self.k3(x, deps=[tid2])
+                return c
+
+        fn = Prog.get_function("main")
+        assert fn is not None
+        scope = _first_runtime_scope(fn.body)
+        assert scope is not None
+        body = scope.body
+        stmts = list(body.stmts) if isinstance(body, ir.SeqStmts) else [body]
+        assert len(stmts) == 5  # k1, task_id_of, k2, task_id_of, k3
+        _, tid1_assign, _, tid2_assign, c_assign = stmts
+        assert isinstance(tid1_assign, ir.AssignStmt)
+        assert isinstance(tid2_assign, ir.AssignStmt)
+        assert isinstance(c_assign, ir.AssignStmt)
+        # Both task_id_of calls produce Scalar[TASK_ID]
+        for tid_asgn in (tid1_assign, tid2_assign):
+            assert isinstance(tid_asgn.value, ir.Call)
+            assert tid_asgn.value.op.name == "system.task_id_of"
+            assert isinstance(tid_asgn.var.type, ir.ScalarType)
+            assert tid_asgn.var.type.dtype == pl.TASK_ID
+        # k3 dep = [tid2]
+        c_call = c_assign.value
+        assert isinstance(c_call, ir.Call)
+        c_user_deps = c_call.attrs.get("user_manual_dep_edges", [])
+        assert len(c_user_deps) == 1
+        assert c_user_deps[0].same_as(tid2_assign.var)
+
+    def test_deps_taskid_multiple(self):
+        """``deps=[tid_a, tid_b]`` — two explicit TaskId handles from
+        two different producers."""
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    b = self.k2(x)
+                    tid_a = pl.task_id_of(a)
+                    tid_b = pl.task_id_of(b)
+                    c = self.k3(x, deps=[tid_a, tid_b])
+                return c
+
+        fn = Prog.get_function("main")
+        assert fn is not None
+        scope = _first_runtime_scope(fn.body)
+        assert scope is not None
+        body = scope.body
+        stmts = list(body.stmts) if isinstance(body, ir.SeqStmts) else [body]
+        assert len(stmts) == 5
+        _, _, tid_a_assign, tid_b_assign, c_assign = stmts
+        assert isinstance(tid_a_assign, ir.AssignStmt)
+        assert isinstance(tid_b_assign, ir.AssignStmt)
+        assert isinstance(c_assign, ir.AssignStmt)
+        # Both task_id_of calls produce Scalar[TASK_ID]
+        for tid_asgn in (tid_a_assign, tid_b_assign):
+            assert isinstance(tid_asgn.value, ir.Call)
+            assert tid_asgn.value.op.name == "system.task_id_of"
+            assert isinstance(tid_asgn.var.type, ir.ScalarType)
+            assert tid_asgn.var.type.dtype == pl.TASK_ID
+        c_call = c_assign.value
+        assert isinstance(c_call, ir.Call)
+        c_user_deps = c_call.attrs.get("user_manual_dep_edges", [])
+        assert len(c_user_deps) == 2
+        assert c_user_deps[0].same_as(tid_a_assign.var)
+        assert c_user_deps[1].same_as(tid_b_assign.var)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

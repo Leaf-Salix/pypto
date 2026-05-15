@@ -680,5 +680,115 @@ class TestBranchChainSwimlane:
             )
 
 
+# ============================================================================
+# TaskId-explicit pipeline — same numerical semantics but uses pl.task_id_of
+# ============================================================================
+
+
+def _build_taskid_program():
+    """2-stage pipeline using explicit TaskId handles.
+
+    Same ``out = 2*x + 1`` computation as ``_build_program()``, but each
+    inner-iteration stage2 dependency is declared via::
+
+        tid = pl.task_id_of(scratch)
+        out = self.stage2(..., deps=[tid])
+
+    instead of the tensor shortcut ``deps=[scratch]``.
+    """
+    M, N = _M, _N
+    TILE_R, TILE_C = _TILE_R, _TILE_C
+    ROWS, COLS = _ROWS, _COLS
+
+    @pl.program
+    class ManualTaskIdPipelineProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def stage1(
+            self,
+            x: pl.Tensor[[ROWS, COLS], pl.FP32],
+            scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            row: pl.Scalar[pl.INDEX],
+            col: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(x, [row, col], [TILE_R, TILE_C])
+            r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, t)
+            ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], scratch)
+            return ret
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def stage2(
+            self,
+            scratch: pl.Tensor[[ROWS, COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            row: pl.Scalar[pl.INDEX],
+            col: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(scratch, [row, col], [TILE_R, TILE_C])
+            r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, 1.0)
+            ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], out)
+            return ret
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[ROWS, COLS], pl.FP32],
+            scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+        ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+            with pl.manual_scope():
+                for i in pl.range(M):
+                    row: pl.Scalar[pl.INDEX] = i * TILE_R
+                    for j in pl.parallel(N):
+                        col: pl.Scalar[pl.INDEX] = j * TILE_C
+                        scratch = self.stage1(x, scratch, row, col)
+                        tid = pl.task_id_of(scratch)
+                        out = self.stage2(scratch, out, row, col, deps=[tid])
+            return out
+
+    return ManualTaskIdPipelineProgram
+
+
+class _ManualTaskIdPipelinePTO(PTOTestCase):
+    """Same 2-stage pipeline as _ManualScopePipelinePTO, but uses
+    ``pl.task_id_of(scratch)`` to create an explicit TaskId dep."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"manual_taskid_pipeline_{_ROWS}x{_COLS}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [_ROWS, _COLS], DataType.FP32, init_value=torch.randn),
+            TensorSpec("scratch", [_ROWS, _COLS], DataType.FP32, init_value=0.0),
+            TensorSpec("out", [_ROWS, _COLS], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_taskid_program()
+
+    def compute_expected(self, tensors, params=None):
+        tensors["out"][:] = 2.0 * tensors["x"] + 1.0
+
+
+class TestManualTaskIdPipeline:
+    """Numerical correctness for the TaskId-explicit manual-scope pipeline."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_taskid_pipeline_correctness(self, test_runner, platform):
+        """``out`` matches ``2 * x + 1`` when deps are written as ``deps=[tid]``
+        with ``tid = pl.task_id_of(scratch)``."""
+        result = test_runner.run(_ManualTaskIdPipelinePTO(platform=platform))
+        assert result.passed, (
+            f"TaskId-explicit manual-scope pipeline execution failed: {result.error}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

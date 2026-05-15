@@ -92,5 +92,120 @@ class TestManualScopeNesting:
                     return b
 
 
+class TestManualScopeTaskIdLowering:
+    """Tests for ``Scalar[TASK_ID]`` passthrough in manual-scope lowering."""
+
+    def test_taskid_var_passthrough_no_companion(self):
+        """A ``Scalar[TASK_ID]`` dep must NOT get a ``__tid`` companion.
+
+        The lowering should recognise that the var is already a TaskId and pass
+        it through directly, not synthesise ``tid__ssa_v0__tid``.
+        """
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    tid = pl.task_id_of(a)
+                    b = self.k1(x, deps=[tid])
+                return b
+
+        ssa = passes.convert_to_ssa()(Prog)
+        after = passes.derive_call_directions()(ssa)
+        ir_dump = str(after)
+        assert "tid__ssa_v0__tid" not in ir_dump
+
+    def test_mixed_deps_selective_rewrite(self):
+        """Tensor dep gets a companion; TaskId dep stays direct.
+
+        ``deps=[a, tid]`` should produce:
+        - ``a__ssa_v0__tid`` (companion for tensor dep)
+        - NO companion for ``tid``
+        """
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    b = self.k2(x)
+                    tid = pl.task_id_of(b)
+                    c = self.k1(x, deps=[a, tid])
+                return c
+
+        ssa = passes.convert_to_ssa()(Prog)
+        after = passes.derive_call_directions()(ssa)
+        ir_dump = str(after)
+        assert "a__ssa_v0__tid" in ir_dump   # tensor companion
+        assert "tid__ssa_v0__tid" not in ir_dump  # TaskId no companion
+
+    def test_multiple_taskid_deps_passthrough(self):
+        """Multiple TaskId deps all pass through directly."""
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    b = self.k2(x)
+                    tid_a = pl.task_id_of(a)
+                    tid_b = pl.task_id_of(b)
+                    c = self.k3(x, deps=[tid_a, tid_b])
+                return c
+
+        ssa = passes.convert_to_ssa()(Prog)
+        after = passes.derive_call_directions()(ssa)
+        ir_dump = str(after)
+        assert "tid_a__ssa_v0__tid" not in ir_dump
+        assert "tid_b__ssa_v0__tid" not in ir_dump
+
+    def test_taskid_in_loop_body_no_companion(self):
+        """TaskId inside a range loop body is not companion-lowered."""
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    for i in pl.range(4):
+                        a = self.k1(x)
+                        tid = pl.task_id_of(a)
+                        x = self.k1(x, deps=[tid])
+                return x
+
+        ssa = passes.convert_to_ssa()(Prog)
+        after = passes.derive_call_directions()(ssa)
+        ir_dump = str(after)
+        assert "tid__ssa_v0__tid" not in ir_dump
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

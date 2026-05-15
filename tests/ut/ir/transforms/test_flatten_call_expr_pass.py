@@ -632,6 +632,67 @@ class TestFlattenPreservesAttrs:
         edges = k2_call.attrs.get("user_manual_dep_edges", [])
         assert len(edges) == 1, f"user_manual_dep_edges dropped after FlattenCallExpr; got {edges!r}"
 
+    def test_user_manual_taskid_dep_edges_survive_arg_flatten(self):
+        """``user_manual_dep_edges`` for a TaskId dep survives FlattenCallExpr.
+
+        Same as the tensor-dep test above, but uses ``pl.task_id_of`` to
+        produce a ``Scalar[TASK_ID]`` dep instead of a raw tensor producer.
+        """
+        instruments: list[_core_passes.PassInstrument] = [
+            _core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)
+        ]
+        ctx = _core_passes.PassContext(instruments)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    a = self.k1(x)
+                    tid = pl.task_id_of(a)
+                    _b = self.k2(x, pl.slice(out, [32], [0]), deps=[tid])
+                return out
+
+        with ctx:
+            After = passes.flatten_call_expr()(Prog)
+        fn = After.get_function("main")
+        assert fn is not None, "main function must exist after flatten_call_expr"
+
+        def find_k2_call(stmt):
+            if isinstance(stmt, ir.SeqStmts):
+                for s in stmt.stmts:
+                    r = find_k2_call(s)
+                    if r is not None:
+                        return r
+            elif isinstance(stmt, ir.RuntimeScopeStmt):
+                return find_k2_call(stmt.body)
+            elif isinstance(stmt, ir.AssignStmt):
+                v = stmt.value
+                if isinstance(v, ir.Call) and v.op.name == "k2":
+                    return v
+            return None
+
+        k2_call = find_k2_call(fn.body)
+        assert k2_call is not None, "expected the k2 call in the manual scope"
+        edges = k2_call.attrs.get("user_manual_dep_edges", [])
+        assert len(edges) == 1, f"user_manual_dep_edges for TaskId dep dropped after FlattenCallExpr; got {edges!r}"
+
 
 class TestFlattenCallInScopeStmt:
     """Tests for flattening nested calls inside ScopeStmt (pl.incore / pl.at) blocks.
