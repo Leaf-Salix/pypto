@@ -790,5 +790,59 @@ class TestManualTaskIdPipeline:
         )
 
 
+@pytest.fixture(scope="module")
+def manual_taskid_swimlane_file(test_runner) -> Path:
+    """Run the TaskId pipeline once with profiling and return the swimlane JSON."""
+    if not test_runner.config.enable_l2_swimlane:
+        pytest.skip("pass --enable-l2-swimlane to validate the manual_taskid swimlane")
+
+    before: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/l2_perf_records.json"))
+    result = test_runner.run(_ManualTaskIdPipelinePTO())
+    assert result.passed, f"TaskId-explicit manual-scope pipeline failed: {result.error}"
+
+    after: set[Path] = set(_BUILD_OUTPUT_DIR.glob("*/dfx_outputs/l2_perf_records.json"))
+    new_files = after - before
+    assert new_files, "No l2_perf_records.json was generated for the manual_taskid run"
+    return max(new_files, key=lambda p: p.stat().st_mtime)
+
+
+@pytest.fixture(scope="module")
+def manual_taskid_swimlane_data(manual_taskid_swimlane_file: Path) -> dict:
+    return json.loads(manual_taskid_swimlane_file.read_text())
+
+
+class TestManualTaskIdSwimlane:
+    """Swimlane counterpart for the explicit ``deps=[tid]`` pipeline."""
+
+    def test_total_task_count(self, manual_taskid_swimlane_data: dict):
+        tasks = manual_taskid_swimlane_data["tasks"]
+        assert len(tasks) >= _M * _N * 2, (
+            f"expected at least {_M * _N * 2} tasks (M*N tiles x 2 stages), got {len(tasks)}"
+        )
+
+    def test_intra_iteration_dep_present(self, manual_taskid_swimlane_data: dict):
+        tasks = manual_taskid_swimlane_data["tasks"]
+        total_fanout = sum(t["fanout_count"] for t in tasks)
+        assert total_fanout >= _M * _N, (
+            f"expected at least {_M * _N} fan-out edges from explicit TaskId deps, got {total_fanout}"
+        )
+
+    def test_inner_parallel_loop_runs_concurrently(self, manual_taskid_swimlane_data: dict):
+        tasks = manual_taskid_swimlane_data["tasks"]
+        core_ids = {t["core_id"] for t in tasks}
+        if len(core_ids) > 1:
+            assert len(core_ids) >= 2, (
+                f"expected explicit TaskId pl.parallel inner loop to use multiple cores; "
+                f"only saw core_ids={sorted(core_ids)}"
+            )
+
+    def test_no_blocking_serialization_chain(self, manual_taskid_swimlane_data: dict):
+        tasks = manual_taskid_swimlane_data["tasks"]
+        max_fanout = max((t["fanout_count"] for t in tasks), default=0)
+        assert max_fanout <= 4, (
+            f"max fan-out per task is {max_fanout}; explicit TaskId deps appear over-linked."
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

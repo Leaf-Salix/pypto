@@ -290,6 +290,12 @@ class TaskIdLoweringMutator : public IRMutator {
     //     share it).
     std::vector<StmtPtr> new_stmts;
     new_stmts.reserve(seq->stmts_.size() * 2);
+    std::unordered_set<const Var*> existing_defs;
+    for (const auto& stmt : seq->stmts_) {
+      if (auto assign = As<AssignStmt>(stmt); assign && assign->var_) {
+        existing_defs.insert(assign->var_.get());
+      }
+    }
     bool changed = false;
     for (const auto& stmt : seq->stmts_) {
       new_stmts.push_back(stmt);
@@ -298,6 +304,7 @@ class TaskIdLoweringMutator : public IRMutator {
       if (!needs_tid_.count(assign->var_.get())) continue;
       VarPtr tid_var = LookupOrAllocateTid(assign->var_);
       if (!tid_var) continue;
+      if (existing_defs.count(tid_var.get())) continue;
 
       if (auto call = As<Call>(assign->value_)) {
         if (kernel_lhs_.count(assign->var_.get())) {
@@ -536,6 +543,31 @@ class TaskIdLoweringMutator : public IRMutator {
   int manual_depth_ = 0;
 };
 
+class ExistingTaskIdCompanionCollector : public IRVisitor {
+ public:
+  explicit ExistingTaskIdCompanionCollector(std::unordered_map<const Var*, VarPtr>* tid_map)
+      : tid_map_(tid_map) {}
+
+ protected:
+  void VisitStmt_(const AssignStmtPtr& assign) override {
+    if (assign && assign->var_) {
+      if (auto call = As<Call>(assign->value_);
+          call && call->op_ && call->op_->name_ == "system.task_id_of" && call->args_.size() == 1) {
+        auto producer = AsVarLike(call->args_[0]);
+        auto lhs_type = As<ScalarType>(assign->var_->GetType());
+        if (producer && lhs_type && lhs_type->dtype_ == DataType::TASK_ID &&
+            assign->var_->name_hint_ == producer->name_hint_ + "__tid") {
+          (*tid_map_)[producer.get()] = assign->var_;
+        }
+      }
+    }
+    IRVisitor::VisitStmt_(assign);
+  }
+
+ private:
+  std::unordered_map<const Var*, VarPtr>* tid_map_;
+};
+
 // Pre-allocate TaskId companions for every Var in the closure. IterArg-typed
 // Vars get an IterArg companion; ordinary Vars get a plain Var companion.
 // The IterArg's init_value is wired to the init_var's TaskId companion.
@@ -554,6 +586,7 @@ void PreallocateTaskIdVars(const std::unordered_set<const Var*>& needs_tid,
     if (auto sty = As<ScalarType>(v->GetType()); sty && sty->dtype_ == DataType::TASK_ID) {
       continue;
     }
+    if (tid_map->count(v)) continue;
     auto tid_type = std::make_shared<ScalarType>(DataType::TASK_ID);
     if (v->GetKind() == ObjectKind::IterArg) {
       iter_arg_vs.push_back(v);
@@ -628,6 +661,8 @@ StmtPtr LowerManualDepsToTaskId(const StmtPtr& body) {
 
   // Stage 3: pre-allocate TaskId companions.
   std::unordered_map<const Var*, VarPtr> tid_map;
+  ExistingTaskIdCompanionCollector existing_companions(&tid_map);
+  existing_companions.VisitStmt(resolved);
   PreallocateTaskIdVars(collector.needs_tid_, collector.iter_arg_init_, &tid_map);
 
   // Stage 3b: for ``import`` Vars (in needs_tid_ but with no AssignStmt def

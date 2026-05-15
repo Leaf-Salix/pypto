@@ -18,6 +18,7 @@ verify that the manual-scope behaviour is preserved.
 import pypto.language as pl
 import pytest
 from pypto import passes
+from pypto.pypto_core import ir
 from pypto.pypto_core import passes as _core_passes
 
 
@@ -34,6 +35,38 @@ def pass_verification_context():
     ]
     with _core_passes.PassContext(instruments):
         yield
+
+
+def _collect_calls(stmt):
+    calls = []
+    if isinstance(stmt, ir.SeqStmts):
+        for child in stmt.stmts:
+            calls.extend(_collect_calls(child))
+    elif isinstance(stmt, ir.RuntimeScopeStmt):
+        calls.extend(_collect_calls(stmt.body))
+    elif isinstance(stmt, ir.ForStmt):
+        calls.extend(_collect_calls(stmt.body))
+    elif isinstance(stmt, ir.IfStmt):
+        calls.extend(_collect_calls(stmt.then_body))
+        calls.extend(_collect_calls(stmt.else_body))
+    elif isinstance(stmt, ir.AssignStmt):
+        if isinstance(stmt.value, ir.Call):
+            calls.append(stmt.value)
+    elif isinstance(stmt, ir.EvalStmt):
+        if isinstance(stmt.expr, ir.Call):
+            calls.append(stmt.expr)
+    return calls
+
+
+def _calls_named(program, name: str):
+    fn = program.get_function("main")
+    assert fn is not None, "main function must exist"
+    return [call for call in _collect_calls(fn.body) if call.op.name == name]
+
+
+def _assert_taskid_edge(edge):
+    assert isinstance(edge.type, ir.ScalarType), edge
+    assert edge.type.dtype == pl.TASK_ID, edge
 
 
 class TestManualScopeLoweringNoOp:
@@ -119,6 +152,12 @@ class TestManualScopeTaskIdLowering:
         after = passes.derive_call_directions()(ssa)
         ir_dump = str(after)
         assert "tid__ssa_v0__tid" not in ir_dump
+        calls = _calls_named(after, "k1")
+        assert len(calls) == 2
+        edges = calls[-1].attrs.get("manual_dep_edges", [])
+        assert len(edges) == 1
+        _assert_taskid_edge(edges[0])
+        assert edges[0].name_hint.startswith("tid")
 
     def test_mixed_deps_selective_rewrite(self):
         """Tensor dep gets a companion; TaskId dep stays direct.
@@ -151,6 +190,15 @@ class TestManualScopeTaskIdLowering:
         ir_dump = str(after)
         assert "a__ssa_v0__tid" in ir_dump   # tensor companion
         assert "tid__ssa_v0__tid" not in ir_dump  # TaskId no companion
+        calls = _calls_named(after, "k1")
+        assert len(calls) == 2
+        edges = calls[-1].attrs.get("manual_dep_edges", [])
+        assert len(edges) == 2
+        for edge in edges:
+            _assert_taskid_edge(edge)
+        assert any(edge.name_hint.startswith("a__") and edge.name_hint.endswith("__tid") for edge in edges)
+        assert any(edge.name_hint.startswith("tid") for edge in edges)
+        assert not any(edge.name_hint.startswith("tid") and edge.name_hint.endswith("__tid") for edge in edges)
 
     def test_multiple_taskid_deps_passthrough(self):
         """Multiple TaskId deps all pass through directly."""
@@ -183,6 +231,13 @@ class TestManualScopeTaskIdLowering:
         ir_dump = str(after)
         assert "tid_a__ssa_v0__tid" not in ir_dump
         assert "tid_b__ssa_v0__tid" not in ir_dump
+        calls = _calls_named(after, "k3")
+        assert len(calls) == 1
+        edges = calls[0].attrs.get("manual_dep_edges", [])
+        assert len(edges) == 2
+        for edge in edges:
+            _assert_taskid_edge(edge)
+        assert {edge.name_hint for edge in edges} == {"tid_a", "tid_b"}
 
     def test_taskid_in_loop_body_no_companion(self):
         """TaskId inside a range loop body is not companion-lowered."""
@@ -205,6 +260,12 @@ class TestManualScopeTaskIdLowering:
         after = passes.derive_call_directions()(ssa)
         ir_dump = str(after)
         assert "tid__ssa_v0__tid" not in ir_dump
+        calls = _calls_named(after, "k1")
+        assert len(calls) == 2
+        edges = calls[-1].attrs.get("manual_dep_edges", [])
+        assert len(edges) == 1
+        _assert_taskid_edge(edges[0])
+        assert edges[0].name_hint.startswith("tid")
 
 
 if __name__ == "__main__":

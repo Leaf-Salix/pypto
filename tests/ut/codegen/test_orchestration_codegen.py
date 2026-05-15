@@ -2893,6 +2893,21 @@ class TestManualScopeCodegen:
         with _core_passes.PassContext(instruments):
             yield
 
+    @staticmethod
+    def _assert_taskid_decl_feeds_dep(
+        code: str,
+        *,
+        task_index: int,
+        params_name: str,
+        name_pattern: str,
+    ) -> str:
+        pattern = rf"PTO2TaskId ({name_pattern}) = task_{task_index}_outs\.task_id\(\);"
+        matches = re.findall(pattern, code)
+        assert len(matches) == 1, code
+        taskid_name = matches[0]
+        assert f"{params_name}.add_dep({taskid_name});" in code, code
+        return taskid_name
+
     def test_manual_scope_emits_manual_pto2_scope_and_task_id_capture(self):
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -2929,8 +2944,13 @@ class TestManualScopeCodegen:
         # Explicit dep on `a`: the pass synthesises a TaskId companion
         # ``a__tid = task_0_outs.task_id();`` and rewrites deps=[a] to the
         # TaskId version, which codegen emits as ``add_dep(<companion>)``.
-        assert "task_0_outs.task_id()" in code
-        assert ".add_dep(" in code
+        self._assert_taskid_decl_feeds_dep(
+            code,
+            task_index=0,
+            params_name="params_t1",
+            name_pattern=r"a__ssa_v\d+__tid",
+        )
+        assert code.count("add_dep(") == 1, code
 
     def test_manual_scope_emits_explicit_user_deps(self):
         backend.reset_for_testing()
@@ -3043,6 +3063,8 @@ class TestManualScopeCodegen:
         assert "params_t2.add_dep(a__ssa_v0__tid);" in code
         assert "params_t2.add_dep(tid);" in code
         assert "tid__ssa_v0__tid" not in code
+        assert "PTO2TaskId a__ssa_v0__tid_1 = task_0_outs.task_id();" not in code, code
+        assert code.count("PTO2TaskId a__ssa_v0__tid = task_0_outs.task_id();") == 1, code
 
     def test_auto_scope_does_not_emit_task_id_capture(self):
         """Sanity: auto scope keeps the legacy fire-and-forget submit."""
@@ -3168,6 +3190,82 @@ class TestManualScopeCodegen:
         # in parallel as MANUAL mode allows.
         assert code.count("add_dep(") == 1, code
 
+    def test_manual_scope_seq_outer_parallel_inner_two_stage_pipeline_taskid_deps(self):
+        """TaskId-explicit mirror of the seq outer / parallel inner pipeline."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        M, N = 4, 8
+        TILE_R, TILE_C = 32, 32
+        ROWS, COLS = M * TILE_R, N * TILE_C
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def stage1(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(x, [row, col], [TILE_R, TILE_C])
+                r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, t)
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], scratch)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def stage2(
+                self,
+                scratch: pl.Tensor[[ROWS, COLS], pl.FP32],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(scratch, [row, col], [TILE_R, TILE_C])
+                r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, t)
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                with pl.manual_scope():
+                    for i in pl.range(M):
+                        row: pl.Scalar[pl.INDEX] = i * TILE_R
+                        for j in pl.parallel(N):
+                            col: pl.Scalar[pl.INDEX] = j * TILE_C
+                            scratch = self.stage1(x, scratch, row, col)
+                            tid = pl.task_id_of(scratch)
+                            out = self.stage2(scratch, out, row, col, deps=[tid])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        assert "for (int64_t i = 0; i < 4; i += 1)" in code, code
+        assert "for (int64_t j = 0; j < 8; j += 1)" in code, code
+        assert code.count("PTO2_SCOPE() {") == 1, code
+        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
+        assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
+        assert "TaskOutputTensors task_1_outs = rt_submit_aiv_task(" in code, code
+        taskid_name = self._assert_taskid_decl_feeds_dep(
+            code,
+            task_index=0,
+            params_name="params_t1",
+            name_pattern=r"tid(?:__ssa_v\d+)?",
+        )
+        assert taskid_name.startswith("tid"), code
+        assert "tid__ssa_v0__tid" not in code, code
+        assert "__tid_1 = task_" not in code, code
+        assert code.count("add_dep(") == 1, code
+
     def test_manual_scope_parallel_outer_seq_inner_two_stage_pipeline(self):
         """End-to-end: outer ``pl.parallel`` + inner ``pl.range`` inside
         ``with pl.manual_scope():`` with the same 2-stage pipeline.
@@ -3248,6 +3346,82 @@ class TestManualScopeCodegen:
         assert "params_t1.add_dep(scratch__ssa_v5__tid);" in code, code
 
         # Cross-iteration parallel: the ONLY add_dep is the intra-iteration one.
+        assert code.count("add_dep(") == 1, code
+
+    def test_manual_scope_parallel_outer_seq_inner_two_stage_pipeline_taskid_deps(self):
+        """TaskId-explicit mirror of the parallel outer / seq inner pipeline."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        M, N = 8, 4
+        TILE_R, TILE_C = 32, 32
+        ROWS, COLS = M * TILE_R, N * TILE_C
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def stage1(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(x, [row, col], [TILE_R, TILE_C])
+                r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, t)
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], scratch)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def stage2(
+                self,
+                scratch: pl.Tensor[[ROWS, COLS], pl.FP32],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                t: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.load(scratch, [row, col], [TILE_R, TILE_C])
+                r: pl.Tile[[TILE_R, TILE_C], pl.FP32] = pl.add(t, t)
+                ret: pl.Tensor[[ROWS, COLS], pl.FP32] = pl.store(r, [row, col], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[ROWS, COLS], pl.FP32],
+                scratch: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+                out: pl.Out[pl.Tensor[[ROWS, COLS], pl.FP32]],
+            ) -> pl.Tensor[[ROWS, COLS], pl.FP32]:
+                with pl.manual_scope():
+                    for i in pl.parallel(M):
+                        row: pl.Scalar[pl.INDEX] = i * TILE_R
+                        for j in pl.range(N):
+                            col: pl.Scalar[pl.INDEX] = j * TILE_C
+                            scratch = self.stage1(x, scratch, row, col)
+                            tid = pl.task_id_of(scratch)
+                            out = self.stage2(scratch, out, row, col, deps=[tid])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code, code
+        assert "for (int64_t i = 0; i < 8; i += 1)" in code, code
+        assert "for (int64_t j = 0; j < 4; j += 1)" in code, code
+        assert code.count("PTO2_SCOPE() {") == 1, code
+        assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
+        assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
+        assert "TaskOutputTensors task_1_outs = rt_submit_aiv_task(" in code, code
+        taskid_name = self._assert_taskid_decl_feeds_dep(
+            code,
+            task_index=0,
+            params_name="params_t1",
+            name_pattern=r"tid(?:__ssa_v\d+)?",
+        )
+        assert taskid_name.startswith("tid"), code
+        assert "tid__ssa_v0__tid" not in code, code
+        assert "__tid_1 = task_" not in code, code
         assert code.count("add_dep(") == 1, code
 
     def test_manual_scope_parallel_dynamic_trip_count_rejected(self):
@@ -3430,6 +3604,7 @@ class TestManualScopeCodegen:
 
         assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
         assert "PTO2TaskId tid = task_0_outs.task_id();" in code
+        assert code.count("PTO2TaskId tid = task_0_outs.task_id();") == 1, code
         assert "params_t1.add_dep(tid);" in code
         assert "params_t2.add_dep(tid);" in code
         assert "tid__ssa_v0__tid" not in code
@@ -3506,9 +3681,16 @@ class TestManualScopeCodegen:
         code = _generate_orch_code(transformed)
 
         assert "PTO2_SCOPE(PTO2ScopeMode::MANUAL)" in code
-        assert ".task_id()" in code
-        assert ".add_dep(" in code
+        assert "for (int64_t i = 0; i < 4; i += 1)" in code, code
+        self._assert_taskid_decl_feeds_dep(
+            code,
+            task_index=0,
+            params_name="params_t1",
+            name_pattern=r"tid(?:__ssa_v\d+)?",
+        )
         assert "tid__ssa_v0__tid" not in code
+        assert "__tid_1 = task_" not in code, code
+        assert code.count("add_dep(") == 1, code
 
 
 if __name__ == "__main__":

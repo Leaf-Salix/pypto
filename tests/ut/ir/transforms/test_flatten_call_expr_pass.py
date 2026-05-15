@@ -692,6 +692,9 @@ class TestFlattenPreservesAttrs:
         assert k2_call is not None, "expected the k2 call in the manual scope"
         edges = k2_call.attrs.get("user_manual_dep_edges", [])
         assert len(edges) == 1, f"user_manual_dep_edges for TaskId dep dropped after FlattenCallExpr; got {edges!r}"
+        edge = edges[0]
+        assert isinstance(edge.type, ir.ScalarType)
+        assert edge.type.dtype == pl.TASK_ID
 
 
 class TestFlattenCallInScopeStmt:
