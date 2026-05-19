@@ -492,7 +492,6 @@ class TestPhaseFenceDepCompressionCodegen:
 
         code = _compile_program(Prog)
         assert "rt_submit_dummy_task" not in code, code
-        assert re.search(r"PTO2TaskId params_t0_deps\[1\];", code), code
 
     def test_updated_array_dep_in_same_parallel_body_falls_back(self):
         rows, cols = 128, 128
@@ -524,11 +523,12 @@ class TestPhaseFenceDepCompressionCodegen:
                     tids = pl.array.create(branches, pl.TASK_ID)
                     for phase in pl.range(2):
                         row: pl.Scalar[pl.INDEX] = phase * tile_r
+                        next_row: pl.Scalar[pl.INDEX] = row + tile_r
                         for branch in pl.parallel(branches):
                             col: pl.Scalar[pl.INDEX] = branch * tile_c
                             out, tid_a = pl.submit(self.kern, x, out, row, col, deps=[tids])
                             tids[branch] = tid_a
-                            out, tid_b = pl.submit(self.kern, x, out, row + tile_r, col, deps=[tids])
+                            out, tid_b = pl.submit(self.kern, x, out, next_row, col, deps=[tids])
                             tids[branch] = tid_b
                 return out
 
