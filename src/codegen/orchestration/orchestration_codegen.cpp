@@ -782,7 +782,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
     if (in_manual_scope_depth_ > 0 && for_stmt->kind_ != ForKind::Parallel) {
       for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
         const auto& iter_arg = for_stmt->iter_args_[i];
-        if (!iter_arg || !ForBodyHasManualDepOnArray(for_stmt->body_, iter_arg.get())) continue;
+        if (!iter_arg || !ForBodyHasManualDepOnArray(for_stmt->body_, iter_arg.get(), /*descend_into_for=*/false)) {
+          continue;
+        }
         auto source = TryResolveExplicitPhaseFenceArrayForVar(iter_arg.get());
         if (!source.has_value()) continue;
         in_loop_phase_fence_barriers[iter_arg.get()] = EmitPhaseFenceBarrier(*source);
@@ -2446,11 +2448,17 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return finder.result;
   }
 
-  static bool ForBodyHasManualDepOnArray(const StmtPtr& body, const Var* target) {
+  static bool ForBodyHasManualDepOnArray(const StmtPtr& body, const Var* target, bool descend_into_for = true) {
     class Finder : public IRVisitor {
      public:
       bool found = false;
       const Var* target = nullptr;
+      bool descend_into_for = true;
+
+      void VisitStmt_(const ForStmtPtr& f) override {
+        if (found || !descend_into_for) return;
+        IRVisitor::VisitStmt_(f);
+      }
 
       void VisitExpr_(const CallPtr& call) override {
         if (found) return;
@@ -2468,6 +2476,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     };
     Finder finder;
     finder.target = target;
+    finder.descend_into_for = descend_into_for;
     finder.VisitStmt(body);
     return finder.found;
   }
