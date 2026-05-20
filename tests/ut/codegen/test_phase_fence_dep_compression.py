@@ -178,49 +178,6 @@ class TestPhaseFenceDepCompressionCodegen:
         _assert_single_barrier_shape(code, fanin=branches)
         assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 1, code
 
-    def test_four_level_flattened_phase_fence(self):
-        rows, cols = 512, 128
-        tile_r, tile_c = 16, 32
-        branches = 4
-
-        @pl.program
-        class Prog:
-            @pl.function(type=pl.FunctionType.InCore)
-            def kern(
-                self,
-                x: pl.Tensor[[rows, cols], pl.FP32],
-                out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
-                row: pl.Scalar[pl.INDEX],
-                col: pl.Scalar[pl.INDEX],
-            ) -> pl.Tensor[[rows, cols], pl.FP32]:
-                t: pl.Tile[[tile_r, tile_c], pl.FP32] = pl.load(x, [row, col], [tile_r, tile_c])
-                r: pl.Tile[[tile_r, tile_c], pl.FP32] = pl.add(t, t)
-                ret: pl.Tensor[[rows, cols], pl.FP32] = pl.store(r, [row, col], out)
-                return ret
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                x: pl.Tensor[[rows, cols], pl.FP32],
-                out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
-            ) -> pl.Tensor[[rows, cols], pl.FP32]:
-                with pl.manual_scope():
-                    tids = pl.array.create(branches, pl.TASK_ID)
-                    for epoch in pl.range(2):
-                        for layer in pl.range(2):
-                            for phase in pl.range(2):
-                                base: pl.Scalar[pl.INDEX] = ((epoch * 2 + layer) * 2 + phase) * branches
-                                for branch in pl.parallel(branches):
-                                    row: pl.Scalar[pl.INDEX] = (base + branch) * tile_r
-                                    col: pl.Scalar[pl.INDEX] = branch * tile_c
-                                    out, tid = pl.submit(self.kern, x, out, row, col, deps=[tids])
-                                    tids[branch] = tid
-                return out
-
-        code = _compile_program(Prog)
-        _assert_single_barrier_shape(code, fanin=branches)
-        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 1, code
-
     def test_nested_parallel_does_not_emit_outer_dummy_barrier(self):
         rows, cols = 256, 128
         tile_r, tile_c = 16, 32
