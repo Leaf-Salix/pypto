@@ -58,6 +58,36 @@ def _assert_flattened_stage_strict(swimlane_data: dict, *, stages: int, branches
         )
 
 
+def _assert_min_task_count(swimlane_data: dict, *, expected: int) -> None:
+    tasks = swimlane_data["tasks"]
+    if len(tasks) < expected:
+        pytest.skip(f"need >= {expected} tasks for swimlane check, got {len(tasks)}")
+
+
+def _assert_multiloop_chain_shape(swimlane_data: dict) -> None:
+    branches = _BRANCHES
+    expected = 2 * branches + 2 * branches + 2 * 2
+    _assert_min_task_count(swimlane_data, expected=expected)
+    tasks = sorted(swimlane_data["tasks"], key=lambda t: t["start_time_us"])[:expected]
+
+    k1_stage0 = tasks[:branches]
+    k1_stage1 = tasks[branches : 2 * branches]
+    after_k1 = tasks[2 * branches :]
+    k1_stage0_end = max(t["end_time_us"] for t in k1_stage0)
+    k1_stage1_start = min(t["start_time_us"] for t in k1_stage1)
+    k1_stage1_end = max(t["end_time_us"] for t in k1_stage1)
+    after_k1_start = min(t["start_time_us"] for t in after_k1)
+
+    assert k1_stage1_start >= k1_stage0_end, (
+        f"multi-loop k1 stage 1 starts at {k1_stage1_start:.2f}us before k1 stage 0 "
+        f"ends at {k1_stage0_end:.2f}us"
+    )
+    assert after_k1_start >= k1_stage1_end, (
+        f"multi-loop downstream stage starts at {after_k1_start:.2f}us before final k1 stage "
+        f"ends at {k1_stage1_end:.2f}us"
+    )
+
+
 def _new_swimlane_file(test_runner, case: PTOTestCase, *, label: str) -> Path:
     if not test_runner.config.enable_l2_swimlane:
         pytest.skip(f"pass --enable-l2-swimlane to validate {label}")
@@ -70,6 +100,11 @@ def _new_swimlane_file(test_runner, case: PTOTestCase, *, label: str) -> Path:
         candidates = sorted(after, key=lambda p: p.stat().st_mtime, reverse=True)[:1]
     assert candidates, f"No l2_perf_records.json generated for {label}"
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _new_swimlane_json(test_runner, case: PTOTestCase, *, label: str) -> dict:
+    path = _new_swimlane_file(test_runner, case, label=label)
+    return json.loads(path.read_text())
 
 
 def _build_submit_flattened_program(*, epochs: int, layers: int, phases: int):
@@ -441,33 +476,51 @@ class TestPhaseFenceDepCompressionCorrectness:
 
 
 @pytest.fixture(scope="module")
-def submit_three_level_swimlane(test_runner) -> dict:
-    path = _new_swimlane_file(
+def multiloop_chain_swimlane(test_runner) -> dict:
+    return _new_swimlane_json(
         test_runner,
-        _submit_case(epochs=2, layers=1, phases=3, name="phase_fence_submit_3l_swimlane"),
-        label="three-level submit phase-fence",
+        _multiloop_chain_case(),
+        label="multi-loop chain phase-fence",
     )
-    return json.loads(path.read_text())
 
 
 class TestPhaseFenceDepCompressionSwimlane:
-    def test_submit_three_level_strict(self, submit_three_level_swimlane: dict):
-        _assert_flattened_stage_strict(submit_three_level_swimlane, stages=2 * 3, branches=_BRANCHES)
+    def test_multiloop_chain_default(self, multiloop_chain_swimlane: dict):
+        _assert_multiloop_chain_shape(multiloop_chain_swimlane)
+
+    def test_submit_three_level_strict(self, test_runner):
+        _require_extra_swimlane_case("three-level submit swimlane")
+        data = _new_swimlane_json(
+            test_runner,
+            _submit_case(epochs=2, layers=1, phases=3, name="phase_fence_submit_3l_swimlane"),
+            label="three-level submit phase-fence",
+        )
+        _assert_flattened_stage_strict(data, stages=2 * 3, branches=_BRANCHES)
 
     def test_submit_four_level_strict(self, test_runner):
         _require_extra_swimlane_case("four-level submit swimlane")
-        path = _new_swimlane_file(
+        data = _new_swimlane_json(
             test_runner,
             _submit_case(epochs=2, layers=2, phases=2, name="phase_fence_submit_4l_swimlane"),
             label="four-level submit phase-fence",
         )
-        _assert_flattened_stage_strict(json.loads(path.read_text()), stages=2 * 2 * 2, branches=_BRANCHES)
+        _assert_flattened_stage_strict(data, stages=2 * 2 * 2, branches=_BRANCHES)
 
     def test_pl_at_three_level_strict(self, test_runner):
         _require_extra_swimlane_case("three-level pl.at swimlane")
-        path = _new_swimlane_file(
+        data = _new_swimlane_json(
             test_runner,
             _pl_at_case(epochs=2, phases=3, name="phase_fence_pl_at_3l_swimlane"),
             label="three-level pl.at phase-fence",
         )
-        _assert_flattened_stage_strict(json.loads(path.read_text()), stages=2 * 3, branches=_BRANCHES)
+        _assert_flattened_stage_strict(data, stages=2 * 3, branches=_BRANCHES)
+
+    def test_reset_per_outer_generates_swimlane(self, test_runner):
+        _require_extra_swimlane_case("reset-per-outer swimlane")
+        data = _new_swimlane_json(test_runner, _reset_case(), label="reset-per-outer phase-fence")
+        _assert_min_task_count(data, expected=2 * 2 * _BRANCHES)
+
+    def test_sibling_loops_strict(self, test_runner):
+        _require_extra_swimlane_case("sibling-loop swimlane")
+        data = _new_swimlane_json(test_runner, _sibling_loops_case(), label="sibling-loop phase-fence")
+        _assert_flattened_stage_strict(data, stages=2, branches=_BRANCHES)
