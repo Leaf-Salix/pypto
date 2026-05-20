@@ -451,15 +451,21 @@ def _build_dense_mixed_phase_graph_program(*, branches: int):
                     tids_local_c = pl.array.create(branches, pl.TASK_ID)
                     tids_local_d = pl.array.create(branches, pl.TASK_ID)
                     group_base: pl.Scalar[pl.INDEX] = stage2a_base + group * dense_group_span
-                    out, _ = pl.submit(self.kernel_stripe, data, group_base * tile_m, out)
+                    row_group: pl.Scalar[pl.INDEX] = group_base * tile_m
+                    out, _ = pl.submit(self.kernel_stripe, data, row_group, out)
                     for step in pl.range(steps):
                         step_base: pl.Scalar[pl.INDEX] = group_base + 1 + step * dense_step_span
                         prev_local_c = tids_local_c[0]
-                        out, _ = pl.submit(self.kernel_stripe, data, step_base * tile_m, out, deps=[prev_local_c])
-                        out, _ = pl.submit(self.kernel_stripe, data, (step_base + 1) * tile_m, out, deps=[tids_local_d])
+                        row_step: pl.Scalar[pl.INDEX] = step_base * tile_m
+                        row_step_fanin: pl.Scalar[pl.INDEX] = (step_base + 1) * tile_m
+                        out, _ = pl.submit(self.kernel_stripe, data, row_step, out, deps=[prev_local_c])
+                        out, _ = pl.submit(
+                            self.kernel_stripe, data, row_step_fanin, out, deps=[tids_local_d]
+                        )
                         for deep_phase in pl.range(deep_phases):
                             phase_base: pl.Scalar[pl.INDEX] = step_base + 2 + deep_phase * dense_phase_span
-                            out, _ = pl.submit(self.kernel_stripe, data, phase_base * tile_m, out)
+                            row_phase: pl.Scalar[pl.INDEX] = phase_base * tile_m
+                            out, _ = pl.submit(self.kernel_stripe, data, row_phase, out)
                             nested_base: pl.Scalar[pl.INDEX] = phase_base + 1
                             for lane in pl.parallel(branches):
                                 row_local_c: pl.Scalar[pl.INDEX] = (nested_base + lane) * tile_m

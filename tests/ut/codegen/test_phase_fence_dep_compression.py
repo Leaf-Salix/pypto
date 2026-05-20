@@ -364,15 +364,19 @@ class TestPhaseFenceDepCompressionCodegen:
                     for group in pl.parallel(2):
                         tids_local = pl.array.create(branches, pl.TASK_ID)
                         group_base: pl.Scalar[pl.INDEX] = group * 22
-                        out, _ = pl.submit(self.kern, x, out, group_base * tile_r, 0)
+                        row_group: pl.Scalar[pl.INDEX] = group_base * tile_r
+                        out, _ = pl.submit(self.kern, x, out, row_group, 0)
                         for step in pl.range(2):
                             step_base: pl.Scalar[pl.INDEX] = group_base + 1 + step * 10
                             prev_local = tids_local[0]
-                            out, _ = pl.submit(self.kern, x, out, step_base * tile_r, 0, deps=[prev_local])
-                            out, _ = pl.submit(self.kern, x, out, (step_base + 1) * tile_r, 0, deps=[tids_local])
+                            row_step: pl.Scalar[pl.INDEX] = step_base * tile_r
+                            row_step_fanin: pl.Scalar[pl.INDEX] = (step_base + 1) * tile_r
+                            out, _ = pl.submit(self.kern, x, out, row_step, 0, deps=[prev_local])
+                            out, _ = pl.submit(self.kern, x, out, row_step_fanin, 0, deps=[tids_local])
                             for deep_phase in pl.range(2):
                                 phase_base: pl.Scalar[pl.INDEX] = step_base + 2 + deep_phase * 5
-                                out, _ = pl.submit(self.kern, x, out, phase_base * tile_r, 0)
+                                row_phase: pl.Scalar[pl.INDEX] = phase_base * tile_r
+                                out, _ = pl.submit(self.kern, x, out, row_phase, 0)
                                 for lane in pl.parallel(branches):
                                     row_local: pl.Scalar[pl.INDEX] = (phase_base + 1 + lane) * tile_r
                                     col_local: pl.Scalar[pl.INDEX] = lane * tile_c
@@ -397,8 +401,10 @@ class TestPhaseFenceDepCompressionCodegen:
                         out, _ = pl.submit(self.kern, x, out, row_cross, col_cross, deps=[tids_a])
 
                     prev = tids_a[0]
-                    out, _ = pl.submit(self.kern, x, out, 64 * tile_r, 0, deps=[prev])
-                    out, _ = pl.submit(self.kern, x, out, 65 * tile_r, 0, deps=[tids_b])
+                    row_scalar: pl.Scalar[pl.INDEX] = 64 * tile_r
+                    row_fanin: pl.Scalar[pl.INDEX] = 65 * tile_r
+                    out, _ = pl.submit(self.kern, x, out, row_scalar, 0, deps=[prev])
+                    out, _ = pl.submit(self.kern, x, out, row_fanin, 0, deps=[tids_b])
                 return out
 
         code = _compile_program(Prog)
