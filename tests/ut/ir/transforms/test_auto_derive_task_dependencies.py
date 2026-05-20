@@ -150,10 +150,14 @@ class TestAutoDeriveTaskDependencies:
                 return x
 
             @pl.function(type=pl.FunctionType.Orchestration)
-            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            def main(
+                self,
+                scratch: pl.Tensor[[64], pl.FP32],
+                other: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
                 with pl.manual_scope():
                     produced, producer_tid = pl.submit(self.fill, scratch)
-                    _unused, user_tid = pl.submit(self.unrelated, scratch)
+                    _unused, user_tid = pl.submit(self.unrelated, other)
                     out, _ = pl.submit(self.consume, produced, deps=[user_tid])
                 return out
 
