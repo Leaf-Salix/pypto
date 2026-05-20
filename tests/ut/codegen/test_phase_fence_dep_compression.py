@@ -178,6 +178,66 @@ class TestPhaseFenceDepCompressionCodegen:
         _assert_single_barrier_shape(code, fanin=branches)
         assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 1, code
 
+    def test_sibling_producer_consumer_loops_emit_phase_fence(self):
+        rows, cols = 256, 128
+        tile_r, tile_c = 32, 32
+        branches = 4
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(
+                self,
+                x: pl.Tensor[[rows, cols], pl.FP32],
+                out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[rows, cols], pl.FP32]:
+                t: pl.Tile[[tile_r, tile_c], pl.FP32] = pl.load(x, [row, col], [tile_r, tile_c])
+                r: pl.Tile[[tile_r, tile_c], pl.FP32] = pl.add(t, 1.0)
+                ret: pl.Tensor[[rows, cols], pl.FP32] = pl.store(r, [row, col], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(
+                self,
+                x: pl.Tensor[[rows, cols], pl.FP32],
+                out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+                row: pl.Scalar[pl.INDEX],
+                col: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[rows, cols], pl.FP32]:
+                t: pl.Tile[[tile_r, tile_c], pl.FP32] = pl.load(x, [row, col], [tile_r, tile_c])
+                r: pl.Tile[[tile_r, tile_c], pl.FP32] = pl.add(t, 2.0)
+                ret: pl.Tensor[[rows, cols], pl.FP32] = pl.store(r, [row, col], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[rows, cols], pl.FP32],
+                out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+            ) -> pl.Tensor[[rows, cols], pl.FP32]:
+                with pl.manual_scope():
+                    tids = pl.array.create(branches, pl.TASK_ID)
+                    for producer_branch in pl.parallel(branches):
+                        col: pl.Scalar[pl.INDEX] = producer_branch * tile_c
+                        out, tid = pl.submit(self.k1, x, out, 0, col)
+                        tids[producer_branch] = tid
+                    for consumer_branch in pl.parallel(branches):
+                        col: pl.Scalar[pl.INDEX] = consumer_branch * tile_c
+                        out, _ = pl.submit(self.k2, x, out, tile_r, col, deps=[tids])
+                return out
+
+        code = _compile_program(Prog)
+        _assert_single_barrier_shape(code, fanin=branches)
+        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 1, code
+        _assert_ordered(
+            code,
+            "for (int64_t producer_branch =",
+            "rt_submit_dummy_task(params_phase_fence_barrier_0)",
+            "for (int64_t consumer_branch =",
+        )
+
     def test_nested_parallel_does_not_emit_outer_dummy_barrier(self):
         rows, cols = 256, 128
         tile_r, tile_c = 16, 32

@@ -191,6 +191,58 @@ def _build_reset_per_outer_program():
     return ResetPerOuterPhaseFence
 
 
+def _build_sibling_loops_program():
+    branches = _BRANCHES
+    tile_m = _TILE_M
+    big_n = _BIG_N
+    big_m = 2 * branches * tile_m
+
+    @pl.program
+    class SiblingLoopPhaseFence:
+        @pl.function(type=pl.FunctionType.InCore)
+        def producer(
+            self,
+            data: pl.Tensor[[big_m, big_n], pl.FP32],
+            row_offset: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[big_m, big_n], pl.FP32]],
+        ) -> pl.Tensor[[big_m, big_n], pl.FP32]:
+            tile: pl.Tile[[tile_m, big_n], pl.FP32] = pl.load(data, [row_offset, 0], [tile_m, big_n])
+            result: pl.Tile[[tile_m, big_n], pl.FP32] = pl.add(tile, 1.0)
+            ret: pl.Tensor[[big_m, big_n], pl.FP32] = pl.store(result, [row_offset, 0], out)
+            return ret
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def consumer(
+            self,
+            data: pl.Tensor[[big_m, big_n], pl.FP32],
+            row_offset: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[big_m, big_n], pl.FP32]],
+        ) -> pl.Tensor[[big_m, big_n], pl.FP32]:
+            tile: pl.Tile[[tile_m, big_n], pl.FP32] = pl.load(data, [row_offset, 0], [tile_m, big_n])
+            result: pl.Tile[[tile_m, big_n], pl.FP32] = pl.add(tile, 1.0)
+            ret: pl.Tensor[[big_m, big_n], pl.FP32] = pl.store(result, [row_offset, 0], out)
+            return ret
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.Tensor[[big_m, big_n], pl.FP32],
+            out: pl.Out[pl.Tensor[[big_m, big_n], pl.FP32]],
+        ) -> pl.Tensor[[big_m, big_n], pl.FP32]:
+            with pl.manual_scope():
+                tids = pl.array.create(branches, pl.TASK_ID)
+                for branch in pl.parallel(branches):
+                    row: pl.Scalar[pl.INDEX] = branch * tile_m
+                    out, tid = pl.submit(self.producer, data, row, out)
+                    tids[branch] = tid
+                for branch in pl.parallel(branches):
+                    row: pl.Scalar[pl.INDEX] = (branches + branch) * tile_m
+                    out, _ = pl.submit(self.consumer, data, row, out, deps=[tids])
+            return out
+
+    return SiblingLoopPhaseFence
+
+
 class _PhaseFenceCase(PTOTestCase):
     __test__ = False
 
@@ -249,6 +301,16 @@ def _reset_case(*, platform: str | None = None):
     return _PhaseFenceCase("phase_fence_reset_per_outer", _build_reset_per_outer_program, rows=rows, platform=platform)
 
 
+def _sibling_loops_case(*, platform: str | None = None):
+    rows = 2 * _BRANCHES * _TILE_M
+    return _PhaseFenceCase(
+        "phase_fence_sibling_loops",
+        _build_sibling_loops_program,
+        rows=rows,
+        platform=platform,
+    )
+
+
 class TestPhaseFenceDepCompressionCorrectness:
     @pytest.fixture(autouse=True)
     def _skip_when_collecting_l2_swimlane(self, test_runner):
@@ -280,6 +342,11 @@ class TestPhaseFenceDepCompressionCorrectness:
     def test_reset_per_outer_correctness(self, test_runner, platform):
         result = test_runner.run(_reset_case(platform=platform))
         assert result.passed, f"reset-per-outer phase-fence failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_sibling_loops_correctness(self, test_runner, platform):
+        result = test_runner.run(_sibling_loops_case(platform=platform))
+        assert result.passed, f"sibling-loop phase-fence failed: {result.error}"
 
 
 @pytest.fixture(scope="module")
