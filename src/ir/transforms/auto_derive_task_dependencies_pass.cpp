@@ -587,7 +587,7 @@ class AutoDepMutator : public IRMutator {
     fallback_stack_.pop_back();
     prior_stack_.pop_back();
     if (fallback) {
-      return std::make_shared<const RuntimeScopeStmt>(false, op->name_hint_, op->body_, op->span_,
+      return std::make_shared<const RuntimeScopeStmt>(false, op->name_hint_, std::move(new_body), op->span_,
                                                       op->leading_comments_, op->attrs_);
     }
     if (new_body.get() != op->body_.get()) {
@@ -605,20 +605,23 @@ class AutoDepMutator : public IRMutator {
 
     VarPtr task_id = LookupTaskId(op.get());
     bool needs_fallback = false;
+    auto user_edges = GetDepAttr(call, kAttrManualDepEdges);
     auto accesses = SummarizeAccesses(call, &needs_fallback);
     if (needs_fallback) {
-      fallback_stack_.back() = true;
+      if (user_edges.empty()) {
+        fallback_stack_.back() = true;
+      }
       return call;
     }
     if (accesses.empty()) return call;
 
     std::vector<VarPtr> compiler_edges;
-    auto user_edges = GetDepAttr(call, kAttrManualDepEdges);
     for (const auto& access : accesses) {
       for (const auto& prior : prior_stack_.back()) {
         if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
         if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
         if (!HasHazard(access.kind, prior.kind)) continue;
+        if (!user_edges.empty() && (prior.dynamic_producer || !prior.task_id_var)) continue;
         if (prior.dynamic_producer || !prior.task_id_var) {
           fallback_stack_.back() = true;
           return call;
