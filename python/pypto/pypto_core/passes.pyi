@@ -539,6 +539,9 @@ def derive_call_directions() -> Pass:
     auto-verified by the pipeline.
     """
 
+def expand_manual_phase_fence() -> Pass:
+    """Create a pass that inserts dummy TaskId barriers for manual phase fences."""
+
 def flatten_call_expr() -> Pass:
     """Create a pass that flattens nested call expressions."""
 
@@ -745,6 +748,7 @@ __all__ = [
     "inline_functions",
     "normalize_stmt_structure",
     "derive_call_directions",
+    "expand_manual_phase_fence",
     "NestedCallErrorType",
     "UseAfterDefErrorType",
     "DiagnosticSeverity",
