@@ -509,6 +509,8 @@ class StorageRootAnalysis : public IRVisitor {
     if (!callee) return {};
     auto dirs = ResolveCalleeDirections(program_, call, callee);
     std::vector<StorageLocation> locations;
+    auto returned_locations = CollectReturnedLocations(call, callee);
+    if (!returned_locations.empty()) return returned_locations;
     for (size_t i = 0; i < dirs.size() && i < call->args_.size(); ++i) {
       if (dirs[i] != ParamDirection::Out && dirs[i] != ParamDirection::InOut) continue;
       locations.push_back(ResolveExpr(call->args_[i]));
@@ -521,6 +523,45 @@ class StorageRootAnalysis : public IRVisitor {
   std::unordered_map<const Var*, MemRefPtr> root_memrefs_;
   std::unordered_map<const Var*, std::vector<StorageLocation>> tuple_locations_;
   std::unordered_set<const Var*> unsupported_locations_;
+
+  std::vector<StorageLocation> CollectReturnedLocations(const CallPtr& call,
+                                                        const FunctionPtr& callee) const {
+    auto ret = GetTrailingReturn(callee ? callee->body_ : StmtPtr{});
+    if (!ret) return {};
+    std::vector<StorageLocation> locations;
+    locations.reserve(ret->value_.size());
+    for (const auto& value : ret->value_) {
+      locations.push_back(ResolveCalleeReturnExpr(value, call, callee));
+    }
+    bool has_location = false;
+    for (const auto& location : locations) {
+      if (HasLocation(location)) {
+        has_location = true;
+        break;
+      }
+    }
+    if (!has_location) return {};
+    return locations;
+  }
+
+  StorageLocation ResolveCalleeReturnExpr(const ExprPtr& expr, const CallPtr& call,
+                                          const FunctionPtr& callee) const {
+    auto var = AsVarLike(expr);
+    if (!var || !call || !callee) return {};
+    for (size_t i = 0; i < callee->params_.size() && i < call->args_.size(); ++i) {
+      if (callee->params_[i] && callee->params_[i]->UniqueId() == var->UniqueId()) {
+        return ResolveExpr(call->args_[i]);
+      }
+    }
+    return {};
+  }
+
+  static ReturnStmtPtr GetTrailingReturn(const StmtPtr& stmt) {
+    if (auto ret = As<ReturnStmt>(stmt)) return ret;
+    auto seq = As<SeqStmts>(stmt);
+    if (!seq || seq->stmts_.empty()) return nullptr;
+    return As<ReturnStmt>(seq->stmts_.back());
+  }
 };
 
 class SubmitTaskIdCollector : public IRVisitor {
