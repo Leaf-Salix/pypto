@@ -98,7 +98,7 @@ class PassManager:
     PassManager maintains a sequence of Pass instances for different optimization
     strategies and executes them in order on a given Program. It delegates to
     a C++ PassPipeline for execution. Instrumentation (verification, logging)
-    is handled by PassContext â€?see passes.PassContext.
+    is handled by PassContext - see passes.PassContext.
 
     Usage:
         # Get a pre-configured strategy
@@ -156,7 +156,7 @@ class PassManager:
             ("CanonicalizeIOOrder", lambda: passes.canonicalize_io_order()),
             # MaterializeTensorStrides fills empty stride slots on every
             # TensorView with packed canonical strides (RFC #1300 Â§2.4).
-            # Active in the default pipeline starting at P6 â€?by this point
+            # Active in the default pipeline starting at P6 - by this point
             # LowerTransposeLoadParamLayout has produced canonical-form DN
             # parameters, so the materialized strides match the IR shape
             # without going through the legacy `dn_swap` codegen path.

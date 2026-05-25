@@ -119,6 +119,56 @@ class TestAutoDeriveTaskDependencies:
         read2_call = _user_calls(out, "read2")[0]
         assert _compiler_edges(read2_call) == []
 
+    def test_manual_scope_waw_hazard_adds_compiler_edge(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    _first, first_tid = pl.submit(self.fill, scratch)
+                    out, _ = pl.submit(self.fill, scratch)
+                return out
+
+        out = _run_auto_deps(Prog)
+        second_fill = _user_calls(out, "fill")[1]
+        edges = _compiler_edges(second_fill)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "first_tid"
+
+    def test_manual_scope_war_hazard_adds_compiler_edge(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def read(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    _seen, reader_tid = pl.submit(self.read, scratch)
+                    out, _ = pl.submit(self.fill, scratch)
+                return out
+
+        out = _run_auto_deps(Prog)
+        fill_call = _user_calls(out, "fill")[0]
+        edges = _compiler_edges(fill_call)
+        assert len(edges) == 1
+        assert edges[0].name_hint == "reader_tid"
+
     def test_auto_scope_is_unchanged(self):
         @pl.program
         class Prog:
@@ -485,6 +535,78 @@ class TestAutoDeriveTaskDependencies:
         scopes = _runtime_scopes(out)
         assert len(scopes) == 1
         assert scopes[0].manual is False
+
+    def test_partial_user_deps_with_dynamic_hazard_still_falls_back(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def unrelated(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[[64], pl.FP32],
+                other: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    carried = scratch
+                    for _i in pl.range(0, 4):
+                        carried, _producer_tid = pl.submit(self.fill, carried)
+                    _unrelated, unrelated_tid = pl.submit(self.unrelated, other)
+                    out, _ = pl.submit(self.consume, carried, deps=[unrelated_tid])
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is False
+
+    def test_fallback_strips_previous_compiler_edges(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                return out
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                scratch: pl.Tensor[[64], pl.FP32],
+                src: pl.Tensor[[4, 16], pl.FP32],
+                index: pl.Tensor[[4, 8], pl.INT32],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                with pl.manual_scope():
+                    produced, _producer_tid = pl.submit(self.fill, scratch)
+                    _first, _ = pl.submit(self.consume, produced)
+                    gathered = pl.tensor.gather(src, -1, index)
+                    out, _ = pl.submit(self.consume, gathered)
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is False
+        for call in _user_calls(out, "consume"):
+            assert _compiler_edges(call) == []
 
     def test_large_control_flow_root_set_falls_back_to_auto_scope(self):
         @pl.program

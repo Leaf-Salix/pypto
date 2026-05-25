@@ -263,6 +263,18 @@ void AppendUnique(std::vector<VarPtr>* vars, const VarPtr& candidate) {
   vars->push_back(candidate);
 }
 
+std::vector<std::pair<std::string, std::any>> StripCompilerManualDepEdges(
+    const std::vector<std::pair<std::string, std::any>>& attrs) {
+  std::vector<std::pair<std::string, std::any>> stripped;
+  stripped.reserve(attrs.size());
+  for (const auto& attr : attrs) {
+    if (attr.first != kAttrCompilerManualDepEdges) {
+      stripped.push_back(attr);
+    }
+  }
+  return stripped;
+}
+
 bool HasHazard(AccessKind current, AccessKind prior) {
   const bool current_writes = current == AccessKind::Write || current == AccessKind::ReadWrite;
   const bool current_reads = current == AccessKind::Read || current == AccessKind::ReadWrite;
@@ -587,8 +599,9 @@ class AutoDepMutator : public IRMutator {
     fallback_stack_.pop_back();
     prior_stack_.pop_back();
     if (fallback) {
-      return std::make_shared<const RuntimeScopeStmt>(false, op->name_hint_, std::move(new_body), op->span_,
-                                                      op->leading_comments_, op->attrs_);
+      auto stripped_body = StripCompilerDeps(new_body);
+      return std::make_shared<const RuntimeScopeStmt>(false, op->name_hint_, std::move(stripped_body),
+                                                      op->span_, op->leading_comments_, op->attrs_);
     }
     if (new_body.get() != op->body_.get()) {
       return std::make_shared<const RuntimeScopeStmt>(op->manual_, op->name_hint_, std::move(new_body),
@@ -608,9 +621,7 @@ class AutoDepMutator : public IRMutator {
     auto user_edges = GetDepAttr(call, kAttrManualDepEdges);
     auto accesses = SummarizeAccesses(call, &needs_fallback);
     if (needs_fallback) {
-      if (user_edges.empty()) {
-        fallback_stack_.back() = true;
-      }
+      fallback_stack_.back() = true;
       return call;
     }
     if (accesses.empty()) return call;
@@ -621,7 +632,6 @@ class AutoDepMutator : public IRMutator {
         if (!storage_ || !storage_->MayAlias(access.location.root, prior.location.root)) continue;
         if (!RegionsMayOverlap(access.location.region, prior.location.region)) continue;
         if (!HasHazard(access.kind, prior.kind)) continue;
-        if (!user_edges.empty() && (prior.dynamic_producer || !prior.task_id_var)) continue;
         if (prior.dynamic_producer || !prior.task_id_var) {
           fallback_stack_.back() = true;
           return call;
@@ -647,6 +657,25 @@ class AutoDepMutator : public IRMutator {
   }
 
  private:
+  class CompilerDepStripper : public IRMutator {
+   protected:
+    ExprPtr VisitExpr_(const CallPtr& op) override {
+      auto base = IRMutator::VisitExpr_(op);
+      auto call = As<Call>(base);
+      if (!call) return base;
+
+      auto stripped_attrs = StripCompilerManualDepEdges(call->attrs_);
+      if (stripped_attrs.size() == call->attrs_.size()) return call;
+      return std::make_shared<const Call>(call->op_, call->args_, call->kwargs_, std::move(stripped_attrs),
+                                          call->GetType(), call->span_);
+    }
+  };
+
+  static StmtPtr StripCompilerDeps(const StmtPtr& stmt) {
+    CompilerDepStripper stripper;
+    return stripper.VisitStmt(stmt);
+  }
+
   VarPtr LookupTaskId(const Call* call) const {
     if (!task_id_by_call_) return nullptr;
     auto it = task_id_by_call_->find(call);
