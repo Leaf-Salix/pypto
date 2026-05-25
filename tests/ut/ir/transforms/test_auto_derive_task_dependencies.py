@@ -234,6 +234,29 @@ class TestAutoDeriveTaskDependencies:
         assert [edge.name_hint for edge in user_edges] == ["user_tid"]
         assert [edge.name_hint for edge in compiler_edges] == ["producer_tid"]
 
+    def test_user_edge_covering_submit_return_keeps_manual_scope(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def producer(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consumer(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, scratch: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    produced, producer_tid = pl.submit(self.producer, scratch)
+                    out, _ = pl.submit(self.consumer, produced, deps=[producer_tid])
+                return out
+
+        out = _run_auto_deps(Prog)
+        scopes = _runtime_scopes(out)
+        assert len(scopes) == 1
+        assert scopes[0].manual is True
+
     def test_static_disjoint_slices_do_not_add_compiler_edge(self):
         @pl.program
         class Prog:
