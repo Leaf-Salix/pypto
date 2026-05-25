@@ -237,6 +237,116 @@ def _build_prefill_sparse_attn_phase_fence_perf64_program():
     return DeepSeekPrefillSparseAttnPhaseFencePerf64
 
 
+def _build_qwen3_rms_lm_head_phase_fence_perf64_program():
+    """64x64 manual profiling witness: Qwen3-14B final_rmsnorm -> lm_head.
+
+    The source topology is pypto-lib/models/qwen3/14b/rms_lm_head.py:
+    final_rmsnorm produces the normalized hidden scratch, then each lm_head
+    vocab shard consumes that scratch. This keeps the real phase names and
+    dependency shape while avoiding a full 14B matmul in ST.
+    """
+
+    @pl.program
+    class Qwen3RmsLmHeadPhaseFencePerf64:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32],
+            scratch: pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32]],
+        ) -> pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32]:
+            with pl.manual_scope():
+                tids = pl.array.create(_PERF_BRANCHES, pl.TASK_ID)
+                for branch in pl.parallel(_PERF_BRANCHES):
+                    row: pl.Scalar[pl.INDEX] = branch * _PERF_ROWS_PER_BRANCH
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="qwen3_perf64_final_rmsnorm",
+                    ) as tid:
+                        hidden = data[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                        scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS] = pl.add(
+                            pl.mul(hidden, 0.5),
+                            0.25,
+                        )
+                    tids[branch] = tid
+
+                for branch in pl.parallel(_PERF_BRANCHES):
+                    row: pl.Scalar[pl.INDEX] = branch * _PERF_ROWS_PER_BRANCH
+                    with pl.at(
+                        level=pl.Level.CORE_GROUP,
+                        name_hint="qwen3_perf64_lm_head",
+                        deps=[tids],
+                    ):
+                        normed = scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                        out[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS] = pl.add(
+                            pl.mul(normed, 3.0),
+                            1.0,
+                        )
+            return out
+
+    return Qwen3RmsLmHeadPhaseFencePerf64
+
+
+def _build_chained_phase_fence_perf64_program():
+    """64-wide chained phase witness: A0 -> A1 -> B0 -> B1.
+
+    Shape requested for swimlane profiling:
+
+      tids -> range(2, parallel 64 deps=[tids], update tids)
+           -> range(2, parallel 64 deps=[tids], update tids)
+
+    Every phase is internally fenced by the previous phase's full TaskId array,
+    so an uncompressed runtime dependency graph would have three 64x64
+    all-to-all boundaries. The phase-fence pass should turn each boundary into
+    one dummy barrier with 64 fanin + 64 fanout.
+    """
+
+    @pl.program
+    class ChainedPhaseFencePerf64:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32],
+            scratch: pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32]],
+        ) -> pl.Tensor[[_PERF_ROWS, _PERF_COLS], pl.FP32]:
+            with pl.manual_scope():
+                tids = pl.array.create(_PERF_BRANCHES, pl.TASK_ID)
+                for _a_phase in pl.range(2):
+                    for branch in pl.parallel(_PERF_BRANCHES):
+                        row: pl.Scalar[pl.INDEX] = branch * _PERF_ROWS_PER_BRANCH
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="perf64_chain_a_phase",
+                            deps=[tids],
+                        ) as tid:
+                            tile = data[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                            prev = scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                            scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS] = pl.add(
+                                pl.add(tile, prev),
+                                1.0,
+                            )
+                        tids[branch] = tid
+
+                for _b_phase in pl.range(2):
+                    for branch in pl.parallel(_PERF_BRANCHES):
+                        row: pl.Scalar[pl.INDEX] = branch * _PERF_ROWS_PER_BRANCH
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="perf64_chain_b_phase",
+                            deps=[tids],
+                        ) as tid:
+                            prev = scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                            out[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS] = pl.add(
+                                prev,
+                                1.0,
+                            )
+                        tids[branch] = tid
+            return out
+
+    return ChainedPhaseFencePerf64
+
+
 _CASE_SPECS = [
     _CaseSpec(
         name="pypto_lib_deepseek_prefill_sparse_attn_phase_fence",
@@ -329,6 +439,59 @@ class _PyptoLibPhaseFencePerf64Case(PTOTestCase):
         tensors["out"][:] = (tensors["data"] + 1.0) * 2.0
 
 
+class _PyptoLibQwen3RmsLmHeadPerf64Case(PTOTestCase):
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "pypto_lib_qwen3_14b_rms_lm_head_phase_fence_perf64x64"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("data", [_PERF_ROWS, _PERF_COLS], DataType.FP32, init_value=_perf_input_tensor),
+            TensorSpec("scratch", [_PERF_ROWS, _PERF_COLS], DataType.FP32, init_value=0.0),
+            TensorSpec("out", [_PERF_ROWS, _PERF_COLS], DataType.FP32, init_value=0.0, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_qwen3_rms_lm_head_phase_fence_perf64_program()
+
+    def compute_expected(self, tensors, params=None):
+        tensors["out"][:] = (tensors["data"] * 0.5 + 0.25) * 3.0 + 1.0
+
+
+class _PyptoLibChainedPhaseFencePerf64Case(PTOTestCase):
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "pypto_lib_chained_phase_fence_perf64x64"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("data", [_PERF_ROWS, _PERF_COLS], DataType.FP32, init_value=_perf_input_tensor),
+            TensorSpec("scratch", [_PERF_ROWS, _PERF_COLS], DataType.FP32, init_value=0.0),
+            TensorSpec("out", [_PERF_ROWS, _PERF_COLS], DataType.FP32, init_value=0.0, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_chained_phase_fence_perf64_program()
+
+    def compute_expected(self, tensors, params=None):
+        # A0: data + 0 + 1; A1: data + A0 + 1; B0 and B1 both write A1 + 1.
+        tensors["out"][:] = tensors["data"] * 2.0 + 3.0
+
+
 def _new_swimlane_json(test_runner, case: PTOTestCase, *, label: str) -> dict:
     if not test_runner.config.enable_l2_swimlane:
         pytest.skip(f"pass --enable-l2-swimlane to validate {label}")
@@ -359,6 +522,28 @@ def _assert_two_phase_strict(swimlane_data: dict, *, label: str, branches: int =
     )
 
 
+def _assert_flattened_phase_strict(
+    swimlane_data: dict,
+    *,
+    label: str,
+    phases: int,
+    branches: int,
+) -> None:
+    expected = phases * branches
+    tasks = swimlane_data["tasks"]
+    if len(tasks) < expected:
+        pytest.skip(f"need >= {expected} tasks for {label}, got {len(tasks)}")
+    tasks = sorted(tasks, key=lambda t: t["start_time_us"])[:expected]
+    grouped = [tasks[i * branches : (i + 1) * branches] for i in range(phases)]
+    for phase in range(phases - 1):
+        phase_end = max(t["end_time_us"] for t in grouped[phase])
+        next_start = min(t["start_time_us"] for t in grouped[phase + 1])
+        assert next_start >= phase_end, (
+            f"{label} phase {phase + 1} starts at {next_start:.2f}us before "
+            f"phase {phase} ends at {phase_end:.2f}us"
+        )
+
+
 def _generate_orch_code(program_cls) -> str:
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend910B)
@@ -371,12 +556,12 @@ def _generate_orch_code(program_cls) -> str:
     raise ValueError("No orchestration function found in program")
 
 
-def _assert_compressed_barrier_codegen(code: str) -> None:
+def _assert_compressed_barrier_codegen(code: str, *, branches: int = _BRANCHES) -> None:
     assert "rt_submit_dummy_task(params_phase_fence_barrier_0)" in code, code
-    assert f"PTO2TaskId params_phase_fence_barrier_0_deps[{_BRANCHES}];" in code, code
+    assert f"PTO2TaskId params_phase_fence_barrier_0_deps[{branches}];" in code, code
     real_dep_arrays = re.findall(r"PTO2TaskId (params_t\d+)_deps\[1\];", code)
     assert real_dep_arrays, code
-    assert not re.search(rf"PTO2TaskId params_t\d+_deps\[{_BRANCHES}\];", code), code
+    assert not re.search(rf"PTO2TaskId params_t\d+_deps\[{branches}\];", code), code
 
 
 class TestPyptoLibPhaseFenceCorrectness:
@@ -407,6 +592,20 @@ class TestPyptoLibPhaseFencePerfSwimlane:
         data = _new_swimlane_json(test_runner, _PyptoLibPhaseFencePerf64Case(), label=label)
         _assert_two_phase_strict(data, label=label, branches=_PERF_BRANCHES)
 
+    def test_qwen3_rms_lm_head_perf64x64_phase_strictness(self, test_runner):
+        if os.environ.get(_PERF_ENV) != "1":
+            pytest.skip(f"set {_PERF_ENV}=1 to run the 64x64 manual profiling witness")
+        label = "pypto_lib_qwen3_14b_rms_lm_head_phase_fence_perf64x64"
+        data = _new_swimlane_json(test_runner, _PyptoLibQwen3RmsLmHeadPerf64Case(), label=label)
+        _assert_two_phase_strict(data, label=label, branches=_PERF_BRANCHES)
+
+    def test_chained_perf64x64_phase_strictness(self, test_runner):
+        if os.environ.get(_PERF_ENV) != "1":
+            pytest.skip(f"set {_PERF_ENV}=1 to run the chained 64x64 manual profiling witness")
+        label = "pypto_lib_chained_phase_fence_perf64x64"
+        data = _new_swimlane_json(test_runner, _PyptoLibChainedPhaseFencePerf64Case(), label=label)
+        _assert_flattened_phase_strict(data, label=label, phases=4, branches=_PERF_BRANCHES)
+
 
 class TestPyptoLibPhaseFenceCodegen:
     @pytest.mark.parametrize("spec", _CASE_SPECS, ids=[spec.name for spec in _CASE_SPECS])
@@ -415,3 +614,21 @@ class TestPyptoLibPhaseFenceCodegen:
         _assert_compressed_barrier_codegen(code)
         assert spec.producer_hint in code
         assert spec.consumer_hint in code
+
+    def test_qwen3_perf64_codegen_uses_compressed_dummy_barrier(self):
+        code = _generate_orch_code(_build_qwen3_rms_lm_head_phase_fence_perf64_program())
+        _assert_compressed_barrier_codegen(code, branches=_PERF_BRANCHES)
+        assert "qwen3_perf64_final_rmsnorm" in code
+        assert "qwen3_perf64_lm_head" in code
+
+    def test_chained_perf64_codegen_uses_three_compressed_dummy_barriers(self):
+        code = _generate_orch_code(_build_chained_phase_fence_perf64_program())
+        # There are two static barrier call sites: one inside the A range loop
+        # and one inside the B range loop. At runtime they cover three real
+        # non-empty boundaries: A0->A1, A1->B0, and B0->B1.
+        assert code.count("rt_submit_dummy_task(params_phase_fence_barrier_") == 2, code
+        for idx in range(2):
+            assert f"PTO2TaskId params_phase_fence_barrier_{idx}_deps[{_PERF_BRANCHES}];" in code, code
+        assert not re.search(rf"PTO2TaskId params_t\d+_deps\[{_PERF_BRANCHES}\];", code), code
+        assert "perf64_chain_a_phase" in code
+        assert "perf64_chain_b_phase" in code
