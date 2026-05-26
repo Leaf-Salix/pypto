@@ -569,7 +569,7 @@ class _PyptoLibChainedPhaseFencePerfCase(PTOTestCase):
         self._rows = branches * _PERF_ROWS_PER_BRANCH
 
     def get_name(self) -> str:
-        return f"pypto_lib_chained_phase_fence_perf{self._branches}x{self._branches}"
+        return f"pypto_lib_chained_phase_fence_perf_width{self._branches}"
 
     def get_strategy(self) -> OptimizationStrategy:
         return OptimizationStrategy.Default
@@ -707,7 +707,7 @@ class TestPyptoLibPhaseFencePerfSwimlane:
         if os.environ.get(_PERF_ENV) != "1":
             pytest.skip(f"set {_PERF_ENV}=1 to run the configurable chained manual profiling witness")
         branches = _perf_chain_branches_from_env()
-        label = f"pypto_lib_chained_phase_fence_perf{branches}x{branches}"
+        label = f"pypto_lib_chained_phase_fence_perf_width{branches}"
         data = _new_swimlane_json(test_runner, _PyptoLibChainedPhaseFencePerfCase(branches), label=label)
         _assert_flattened_phase_strict(data, label=label, phases=4, branches=branches)
 
