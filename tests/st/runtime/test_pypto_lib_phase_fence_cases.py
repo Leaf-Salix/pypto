@@ -38,6 +38,7 @@ _COLS = 32
 _ROWS = _BRANCHES * _ROWS_PER_BRANCH
 _SCALE_EPS = 1e-4
 _PERF_ENV = "PYPTO_LIB_PHASE_FENCE_PERF"
+_PERF_CHAIN_BRANCHES_ENV = "PYPTO_LIB_PHASE_FENCE_CHAIN_BRANCHES"
 _PERF_BRANCHES = 64
 _PERF_ROWS_PER_BRANCH = 1
 _PERF_COLS = 32
@@ -347,6 +348,57 @@ def _build_chained_phase_fence_perf64_program():
     return ChainedPhaseFencePerf64
 
 
+def _build_chained_phase_fence_perf_program(branches: int):
+    """Runtime-configurable chained witness: A0 -> A1 -> B0 -> B1."""
+
+    rows = branches * _PERF_ROWS_PER_BRANCH
+
+    @pl.program
+    class ChainedPhaseFencePerf:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.Tensor[[rows, _PERF_COLS], pl.FP32],
+            scratch: pl.Tensor[[rows, _PERF_COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[rows, _PERF_COLS], pl.FP32]],
+        ) -> pl.Tensor[[rows, _PERF_COLS], pl.FP32]:
+            with pl.manual_scope():
+                tids = pl.array.create(branches, pl.TASK_ID)
+                for _a_phase in pl.range(2):
+                    for branch in pl.parallel(branches):
+                        row: pl.Scalar[pl.INDEX] = branch * _PERF_ROWS_PER_BRANCH
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="perf_param_chain_a_phase",
+                            deps=[tids],
+                        ) as tid:
+                            tile = data[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                            prev = scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                            scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS] = pl.add(
+                                pl.add(tile, prev),
+                                1.0,
+                            )
+                        tids[branch] = tid
+
+                for _b_phase in pl.range(2):
+                    for branch in pl.parallel(branches):
+                        row: pl.Scalar[pl.INDEX] = branch * _PERF_ROWS_PER_BRANCH
+                        with pl.at(
+                            level=pl.Level.CORE_GROUP,
+                            name_hint="perf_param_chain_b_phase",
+                            deps=[tids],
+                        ) as tid:
+                            prev = scratch[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS]
+                            out[row : row + _PERF_ROWS_PER_BRANCH, 0:_PERF_COLS] = pl.add(
+                                prev,
+                                1.0,
+                            )
+                        tids[branch] = tid
+            return out
+
+    return ChainedPhaseFencePerf
+
+
 _CASE_SPECS = [
     _CaseSpec(
         name="pypto_lib_deepseek_prefill_sparse_attn_phase_fence",
@@ -380,6 +432,22 @@ def _input_tensor() -> torch.Tensor:
 def _perf_input_tensor() -> torch.Tensor:
     values = torch.arange(_PERF_ROWS * _PERF_COLS, dtype=torch.float32).reshape(_PERF_ROWS, _PERF_COLS)
     return values / 257.0 - 4.0
+
+
+def _perf_input_tensor_for(rows: int) -> torch.Tensor:
+    values = torch.arange(rows * _PERF_COLS, dtype=torch.float32).reshape(rows, _PERF_COLS)
+    return values / 257.0 - 4.0
+
+
+def _perf_chain_branches_from_env() -> int:
+    raw = os.environ.get(_PERF_CHAIN_BRANCHES_ENV, str(_PERF_BRANCHES))
+    try:
+        branches = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_PERF_CHAIN_BRANCHES_ENV} must be an integer, got {raw!r}") from exc
+    if branches <= 0:
+        raise ValueError(f"{_PERF_CHAIN_BRANCHES_ENV} must be positive, got {branches}")
+    return branches
 
 
 class _PyptoLibPhaseFenceCase(PTOTestCase):
@@ -486,6 +554,35 @@ class _PyptoLibChainedPhaseFencePerf64Case(PTOTestCase):
 
     def get_program(self) -> Any:
         return _build_chained_phase_fence_perf64_program()
+
+    def compute_expected(self, tensors, params=None):
+        # A0: data + 0 + 1; A1: data + A0 + 1; B0 and B1 both write A1 + 1.
+        tensors["out"][:] = tensors["data"] * 2.0 + 3.0
+
+
+class _PyptoLibChainedPhaseFencePerfCase(PTOTestCase):
+    __test__ = False
+
+    def __init__(self, branches: int, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self._branches = branches
+        self._rows = branches * _PERF_ROWS_PER_BRANCH
+
+    def get_name(self) -> str:
+        return f"pypto_lib_chained_phase_fence_perf{self._branches}x{self._branches}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("data", [self._rows, _PERF_COLS], DataType.FP32, init_value=lambda: _perf_input_tensor_for(self._rows)),
+            TensorSpec("scratch", [self._rows, _PERF_COLS], DataType.FP32, init_value=0.0),
+            TensorSpec("out", [self._rows, _PERF_COLS], DataType.FP32, init_value=0.0, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_chained_phase_fence_perf_program(self._branches)
 
     def compute_expected(self, tensors, params=None):
         # A0: data + 0 + 1; A1: data + A0 + 1; B0 and B1 both write A1 + 1.
@@ -605,6 +702,14 @@ class TestPyptoLibPhaseFencePerfSwimlane:
         label = "pypto_lib_chained_phase_fence_perf64x64"
         data = _new_swimlane_json(test_runner, _PyptoLibChainedPhaseFencePerf64Case(), label=label)
         _assert_flattened_phase_strict(data, label=label, phases=4, branches=_PERF_BRANCHES)
+
+    def test_chained_param_perf_phase_strictness(self, test_runner):
+        if os.environ.get(_PERF_ENV) != "1":
+            pytest.skip(f"set {_PERF_ENV}=1 to run the configurable chained manual profiling witness")
+        branches = _perf_chain_branches_from_env()
+        label = f"pypto_lib_chained_phase_fence_perf{branches}x{branches}"
+        data = _new_swimlane_json(test_runner, _PyptoLibChainedPhaseFencePerfCase(branches), label=label)
+        _assert_flattened_phase_strict(data, label=label, phases=4, branches=branches)
 
 
 class TestPyptoLibPhaseFenceCodegen:
