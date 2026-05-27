@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <any>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +48,23 @@ struct BarrierDecision {
   StmtPtr barrier_stmt;
   std::unordered_set<const Call*> consumers;
 };
+
+struct DepArrayInfo {
+  VarPtr source_var;
+  int64_t consumer_count = 0;
+  std::unordered_set<const Call*> consumers;
+};
+
+struct LoopBodyDepIndex {
+  std::vector<const Var*> dep_array_order;
+  std::unordered_map<const Var*, DepArrayInfo> dep_arrays;
+  std::unordered_set<const Var*> body_defined_vars;
+  std::unordered_set<const Var*> updated_arrays;
+};
+
+using ArrayAliasSet = std::unordered_set<const Var*>;
+using ArrayAliasMap = std::unordered_map<const Var*, std::shared_ptr<ArrayAliasSet>>;
+using NestedUpdateCollector = std::function<void(const ForStmtPtr&, std::unordered_set<const Var*>*)>;
 
 static std::optional<int64_t> EvalConstInt(const ExprPtr& expr) {
   if (auto ci = As<ConstInt>(expr)) return ci->value_;
@@ -86,15 +104,19 @@ static std::optional<VarPtr> GetSingleManualDepTaskIdArray(const CallPtr& call) 
   return dep;
 }
 
-static bool ManualDepsExactlyArray(const CallPtr& call, const Var* target) {
-  auto dep = GetSingleManualDepTaskIdArray(call);
-  return dep.has_value() && dep->get() == target;
-}
-
 static bool ShouldEmitPhaseFenceBarrier(int64_t producer_count, int64_t consumer_count) {
   if (producer_count <= 0 || consumer_count <= 0) return false;
   const int64_t estimated_saving = producer_count * consumer_count - (producer_count + consumer_count);
   return estimated_saving >= kPhaseFenceMinEstimatedEdgeSavings;
+}
+
+static void InsertWithAliases(const Var* var, const ArrayAliasMap& aliases,
+                              std::unordered_set<const Var*>* out) {
+  if (!var || !out) return;
+  out->insert(var);
+  auto it = aliases.find(var);
+  if (it == aliases.end()) return;
+  out->insert(it->second->begin(), it->second->end());
 }
 
 static std::vector<StmtPtr> FlattenToVector(const StmtPtr& body) {
@@ -109,65 +131,46 @@ static StmtPtr MakeSeqOrStmt(std::vector<StmtPtr> stmts, const Span& span) {
   return SeqStmts::Flatten(std::move(stmts), span);
 }
 
-static std::vector<VarPtr> CollectDirectManualDepArrays(const StmtPtr& body) {
+static LoopBodyDepIndex BuildLoopBodyDepIndex(const StmtPtr& body, const ArrayAliasMap& aliases,
+                                              const NestedUpdateCollector& collect_nested_updates) {
   class Collector : public IRVisitor {
    public:
-    std::vector<VarPtr> arrays;
-    std::unordered_set<const Var*> seen;
+    Collector(const ArrayAliasMap& aliases, const NestedUpdateCollector& collect_nested_updates)
+        : aliases_(aliases), collect_nested_updates_(collect_nested_updates) {}
 
-    void VisitStmt_(const ForStmtPtr&) override {}
-
-    void VisitExpr_(const CallPtr& call) override {
-      auto dep = GetSingleManualDepTaskIdArray(call);
-      if (dep.has_value() && seen.insert(dep->get()).second) arrays.push_back(*dep);
-      IRVisitor::VisitExpr_(call);
-    }
-  };
-  Collector collector;
-  collector.VisitStmt(body);
-  return collector.arrays;
-}
-
-static bool BodyUpdatesArray(const StmtPtr& body, const Var* target) {
-  class Finder : public IRVisitor {
-   public:
-    bool found = false;
-    const Var* target = nullptr;
-
-    void VisitStmt_(const ForStmtPtr&) override {}
-
-    void VisitStmt_(const AssignStmtPtr& assign) override {
-      if (found) return;
-      auto call = As<Call>(assign->value_);
-      if (call && call->op_->name_ == "array.update_element" && !call->args_.empty()) {
-        auto base = AsVarLike(call->args_[0]);
-        if (base && base.get() == target) {
-          found = true;
-          return;
-        }
-      }
-      IRVisitor::VisitStmt_(assign);
-    }
-  };
-  Finder finder;
-  finder.target = target;
-  finder.VisitStmt(body);
-  return finder.found;
-}
-
-static std::unordered_set<const Var*> CollectBodyDefinedVars(const StmtPtr& body) {
-  class Collector : public IRVisitor {
-   public:
-    std::unordered_set<const Var*> vars;
+    LoopBodyDepIndex index;
 
     void AddVars(const std::vector<VarPtr>& defined_vars) {
       for (const auto& var : defined_vars) {
-        if (var) vars.insert(var.get());
+        if (var) index.body_defined_vars.insert(var.get());
       }
     }
 
+    void VisitStmt_(const ForStmtPtr& for_stmt) override {
+      AddVars(for_stmt->return_vars_);
+      if (collect_nested_updates_) collect_nested_updates_(for_stmt, &index.updated_arrays);
+    }
+
+    void RecordDepConsumer(const CallPtr& call) {
+      auto dep = GetSingleManualDepTaskIdArray(call);
+      if (!dep.has_value()) return;
+      const Var* key = dep->get();
+      auto [it, inserted] = index.dep_arrays.emplace(key, DepArrayInfo{});
+      if (inserted) {
+        index.dep_array_order.push_back(key);
+        it->second.source_var = *dep;
+      }
+      it->second.consumer_count += 1;
+      it->second.consumers.insert(call.get());
+    }
+
     void VisitStmt_(const AssignStmtPtr& assign) override {
-      if (assign->var_) vars.insert(assign->var_.get());
+      if (assign->var_) index.body_defined_vars.insert(assign->var_.get());
+      auto call = As<Call>(assign->value_);
+      if (call && call->op_->name_ == "array.update_element" && !call->args_.empty()) {
+        auto base = AsVarLike(call->args_[0]);
+        if (base) InsertWithAliases(base.get(), aliases_, &index.updated_arrays);
+      }
       IRVisitor::VisitStmt_(assign);
     }
 
@@ -176,58 +179,27 @@ static std::unordered_set<const Var*> CollectBodyDefinedVars(const StmtPtr& body
       IRVisitor::VisitStmt_(if_stmt);
     }
 
-    void VisitStmt_(const ForStmtPtr& for_stmt) override { AddVars(for_stmt->return_vars_); }
-
     void VisitStmt_(const WhileStmtPtr& while_stmt) override {
       AddVars(while_stmt->return_vars_);
       for (const auto& iter_arg : while_stmt->iter_args_) {
-        if (iter_arg) vars.insert(iter_arg.get());
+        if (iter_arg) index.body_defined_vars.insert(iter_arg.get());
       }
       IRVisitor::VisitStmt_(while_stmt);
     }
-  };
-  Collector collector;
-  collector.VisitStmt(body);
-  return collector.vars;
-}
-
-static int64_t CountManualDepConsumersOnArray(const StmtPtr& body, const Var* target) {
-  class Counter : public IRVisitor {
-   public:
-    int64_t count = 0;
-    const Var* target = nullptr;
-
-    void VisitStmt_(const ForStmtPtr&) override {}
 
     void VisitExpr_(const CallPtr& call) override {
-      if (ManualDepsExactlyArray(call, target)) ++count;
+      RecordDepConsumer(call);
       IRVisitor::VisitExpr_(call);
     }
+
+   private:
+    const ArrayAliasMap& aliases_;
+    const NestedUpdateCollector& collect_nested_updates_;
   };
-  Counter counter;
-  counter.target = target;
-  counter.VisitStmt(body);
-  return counter.count;
-}
 
-static void CollectCoveredConsumers(const StmtPtr& body, const Var* target,
-                                    std::unordered_set<const Call*>* consumers) {
-  class Collector : public IRVisitor {
-   public:
-    const Var* target = nullptr;
-    std::unordered_set<const Call*>* consumers = nullptr;
-
-    void VisitStmt_(const ForStmtPtr&) override {}
-
-    void VisitExpr_(const CallPtr& call) override {
-      if (ManualDepsExactlyArray(call, target)) consumers->insert(call.get());
-      IRVisitor::VisitExpr_(call);
-    }
-  };
-  Collector collector;
-  collector.target = target;
-  collector.consumers = consumers;
+  Collector collector(aliases, collect_nested_updates);
   collector.VisitStmt(body);
+  return std::move(collector.index);
 }
 
 static int64_t GetArrayProducerCount(const VarPtr& array_var) {
@@ -326,12 +298,64 @@ class ManualPhaseFenceMutator : public IRMutator {
   }
 
  private:
+  void AddCachedArrayAlias(const Var* lhs, const Var* rhs) {
+    if (!lhs || !rhs || lhs == rhs) return;
+    auto lhs_set = GetOrCreateArrayAliasSet(lhs);
+    auto rhs_set = GetOrCreateArrayAliasSet(rhs);
+    if (lhs_set == rhs_set) return;
+    if (lhs_set->size() < rhs_set->size()) std::swap(lhs_set, rhs_set);
+    lhs_set->insert(rhs_set->begin(), rhs_set->end());
+    for (const Var* var : *rhs_set) {
+      array_aliases_[var] = lhs_set;
+    }
+  }
+
+  std::shared_ptr<ArrayAliasSet> GetOrCreateArrayAliasSet(const Var* var) {
+    auto it = array_aliases_.find(var);
+    if (it != array_aliases_.end()) return it->second;
+    auto alias_set = std::make_shared<ArrayAliasSet>();
+    alias_set->insert(var);
+    array_aliases_[var] = alias_set;
+    return alias_set;
+  }
+
+  void RegisterLoopArrayAliases(const ForStmtPtr& for_stmt) {
+    if (!for_stmt) return;
+    for (const auto& iter_arg : for_stmt->iter_args_) {
+      if (!iter_arg || !IsTaskIdArrayVar(iter_arg)) continue;
+      auto init_var = AsVarLike(iter_arg->initValue_);
+      if (!init_var || !IsTaskIdArrayVar(init_var)) continue;
+      AddCachedArrayAlias(iter_arg.get(), init_var.get());
+    }
+  }
+
+  void CollectNestedArrayUpdates(const ForStmtPtr& for_stmt, std::unordered_set<const Var*>* updated_arrays) {
+    if (!for_stmt || !updated_arrays) return;
+    RegisterLoopArrayAliases(for_stmt);
+    auto [it, inserted] = nested_update_cache_.emplace(for_stmt.get(), std::unordered_set<const Var*>{});
+    if (inserted) {
+      const auto nested_index = BuildLoopBodyDepIndex(
+          for_stmt->body_, array_aliases_,
+          [this](const ForStmtPtr& nested_for, std::unordered_set<const Var*>* nested_updates) {
+            CollectNestedArrayUpdates(nested_for, nested_updates);
+          });
+      it->second = std::move(nested_index.updated_arrays);
+    }
+    updated_arrays->insert(it->second.begin(), it->second.end());
+  }
+
   std::vector<BarrierDecision> BuildDecisions(const ForStmtPtr& for_stmt, const StmtPtr& body) {
     std::vector<BarrierDecision> decisions;
     std::unordered_set<const Var*> already_decided;
     std::unordered_set<const Var*> current_iter_args;
+    RegisterLoopArrayAliases(for_stmt);
+    const auto body_index = BuildLoopBodyDepIndex(
+        body, array_aliases_, [this](const ForStmtPtr& nested_for, std::unordered_set<const Var*>* updates) {
+          CollectNestedArrayUpdates(nested_for, updates);
+        });
 
-    auto try_add = [&](const VarPtr& match_var, const VarPtr& barrier_source_var, int64_t consumer_count) {
+    auto try_add = [&](const VarPtr& match_var, const VarPtr& barrier_source_var, int64_t consumer_count,
+                       const std::unordered_set<const Call*>& consumers) {
       if (!match_var || !barrier_source_var || !already_decided.insert(match_var.get()).second) return;
       const int64_t producer_count = GetArrayProducerCount(match_var);
       if (!ShouldEmitPhaseFenceBarrier(producer_count, consumer_count)) return;
@@ -340,7 +364,7 @@ class ManualPhaseFenceMutator : public IRMutator {
       decision.source_var = barrier_source_var;
       decision.barrier_stmt =
           MakeBarrierStmt(barrier_source_var, &decision.barrier_var, for_stmt->span_, barrier_counter_++);
-      CollectCoveredConsumers(body, match_var.get(), &decision.consumers);
+      decision.consumers = consumers;
       if (!decision.consumers.empty()) decisions.push_back(std::move(decision));
     };
 
@@ -352,15 +376,19 @@ class ManualPhaseFenceMutator : public IRMutator {
       if (iter_arg) current_iter_args.insert(iter_arg.get());
     }
 
-    const auto body_defined_vars = CollectBodyDefinedVars(body);
-    for (const auto& dep_array : CollectDirectManualDepArrays(body)) {
+    for (const Var* dep_array_key : body_index.dep_array_order) {
+      auto info_it = body_index.dep_arrays.find(dep_array_key);
+      if (info_it == body_index.dep_arrays.end()) continue;
+      const auto& info = info_it->second;
+      const auto& dep_array = info.source_var;
       if (!dep_array || current_iter_args.count(dep_array.get()) != 0 ||
-          body_defined_vars.count(dep_array.get()) != 0 || BodyUpdatesArray(body, dep_array.get())) {
+          body_index.body_defined_vars.count(dep_array.get()) != 0 ||
+          body_index.updated_arrays.count(dep_array.get()) != 0) {
         continue;
       }
-      int64_t consumers = CountManualDepConsumersOnArray(body, dep_array.get());
+      int64_t consumers = info.consumer_count;
       if (is_parallel) consumers *= trip_count;
-      try_add(dep_array, dep_array, consumers);
+      try_add(dep_array, dep_array, consumers, info.consumers);
     }
 
     return decisions;
@@ -392,6 +420,8 @@ class ManualPhaseFenceMutator : public IRMutator {
 
   bool in_manual_scope_ = false;
   int64_t barrier_counter_ = 0;
+  ArrayAliasMap array_aliases_;
+  std::unordered_map<const ForStmt*, std::unordered_set<const Var*>> nested_update_cache_;
 };
 
 ProgramPtr TransformExpandManualPhaseFence(const ProgramPtr& program) {
