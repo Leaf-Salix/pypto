@@ -105,7 +105,11 @@ const Tensor& tmp = alloc_0.get_ref(0);
 
 ### 阶段 6–8：任务提交与控制流
 
-所有任务提交包裹在顶层 `PTO2_SCOPE()` 中：
+所有任务提交包裹在顶层 `PTO2_SCOPE()` 中。codegen 不再依据 `for` / `if` 结构
+决定 scope 位置：[MaterializeRuntimeScopes](../passes/37-materialize_runtime_scopes.md)
+pass 会向 IR 中插入显式的 AUTO `RuntimeScopeStmt` 节点（函数体以及每个
+`for` / `if` 体），codegen 从这些节点 1:1 地 emit `PTO2_SCOPE`（manual scope
+降级为 `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`）：
 
 ```cpp
 PTO2_SCOPE() {
@@ -459,7 +463,7 @@ dep 数组填充条目在 source 是 iter_arg / 数组槽 carry 时会被
 
 ### Phase-fence dummy barrier
 
-`DeriveCallDirections` 之后，`ExpandManualPhaseFence` pass 可能压缩有收益的完整数组
+`DeriveCallDirections` 之后，`ExpandManualPhaseFence` pass 可能压缩有收益且稳定的完整数组
 manual dependency：它把选中的 `manual_dep_edges=[tids]` consumer call 改写为
 `manual_dep_edges=[barrier_tid]`。该 pass 会插入一个带标记的 `system.task_dummy`
 call；这个 dummy call 自己的 `manual_dep_edges` 仍然引用原始 TaskId 数组。Orchestration
@@ -473,6 +477,13 @@ tids[N] -> dummy barrier -> consumers[M]
 ```
 
 如果形状、安全性或收益不够明确，则继续走原有直接 `manual_dep_edges` lowering 路径。
+尤其在 `manual_scope` 中，用户显式写出的 deps 是权威约束：如果 `pl.parallel`
+body 读取 `deps=[tids]`，随后又更新 `tids[branch]`，这表示 same-carrier
+dependency chain，而不是可在 loop 前压缩的 snapshot source。若用户需要
+layer-parallel snapshot 语义，应写入单独的 `tids_next` carrier，并通过
+loop-carried `init_values` / `pl.yield_` 在 parallel body 之后传回。这里不写成
+普通的 `tids = tids_next`，因为当前 codegen 路径暂不支持 `ArrayType` 的普通
+`AssignStmt`。
 
 **codegen 入口检查的约束（带用户友好 CHECK 消息）：**
 

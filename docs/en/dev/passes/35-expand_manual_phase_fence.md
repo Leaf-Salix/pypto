@@ -3,9 +3,9 @@
 ## Overview
 
 `ExpandManualPhaseFence` compresses profitable full-array `TaskId`
-dependencies produced by explicit `pl.submit(..., deps=[tids])` edges. It is a
-narrow orchestration-only pass: when a manual-scope consumer fanout depends on
-one complete `Array[TASK_ID]`, the pass inserts one dependency-only
+dependencies carried by explicit manual-scope deps. It is a narrow
+orchestration-only pass: when a manual-scope consumer fanout depends on one
+stable, read-only `Array[TASK_ID]`, the pass inserts one dependency-only
 `system.task_dummy` barrier and rewrites the covered consumers to depend on the
 barrier `TaskId`.
 
@@ -23,7 +23,10 @@ tids[N] -> system.task_dummy -> consumers[M]
 
 The pass does not change kernel execution semantics. It only rewrites
 `Call.attrs["manual_dep_edges"]` on selected consumer calls and adds the marked
-dummy-task call that codegen lowers to `rt_submit_dummy_task(...)`.
+dummy-task call that codegen lowers to `rt_submit_dummy_task(...)`. After
+outlining, this covers manual-scope orchestration calls uniformly, including
+both `pl.submit(..., deps=[...])` and `pl.at(..., deps=[...])` shapes once they
+are represented as calls with `manual_dep_edges`.
 
 ## Position in the pipeline
 
@@ -56,9 +59,10 @@ regions and analyzes each loop body:
    `manual_dep_edges=[barrier_tid]`, leaving all other call attrs unchanged.
 
 For sequential loops, the barrier is inserted inside the loop before the
-rewritten body. For parallel loops, the barrier is inserted before the parallel
-loop so all branches observe the previous phase snapshot instead of any
-same-phase slot updates.
+rewritten body. For parallel loops, a barrier may be inserted before the loop
+only when the dependency source is stable for that loop body. `pl.parallel`
+does not weaken explicit `manual_scope` dependencies: if the body reads
+`deps=[tids]` and also updates `tids[branch]`, the pass keeps direct deps.
 
 ## Fallback boundaries
 
@@ -68,8 +72,8 @@ place unless the pattern is clear, safe, and profitable.
 Compressed:
 
 - full-array manual-scope fanout with positive estimated edge savings;
-- loop-carried `Array[TASK_ID]` phase fences, including parallel-loop snapshot
-  cases where the barrier source is the incoming array value.
+- double-buffered phase fences where the body reads one `Array[TASK_ID]` and
+  writes a different carrier such as `tids_next`.
 
 Left direct:
 
@@ -77,7 +81,8 @@ Left direct:
 - mixed scalar + array deps;
 - multiple-array deps;
 - partial-slot deps such as `prev = tids[i]; deps=[prev]`;
-- non-loop-carried arrays defined or updated inside the same loop body;
+- current loop iter-arg arrays;
+- arrays defined or updated inside the same loop body;
 - low-benefit fanout such as `N -> 1` or `2 -> 2`;
 - non-manual scopes and non-orchestration functions.
 

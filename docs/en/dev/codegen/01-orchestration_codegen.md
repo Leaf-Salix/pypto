@@ -105,7 +105,12 @@ const Tensor& tmp = alloc_0.get_ref(0);
 
 ### Phase 6–8: Task Submission and Control Flow
 
-All task submission is wrapped in a top-level `PTO2_SCOPE()`:
+All task submission is wrapped in a top-level `PTO2_SCOPE()`. Codegen no longer
+decides scope placement from the `for` / `if` structure: the
+[MaterializeRuntimeScopes](../passes/37-materialize_runtime_scopes.md) pass
+inserts explicit AUTO `RuntimeScopeStmt` nodes (the function body and each
+`for` / `if` body) into the IR, and codegen emits `PTO2_SCOPE` 1:1 from those
+nodes (manual scopes lower to `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`):
 
 ```cpp
 PTO2_SCOPE() {
@@ -473,7 +478,7 @@ in topologies like case1 (outer SEQ × inner PARALLEL).
 ### Phase-fence dummy barriers
 
 After `DeriveCallDirections`, the `ExpandManualPhaseFence` pass may compress a
-profitable full-array manual dependency by rewriting selected
+profitable stable full-array manual dependency by rewriting selected
 `manual_dep_edges=[tids]` consumer calls to `manual_dep_edges=[barrier_tid]`.
 It inserts a marked `system.task_dummy` call whose own `manual_dep_edges` still
 references the original TaskId array. Orchestration codegen lowers that marked
@@ -487,7 +492,14 @@ tids[N] -> dummy barrier -> consumers[M]
 ```
 
 Shapes that are not clearly safe or profitable stay on the direct
-`manual_dep_edges` lowering path.
+`manual_dep_edges` lowering path. In particular, `manual_scope` treats explicit
+deps as authoritative: a `pl.parallel` body that reads `deps=[tids]` and then
+updates `tids[branch]` is a same-carrier dependency chain, not a snapshot
+source for pre-loop compression. Users who want layer-parallel snapshot
+semantics should write a separate `tids_next` carrier and carry it back after
+the parallel body via loop-carried `init_values` / `pl.yield_`. We do not spell
+this as plain `tids = tids_next` here because the current codegen path does not
+support an ordinary `AssignStmt` on `ArrayType`.
 
 **Constraints checked at codegen entry (with user-facing CHECK messages):**
 
