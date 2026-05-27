@@ -916,3 +916,7 @@ class TestPhaseFenceDepCompressionCodegen:
         assert "PTO2TaskId params_phase_fence_barrier_0_deps[4];" in code, code
         assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
         assert re.search(r"PTO2TaskId params_t\d+_deps\[4\];", code), code
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
