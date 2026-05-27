@@ -178,6 +178,42 @@ static bool BodyUpdatesArray(const StmtPtr& body, const Var* target) {
   return finder.found;
 }
 
+static std::unordered_set<const Var*> CollectBodyDefinedVars(const StmtPtr& body) {
+  class Collector : public IRVisitor {
+   public:
+    std::unordered_set<const Var*> vars;
+
+    void AddVars(const std::vector<VarPtr>& defined_vars) {
+      for (const auto& var : defined_vars) {
+        if (var) vars.insert(var.get());
+      }
+    }
+
+    void VisitStmt_(const AssignStmtPtr& assign) override {
+      if (assign->var_) vars.insert(assign->var_.get());
+      IRVisitor::VisitStmt_(assign);
+    }
+
+    void VisitStmt_(const IfStmtPtr& if_stmt) override {
+      AddVars(if_stmt->return_vars_);
+      IRVisitor::VisitStmt_(if_stmt);
+    }
+
+    void VisitStmt_(const ForStmtPtr& for_stmt) override { AddVars(for_stmt->return_vars_); }
+
+    void VisitStmt_(const WhileStmtPtr& while_stmt) override {
+      AddVars(while_stmt->return_vars_);
+      for (const auto& iter_arg : while_stmt->iter_args_) {
+        if (iter_arg) vars.insert(iter_arg.get());
+      }
+      IRVisitor::VisitStmt_(while_stmt);
+    }
+  };
+  Collector collector;
+  collector.VisitStmt(body);
+  return collector.vars;
+}
+
 static int64_t CountManualDepConsumersOnArray(const StmtPtr& body, const Var* target) {
   class Counter : public IRVisitor {
    public:
@@ -222,18 +258,6 @@ static int64_t GetArrayProducerCount(const VarPtr& array_var) {
   if (!array_ty) return 0;
   if (auto ci = As<ConstInt>(array_ty->extent())) return ci->value_;
   return 0;
-}
-
-static std::vector<std::pair<std::string, std::any>> WithBoolAttr(
-    std::vector<std::pair<std::string, std::any>> attrs, const std::string& key, bool value) {
-  for (auto& [k, v] : attrs) {
-    if (k == key) {
-      v = value;
-      return attrs;
-    }
-  }
-  attrs.emplace_back(key, value);
-  return attrs;
 }
 
 static CallPtr RewriteManualDepsToBarrier(const CallPtr& call, const VarPtr& barrier_var) {
@@ -328,6 +352,7 @@ class ManualPhaseFenceMutator : public IRMutator {
   std::vector<BarrierDecision> BuildDecisions(const ForStmtPtr& for_stmt, const StmtPtr& body) {
     std::vector<BarrierDecision> decisions;
     std::unordered_set<const Var*> already_decided;
+    std::unordered_set<const Var*> current_iter_args;
 
     auto try_add = [&](const VarPtr& match_var, const VarPtr& barrier_source_var, int64_t consumer_count) {
       if (!match_var || !barrier_source_var || !already_decided.insert(match_var.get()).second) return;
@@ -347,6 +372,7 @@ class ManualPhaseFenceMutator : public IRMutator {
     if (is_parallel && trip_count <= 0) return decisions;
 
     for (const auto& iter_arg : for_stmt->iter_args_) {
+      if (iter_arg) current_iter_args.insert(iter_arg.get());
       if (!iter_arg || !IsTaskIdArrayVar(iter_arg)) continue;
       if (!ForBodyHasManualDepOnArray(body, iter_arg.get())) continue;
       VarPtr barrier_source = iter_arg;
@@ -359,8 +385,12 @@ class ManualPhaseFenceMutator : public IRMutator {
       try_add(iter_arg, barrier_source, consumers);
     }
 
+    const auto body_defined_vars = CollectBodyDefinedVars(body);
     for (const auto& dep_array : CollectDirectManualDepArrays(body)) {
-      if (!dep_array || BodyUpdatesArray(body, dep_array.get())) continue;
+      if (!dep_array || current_iter_args.count(dep_array.get()) != 0 ||
+          body_defined_vars.count(dep_array.get()) != 0 || BodyUpdatesArray(body, dep_array.get())) {
+        continue;
+      }
       int64_t consumers = CountManualDepConsumersOnArray(body, dep_array.get());
       if (is_parallel) consumers *= trip_count;
       try_add(dep_array, dep_array, consumers);

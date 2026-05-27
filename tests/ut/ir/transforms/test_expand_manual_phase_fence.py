@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
+
 from pypto import DataType, ir
 from pypto.pypto_core import passes
 
@@ -158,6 +160,86 @@ def test_parallel_iter_arg_barrier_uses_visible_init_value():
     )
 
 
+def test_parallel_iter_arg_without_visible_init_is_not_hoisted():
+    init_expr = ir.create_op_call("array.create", [_const(4)], {"dtype": DataType.TASK_ID}, S)
+    iter_tids = ir.IterArg("tids_iter", init_expr.type, init_expr, S)
+    return_tids = ir.Var("tids_rv", init_expr.type, S)
+    loop = ir.ForStmt(
+        ir.Var("p", ir.ScalarType(DataType.INDEX), S),
+        _const(0),
+        _const(4),
+        _const(1),
+        [iter_tids],
+        ir.SeqStmts(
+            [
+                _consumer("a", [iter_tids]),
+                _consumer("b", [iter_tids]),
+                ir.YieldStmt([iter_tids], S),
+            ],
+            S,
+        ),
+        [return_tids],
+        S,
+        kind=ir.ForKind.Parallel,
+    )
+    scope = ir.RuntimeScopeStmt(True, "manual", loop, S)
+    orch = ir.Function("main", [], [], scope, S, type=ir.FunctionType.Orchestration)
+    kernel = ir.Function("kernel", [], [TASK_ID], ir.ReturnStmt([ir.Var("ret_tid", TASK_ID, S)], S), S)
+
+    after = _run(ir.Program([orch, kernel], "iter_arg_no_visible_source", S))
+
+    assert isinstance(_manual_scope_body(after), ir.ForStmt)
+    assert all(
+        cast(ir.Call, cast(ir.AssignStmt, stmt).value).attrs["manual_dep_edges"] == [iter_tids]
+        for stmt in _loop_body_stmts(after)[:2]
+    )
+
+
+def test_loop_local_dep_array_is_not_moved_before_definition():
+    tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
+    for kind in (ir.ForKind.Parallel, ir.ForKind.Sequential):
+        local_tids = ir.Var("local_tids", tids.type, S)
+        before = _program_with_loop(
+            ir.SeqStmts(
+                [
+                    ir.AssignStmt(local_tids, tids, S),
+                    _consumer("a", [local_tids]),
+                    _consumer("b", [local_tids]),
+                ],
+                S,
+            ),
+            kind=kind,
+        )
+
+        after = _run(before)
+        assert isinstance(_manual_scope_body(after), ir.ForStmt)
+        for stmt in _loop_body_stmts(after)[1:]:
+            call = cast(ir.Call, cast(ir.AssignStmt, stmt).value)
+            assert call.attrs["manual_dep_edges"] == [local_tids]
+
+
+def test_nested_if_return_dep_array_is_not_moved_before_definition():
+    tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
+    local_tids = ir.Var("local_tids", tids.type, S)
+    if_stmt = ir.IfStmt(
+        ir.ConstBool(True, S),
+        ir.YieldStmt([tids], S),
+        ir.YieldStmt([tids], S),
+        [local_tids],
+        S,
+    )
+    before = _program_with_loop(
+        ir.SeqStmts([if_stmt, _consumer("a", [local_tids]), _consumer("b", [local_tids])], S)
+    )
+
+    after = _run(before)
+
+    assert isinstance(_manual_scope_body(after), ir.ForStmt)
+    for stmt in _loop_body_stmts(after)[1:]:
+        call = cast(ir.Call, cast(ir.AssignStmt, stmt).value)
+        assert call.attrs["manual_dep_edges"] == [local_tids]
+
+
 def test_non_orchestration_function_is_ignored():
     tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
     loop = _main_loop(_program_with_loop(ir.SeqStmts([_consumer("a", [tids]), _consumer("b", [tids])], S)))
@@ -296,3 +378,7 @@ def test_pure_range_consumer_does_not_insert_dummy():
     after = _run(before)
     first_call = cast(ir.Call, cast(ir.AssignStmt, _loop_body_stmts(after)[0]).value)
     assert first_call.op.name != "system.task_dummy"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

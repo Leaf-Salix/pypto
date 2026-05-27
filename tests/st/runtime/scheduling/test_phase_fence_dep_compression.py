@@ -52,8 +52,7 @@ def _require_extra_swimlane_case(label: str) -> None:
 def _assert_flattened_stage_strict(swimlane_data: dict, *, stages: int, branches: int) -> None:
     expected = stages * branches
     tasks = swimlane_data["tasks"]
-    if len(tasks) < expected:
-        pytest.skip(f"need >= {expected} tasks for phase-fence check, got {len(tasks)}")
+    assert len(tasks) >= expected, f"need >= {expected} tasks for phase-fence check, got {len(tasks)}"
     tasks = sorted(tasks, key=lambda t: t["start_time_us"])[:expected]
     grouped = [tasks[i * branches : (i + 1) * branches] for i in range(stages)]
     for i in range(stages - 1):
@@ -66,8 +65,7 @@ def _assert_flattened_stage_strict(swimlane_data: dict, *, stages: int, branches
 
 def _assert_min_task_count(swimlane_data: dict, *, expected: int) -> None:
     tasks = swimlane_data["tasks"]
-    if len(tasks) < expected:
-        pytest.skip(f"need >= {expected} tasks for swimlane check, got {len(tasks)}")
+    assert len(tasks) >= expected, f"need >= {expected} tasks for swimlane check, got {len(tasks)}"
 
 
 def _assert_multiloop_chain_shape(swimlane_data: dict) -> None:
@@ -911,3 +909,7 @@ class TestPhaseFenceDepCompressionSwimlane:
             f"partial-reduce consumers start at {consumer_start:.2f}us "
             f"before reducer ends at {reducer_end:.2f}us"
         )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

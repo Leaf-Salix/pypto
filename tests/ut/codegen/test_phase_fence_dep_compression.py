@@ -13,15 +13,13 @@ import re
 
 import pypto.language as pl
 import pytest
-from pypto import backend, codegen, passes
+from pypto import backend, codegen
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import ir
 
 
 def _generate_orch_code(program) -> str:
-    program = passes.derive_call_directions()(program)
-    program = passes.expand_manual_phase_fence()(program)
     for func in program.functions.values():
         if func.func_type == ir.FunctionType.Orchestration:
             return codegen.generate_orchestration(program, func).code
@@ -918,3 +916,7 @@ class TestPhaseFenceDepCompressionCodegen:
         assert "PTO2TaskId params_phase_fence_barrier_0_deps[4];" in code, code
         assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
         assert re.search(r"PTO2TaskId params_t\d+_deps\[4\];", code), code
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

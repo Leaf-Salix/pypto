@@ -437,8 +437,7 @@ class TestPhaseFencePlAtSwimlane:
         """
         expected = _PHASE_FENCE_N_PHASES * _PHASE_FENCE_N_BRANCHES
         tasks = phase_fence_pl_at_swimlane_data["tasks"]
-        if len(tasks) < expected:
-            pytest.skip(f"need ≥ {expected} tasks for phase fence check, got {len(tasks)}")
+        assert len(tasks) >= expected, f"need >= {expected} tasks for phase fence check, got {len(tasks)}"
         tasks = sorted(tasks, key=lambda t: t["start_time_us"])[:expected]
         phases = [
             tasks[i * _PHASE_FENCE_N_BRANCHES : (i + 1) * _PHASE_FENCE_N_BRANCHES]
