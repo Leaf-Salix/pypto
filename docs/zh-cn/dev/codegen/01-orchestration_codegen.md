@@ -476,8 +476,10 @@ tids[N] -> dummy barrier -> consumers[M]
 尤其在 `manual_scope` 中，用户显式写出的 deps 是权威约束：如果 `pl.parallel`
 body 读取 `deps=[tids]`，随后又更新 `tids[branch]`，这表示 same-carrier
 dependency chain，而不是可在 loop 前压缩的 snapshot source。若用户需要
-layer-parallel snapshot 语义，应写入单独的 `tids_next` carrier，并在 parallel
-body 之后再赋回 `tids`。
+layer-parallel snapshot 语义，应写入单独的 `tids_next` carrier，并通过
+loop-carried `init_values` / `pl.yield_` 在 parallel body 之后传回。这里不写成
+普通的 `tids = tids_next`，因为当前 codegen 路径暂不支持 `ArrayType` 的普通
+`AssignStmt`。
 
 **codegen 入口检查的约束（带用户友好 CHECK 消息）：**
 

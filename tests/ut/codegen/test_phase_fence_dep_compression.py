@@ -130,7 +130,9 @@ class TestPhaseFenceDepCompressionCodegen:
                             branches, init_values=(out_iter, tids_next)
                         ):
                             col: pl.Scalar[pl.INDEX] = branch * tile_c
-                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="phase_tile", deps=[tids_iter]) as tid:
+                            with pl.at(
+                                level=pl.Level.CORE_GROUP, name_hint="phase_tile", deps=[tids_iter]
+                            ) as tid:
                                 t: pl.Tile[[tile_r, tile_c], pl.FP32] = pl.load(
                                     x, [row, col], [tile_r, tile_c]
                                 )

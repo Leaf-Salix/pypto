@@ -2,7 +2,7 @@
 
 ## 概览
 
-`ExpandManualPhaseFence` 会压缩显式 `pl.submit(..., deps=[tids])` 产生的、
+`ExpandManualPhaseFence` 会压缩显式 manual-scope deps 携带的、
 有收益的完整数组 `TaskId` 依赖。它是一个很窄的 orchestration-only pass：
 当 manual-scope consumer fanout 只依赖一个稳定、只读的 `Array[TASK_ID]` 时，本 pass
 插入一个 dependency-only 的 `system.task_dummy` barrier，并把覆盖到的 consumer
@@ -22,7 +22,9 @@ tids[N] -> system.task_dummy -> consumers[M]
 
 本 pass 不改变 kernel 执行语义。它只改写选中的 consumer call 上的
 `Call.attrs["manual_dep_edges"]`，并插入一个带标记的 dummy-task call；后续
-codegen 会把该 call lowering 为 `rt_submit_dummy_task(...)`。
+codegen 会把该 call lowering 为 `rt_submit_dummy_task(...)`。在 outline 之后，
+它会统一覆盖带 `manual_dep_edges` 的 orchestration call，包括
+`pl.submit(..., deps=[...])` 和 `pl.at(..., deps=[...])` 这两类形状。
 
 ## Pipeline 位置
 
@@ -92,7 +94,7 @@ pass 运行后：
 ## Pass 属性
 
 | 字段 | 值 |
-| ---- | ---- |
+| ---- | -- |
 | `required` | `{SSAForm, NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved}` |
 | `produced` | `{SSAForm, NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved}` |
 | `invalidated` | `{}` |

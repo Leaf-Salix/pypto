@@ -173,7 +173,9 @@ def _build_submit_flattened_program(*, epochs: int, layers: int, phases: int):
                             tids_next = pl.array.create(branches, pl.TASK_ID)
                             for branch in pl.parallel(branches):
                                 row: pl.Scalar[pl.INDEX] = (stage * branches + branch) * tile_m
-                                out, tid = pl.submit(self.kernel_stripe, data, row, 1.0, out, deps=[tids_iter])
+                                out, tid = pl.submit(
+                                    self.kernel_stripe, data, row, 1.0, out, deps=[tids_iter]
+                                )
                                 tids_next[branch] = tid
                             tids_phase = pl.yield_(tids_next)
                         tids_layer_out = pl.yield_(tids_phase)
@@ -208,7 +210,9 @@ def _build_pl_at_flattened_program(*, epochs: int, phases: int):
                             branches, init_values=(out_iter, tids_next)
                         ):
                             row: pl.Scalar[pl.INDEX] = (stage * branches + branch) * tile_m
-                            with pl.at(level=pl.Level.CORE_GROUP, name_hint="phase_tile", deps=[tids_iter]) as tid:
+                            with pl.at(
+                                level=pl.Level.CORE_GROUP, name_hint="phase_tile", deps=[tids_iter]
+                            ) as tid:
                                 tile: pl.Tile[[tile_m, big_n], pl.FP32] = pl.load(
                                     data, [row, 0], [tile_m, big_n]
                                 )

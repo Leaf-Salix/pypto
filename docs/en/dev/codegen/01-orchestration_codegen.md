@@ -491,8 +491,10 @@ Shapes that are not clearly safe or profitable stay on the direct
 deps as authoritative: a `pl.parallel` body that reads `deps=[tids]` and then
 updates `tids[branch]` is a same-carrier dependency chain, not a snapshot
 source for pre-loop compression. Users who want layer-parallel snapshot
-semantics should write a separate `tids_next` carrier and assign it back after
-the parallel body.
+semantics should write a separate `tids_next` carrier and carry it back after
+the parallel body via loop-carried `init_values` / `pl.yield_`. We do not spell
+this as plain `tids = tids_next` here because the current codegen path does not
+support an ordinary `AssignStmt` on `ArrayType`.
 
 **Constraints checked at codegen entry (with user-facing CHECK messages):**
 

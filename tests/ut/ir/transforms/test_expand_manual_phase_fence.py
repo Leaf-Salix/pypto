@@ -12,7 +12,6 @@ from __future__ import annotations
 from typing import cast
 
 import pytest
-
 from pypto import DataType, ir
 from pypto.pypto_core import passes
 
@@ -235,7 +234,9 @@ def test_same_carrier_dep_array_update_in_body_falls_back():
     after = _run(before)
 
     assert isinstance(_manual_scope_body(after), ir.ForStmt)
-    consumer_stmts = [stmt for stmt in _loop_body_stmts(after) if isinstance(cast(ir.AssignStmt, stmt).value, ir.Call)]
+    consumer_stmts = [
+        stmt for stmt in _loop_body_stmts(after) if isinstance(cast(ir.AssignStmt, stmt).value, ir.Call)
+    ]
     consumer_calls = [
         cast(ir.Call, cast(ir.AssignStmt, stmt).value)
         for stmt in consumer_stmts

@@ -3,9 +3,9 @@
 ## Overview
 
 `ExpandManualPhaseFence` compresses profitable full-array `TaskId`
-dependencies produced by explicit `pl.submit(..., deps=[tids])` edges. It is a
-narrow orchestration-only pass: when a manual-scope consumer fanout depends on
-one stable, read-only `Array[TASK_ID]`, the pass inserts one dependency-only
+dependencies carried by explicit manual-scope deps. It is a narrow
+orchestration-only pass: when a manual-scope consumer fanout depends on one
+stable, read-only `Array[TASK_ID]`, the pass inserts one dependency-only
 `system.task_dummy` barrier and rewrites the covered consumers to depend on the
 barrier `TaskId`.
 
@@ -23,7 +23,10 @@ tids[N] -> system.task_dummy -> consumers[M]
 
 The pass does not change kernel execution semantics. It only rewrites
 `Call.attrs["manual_dep_edges"]` on selected consumer calls and adds the marked
-dummy-task call that codegen lowers to `rt_submit_dummy_task(...)`.
+dummy-task call that codegen lowers to `rt_submit_dummy_task(...)`. After
+outlining, this covers manual-scope orchestration calls uniformly, including
+both `pl.submit(..., deps=[...])` and `pl.at(..., deps=[...])` shapes once they
+are represented as calls with `manual_dep_edges`.
 
 ## Position in the pipeline
 
