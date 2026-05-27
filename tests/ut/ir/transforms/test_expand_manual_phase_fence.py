@@ -283,6 +283,108 @@ def test_iter_arg_alias_update_of_dep_array_falls_back():
     assert all(call.attrs["manual_dep_edges"] == [tids] for call in consumer_calls)
 
 
+def test_nested_iter_arg_alias_update_of_dep_array_falls_back():
+    tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
+    outer_tids = ir.IterArg("outer_tids", tids.type, tids, S)
+    inner_tids = ir.IterArg("inner_tids", tids.type, outer_tids, S)
+    inner_return_tids = ir.Var("inner_tids_return", tids.type, S)
+    outer_return_tids = ir.Var("outer_tids_return", tids.type, S)
+    first = _consumer("a", [tids])
+    update = _update_array_slot("inner_tids_after_a", inner_tids, first.var)
+    second = _consumer("b", [tids])
+    inner_loop = ir.ForStmt(
+        ir.Var("q", ir.ScalarType(DataType.INDEX), S),
+        _const(0),
+        _const(4),
+        _const(1),
+        [inner_tids],
+        ir.SeqStmts([first, update, second, ir.YieldStmt([update.var], S)], S),
+        [inner_return_tids],
+        S,
+        kind=ir.ForKind.Parallel,
+    )
+    outer_loop = ir.ForStmt(
+        ir.Var("p", ir.ScalarType(DataType.INDEX), S),
+        _const(0),
+        _const(4),
+        _const(1),
+        [outer_tids],
+        ir.SeqStmts([inner_loop, ir.YieldStmt([inner_return_tids], S)], S),
+        [outer_return_tids],
+        S,
+        kind=ir.ForKind.Parallel,
+    )
+    scope = ir.RuntimeScopeStmt(True, "manual", outer_loop, S)
+    orch = ir.Function("main", [], [], scope, S, type=ir.FunctionType.Orchestration)
+    kernel = ir.Function("kernel", [], [TASK_ID], ir.ReturnStmt([ir.Var("ret_tid", TASK_ID, S)], S), S)
+
+    after = _run(ir.Program([orch, kernel], "nested_iter_arg_alias_update_fallback", S))
+
+    inner_after = cast(ir.ForStmt, _loop_body_stmts(after)[0])
+    inner_body = inner_after.body
+    inner_stmts = list(inner_body.stmts) if isinstance(inner_body, ir.SeqStmts) else [inner_body]
+    consumer_calls = []
+    for stmt in inner_stmts:
+        if not isinstance(stmt, ir.AssignStmt):
+            continue
+        if not isinstance(stmt.value, ir.Call):
+            continue
+        if stmt.value.op.name == "kernel":
+            consumer_calls.append(stmt.value)
+    assert len(consumer_calls) == 2
+    assert all(call.attrs["manual_dep_edges"] == [tids] for call in consumer_calls)
+
+
+def test_outer_dep_array_consumers_fall_back_when_nested_loop_updates_alias():
+    tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
+    outer_tids = ir.IterArg("outer_tids", tids.type, tids, S)
+    inner_tids = ir.IterArg("inner_tids", tids.type, outer_tids, S)
+    inner_return_tids = ir.Var("inner_tids_return", tids.type, S)
+    outer_return_tids = ir.Var("outer_tids_return", tids.type, S)
+    first = _consumer("a", [tids])
+    update = _update_array_slot("inner_tids_after_a", inner_tids, first.var)
+    second = _consumer("b", [tids])
+    inner_loop = ir.ForStmt(
+        ir.Var("q", ir.ScalarType(DataType.INDEX), S),
+        _const(0),
+        _const(4),
+        _const(1),
+        [inner_tids],
+        ir.SeqStmts([update, ir.YieldStmt([update.var], S)], S),
+        [inner_return_tids],
+        S,
+        kind=ir.ForKind.Parallel,
+    )
+    outer_loop = ir.ForStmt(
+        ir.Var("p", ir.ScalarType(DataType.INDEX), S),
+        _const(0),
+        _const(4),
+        _const(1),
+        [outer_tids],
+        ir.SeqStmts([first, inner_loop, second, ir.YieldStmt([inner_return_tids], S)], S),
+        [outer_return_tids],
+        S,
+        kind=ir.ForKind.Parallel,
+    )
+    scope = ir.RuntimeScopeStmt(True, "manual", outer_loop, S)
+    orch = ir.Function("main", [], [], scope, S, type=ir.FunctionType.Orchestration)
+    kernel = ir.Function("kernel", [], [TASK_ID], ir.ReturnStmt([ir.Var("ret_tid", TASK_ID, S)], S), S)
+
+    after = _run(ir.Program([orch, kernel], "outer_consumers_nested_alias_update_fallback", S))
+
+    assert isinstance(_manual_scope_body(after), ir.ForStmt)
+    consumer_calls = []
+    for stmt in _loop_body_stmts(after):
+        if not isinstance(stmt, ir.AssignStmt):
+            continue
+        if not isinstance(stmt.value, ir.Call):
+            continue
+        if stmt.value.op.name == "kernel":
+            consumer_calls.append(stmt.value)
+    assert len(consumer_calls) == 2
+    assert all(call.attrs["manual_dep_edges"] == [tids] for call in consumer_calls)
+
+
 def test_double_buffered_dep_array_update_remains_compressible():
     tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
     tids_new = ir.Var("tids_new", tids.type, S)
@@ -327,6 +429,33 @@ def test_nested_if_return_dep_array_is_not_moved_before_definition():
     )
     before = _program_with_loop(
         ir.SeqStmts([if_stmt, _consumer("a", [local_tids]), _consumer("b", [local_tids])], S)
+    )
+
+    after = _run(before)
+
+    assert isinstance(_manual_scope_body(after), ir.ForStmt)
+    for stmt in _loop_body_stmts(after)[1:]:
+        call = cast(ir.Call, cast(ir.AssignStmt, stmt).value)
+        assert call.attrs["manual_dep_edges"] == [local_tids]
+
+
+def test_nested_for_return_dep_array_is_not_moved_before_definition():
+    tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
+    iter_tids = ir.IterArg("iter_tids", tids.type, tids, S)
+    local_tids = ir.Var("local_tids", tids.type, S)
+    inner_loop = ir.ForStmt(
+        ir.Var("q", ir.ScalarType(DataType.INDEX), S),
+        _const(0),
+        _const(1),
+        _const(1),
+        [iter_tids],
+        ir.YieldStmt([iter_tids], S),
+        [local_tids],
+        S,
+        kind=ir.ForKind.Sequential,
+    )
+    before = _program_with_loop(
+        ir.SeqStmts([inner_loop, _consumer("a", [local_tids]), _consumer("b", [local_tids])], S)
     )
 
     after = _run(before)
