@@ -246,6 +246,43 @@ def test_same_carrier_dep_array_update_in_body_falls_back():
     assert all(call.attrs["manual_dep_edges"] == [tids] for call in consumer_calls)
 
 
+def test_iter_arg_alias_update_of_dep_array_falls_back():
+    tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
+    tids_branch = ir.IterArg("tids_branch", tids.type, tids, S)
+    return_tids = ir.Var("tids_return", tids.type, S)
+    first = _consumer("a", [tids])
+    update = _update_array_slot("tids_branch_after_a", tids_branch, first.var)
+    second = _consumer("b", [tids])
+    loop = ir.ForStmt(
+        ir.Var("p", ir.ScalarType(DataType.INDEX), S),
+        _const(0),
+        _const(4),
+        _const(1),
+        [tids_branch],
+        ir.SeqStmts([first, update, second, ir.YieldStmt([update.var], S)], S),
+        [return_tids],
+        S,
+        kind=ir.ForKind.Parallel,
+    )
+    scope = ir.RuntimeScopeStmt(True, "manual", loop, S)
+    orch = ir.Function("main", [], [], scope, S, type=ir.FunctionType.Orchestration)
+    kernel = ir.Function("kernel", [], [TASK_ID], ir.ReturnStmt([ir.Var("ret_tid", TASK_ID, S)], S), S)
+
+    after = _run(ir.Program([orch, kernel], "iter_arg_alias_update_fallback", S))
+
+    assert isinstance(_manual_scope_body(after), ir.ForStmt)
+    consumer_calls = []
+    for stmt in _loop_body_stmts(after):
+        if not isinstance(stmt, ir.AssignStmt):
+            continue
+        if not isinstance(stmt.value, ir.Call):
+            continue
+        if stmt.value.op.name == "kernel":
+            consumer_calls.append(stmt.value)
+    assert len(consumer_calls) == 2
+    assert all(call.attrs["manual_dep_edges"] == [tids] for call in consumer_calls)
+
+
 def test_double_buffered_dep_array_update_remains_compressible():
     tids = ir.Var("tids", ir.ArrayType(DataType.TASK_ID, 4), S)
     tids_new = ir.Var("tids_new", tids.type, S)
