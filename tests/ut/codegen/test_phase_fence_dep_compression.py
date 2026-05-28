@@ -10,6 +10,8 @@
 """Focused codegen tests for manual_scope phase-fence dependency compression."""
 
 import re
+import sys
+from pathlib import Path
 
 import pypto.language as pl
 import pytest
@@ -18,7 +20,11 @@ from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import ir
 
-from examples.utils.phase_fence_dep_compression import build_chained_snapshot_phase_fence
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from examples.utils.phase_fence_dep_compression import build_chained_snapshot_phase_fence  # noqa: E402
 
 
 def _generate_orch_code(program) -> str:
