@@ -3654,6 +3654,47 @@ class TestManualScopeCodegen:
         assert "if (a_tid.is_valid()) params_t1_deps[params_t1_deps_count++] = a_tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
+    def test_auto_scope_task_id_array_slot_dep_uses_scalar_snapshot(self):
+        """A TaskId array slot read is a valid explicit dep in auto scope."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def k1(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k2(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def k3(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                tids = pl.array.create(1, pl.TASK_ID)
+                a, first_tid = pl.submit(self.k1, x)
+                tids[0] = first_tid
+                prev = tids[0]
+                b, second_tid = pl.submit(self.k2, x)
+                tids[0] = second_tid
+                c, _ = pl.submit(self.k3, x, deps=[prev])
+                return c
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "PTO2ScopeMode::MANUAL" not in code, code
+        assert re.search(r"PTO2TaskId\s+prev\s*=\s*tids\[0\];", code), code
+        assert "tids[0] = second_tid;" in code, code
+        assert "PTO2TaskId params_t2_deps[1];" in code, code
+        assert "if (prev.is_valid()) params_t2_deps[params_t2_deps_count++] = prev;" in code, code
+        assert "params_t2.set_dependencies(params_t2_deps, params_t2_deps_count);" in code, code
+
     def test_manual_scope_seq_outer_parallel_inner_two_stage_pipeline(self):
         """End-to-end: ``with pl.manual_scope():`` wrapping
         ``for i in pl.range(M): for j in pl.parallel(N): stage1; stage2``.
