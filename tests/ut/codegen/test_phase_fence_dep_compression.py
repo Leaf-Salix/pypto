@@ -10,6 +10,8 @@
 """Focused codegen tests for manual_scope phase-fence dependency compression."""
 
 import re
+import sys
+from pathlib import Path
 
 import pypto.language as pl
 import pytest
@@ -18,7 +20,15 @@ from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import ir
 
-from examples.utils.phase_fence_dep_compression import build_chained_snapshot_phase_fence
+# Keep this local: tests/ut/conftest.py intentionally does not add the project
+# root, while tests/ut/jit/conftest.py does so for the JIT-specific example
+# tests. If more codegen UTs need examples imports, move this to a
+# tests/ut/codegen/conftest.py instead.
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from examples.utils.phase_fence_dep_compression import build_chained_snapshot_phase_fence  # noqa: E402
 
 
 def _generate_orch_code(program) -> str:

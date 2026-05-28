@@ -970,7 +970,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
           }
         } else if (op_name == "array.get_element") {
           auto scalar_ty = As<ScalarType>(assign->var_->GetType());
-          if (in_manual_scope_depth_ > 0 && scalar_ty && scalar_ty->dtype_ == DataType::TASK_ID) {
+          if (scalar_ty && scalar_ty->dtype_ == DataType::TASK_ID) {
             manual_task_id_map_[assign->var_.get()] = var_name;
           }
         }
