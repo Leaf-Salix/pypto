@@ -1023,6 +1023,14 @@ class TestPhaseFenceDepCompressionSwimlane:
         )
         _assert_min_task_count(data, expected=3 * _BRANCHES)
 
+    def test_manual_dummy_auto_mix_generates_swimlane(self, test_runner):
+        data = _new_swimlane_json(
+            test_runner,
+            _manual_dummy_auto_mix_case(),
+            label="manual-dummy/auto phase-fence mix",
+        )
+        _assert_min_task_count(data, expected=3 * _BRANCHES)
+
     def test_dense_mixed_extra(self, test_runner):
         _require_extra_swimlane_case("dense mixed swimlane")
         data = _new_swimlane_json(
