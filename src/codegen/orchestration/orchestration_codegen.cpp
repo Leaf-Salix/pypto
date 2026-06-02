@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -787,6 +788,27 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const RuntimeScopeStmtPtr& scope) override {
+    auto seq = As<SeqStmts>(scope->body_);
+    if (seq) {
+      size_t prelude_count = 0;
+      while (prelude_count < seq->stmts_.size() && IsRuntimeScopePreludeAssign(seq->stmts_[prelude_count])) {
+        ++prelude_count;
+      }
+      if (prelude_count > 0) {
+        for (size_t i = 0; i < prelude_count; ++i) {
+          VisitStmt(seq->stmts_[i]);
+        }
+        std::vector<StmtPtr> remaining(seq->stmts_.begin() + static_cast<std::ptrdiff_t>(prelude_count),
+                                       seq->stmts_.end());
+        StmtPtr scoped_body = std::make_shared<SeqStmts>(std::move(remaining), scope->body_->span_);
+        auto rebuilt_scope =
+            std::make_shared<RuntimeScopeStmt>(scope->manual_, scope->name_hint_, scoped_body, scope->span_,
+                                               scope->leading_comments_, scope->attrs_);
+        VisitStmt(rebuilt_scope);
+        return;
+      }
+    }
+
     code_ << Indent() << "PTO2_SCOPE(" << (scope->manual_ ? "PTO2ScopeMode::MANUAL" : "") << ") {\n";
     indent_ += 4;
     PushCppScope();
@@ -2424,6 +2446,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     PopCppScope();
     indent_ -= 4;
+  }
+
+  static bool IsRuntimeScopePreludeAssign(const StmtPtr& stmt) {
+    auto assign = As<AssignStmt>(stmt);
+    if (!assign) return false;
+    auto call = As<Call>(assign->value_);
+    return call && call->op_ && call->op_->name_ == "tensor.slice" &&
+           call->GetAttr<bool>(kAttrRuntimeScopePrelude, false);
   }
 
   void HandleTensorAssembleAssign(const AssignStmtPtr& assign, const CallPtr& call) {

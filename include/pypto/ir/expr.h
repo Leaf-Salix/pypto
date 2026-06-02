@@ -703,6 +703,18 @@ inline constexpr const char* kAttrManualDepEdges = "manual_dep_edges";
 inline constexpr const char* kAttrDummyTask = "dummy_task";
 
 /**
+ * @brief Reserved attr key marking a compiler-synthesised tensor view that must
+ * be materialised immediately before the enclosing auto runtime scope.
+ *
+ * Value type: ``bool``. Written by ``OptimizeOrchTensors`` on callsite
+ * ``tensor.slice`` calls synthesised for out-window externalization. The
+ * orchestration codegen emits marked slice assignments before the generated
+ * ``PTO2_SCOPE()`` so runtime can observe the parent/view relationship before
+ * the windowed producer task is submitted.
+ */
+inline constexpr const char* kAttrRuntimeScopePrelude = "runtime_scope_prelude";
+
+/**
  * @brief Reserved attr key for the producer-TaskId Var captured by a
  * ``with pl.at(...) as tid:`` block.
  *

@@ -570,6 +570,26 @@ class StructuralEqualImpl {
   // Compare kwargs (vector of pairs to preserve order)
   result_type VisitLeafField(const std::vector<std::pair<std::string, std::any>>& lhs,
                              const std::vector<std::pair<std::string, std::any>>& rhs) {
+    // Internal codegen-only markers are not printed by the Python printer, so
+    // pass roundtrip checks must not treat their absence as semantic mismatch.
+    auto has_runtime_scope_prelude = [](const std::vector<std::pair<std::string, std::any>>& attrs) {
+      for (const auto& kv : attrs) {
+        if (kv.first == kAttrRuntimeScopePrelude) return true;
+      }
+      return false;
+    };
+    if (has_runtime_scope_prelude(lhs) || has_runtime_scope_prelude(rhs)) {
+      auto strip_runtime_scope_prelude = [](const std::vector<std::pair<std::string, std::any>>& attrs) {
+        std::vector<std::pair<std::string, std::any>> stripped;
+        stripped.reserve(attrs.size());
+        for (const auto& kv : attrs) {
+          if (kv.first != kAttrRuntimeScopePrelude) stripped.push_back(kv);
+        }
+        return stripped;
+      };
+      return VisitLeafField(strip_runtime_scope_prelude(lhs), strip_runtime_scope_prelude(rhs));
+    }
+
     if (lhs.size() != rhs.size()) {
       if constexpr (AssertMode) {
         std::ostringstream msg;

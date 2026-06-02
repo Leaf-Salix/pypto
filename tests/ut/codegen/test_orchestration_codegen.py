@@ -2403,17 +2403,17 @@ class TestTensorReadWriteOffsetCodegen:
             for name in rv_carry_names
         ), code
 
-    def test_windowed_writer_before_full_parent_reader_stays_unwindowed(self):
-        """Issue #1444: window writes followed by full-parent reads must not be externalized.
+    def test_windowed_writer_before_full_parent_reader_hoists_view_before_scope(self):
+        """Issue #1444: window writes followed by full-parent reads hoist views before PTO2_SCOPE.
 
-        The unsafe codegen shape is:
+        The historically unsafe codegen shape was:
             producer writes score_flat.view(...) with add_output/add_inout
             later consumer reads score_flat with add_input
-            no explicit set_dependencies edge bridges view -> parent
+            the view is declared inside the producer PTO2_SCOPE
 
-        Until runtime/codegen has a generic root-aware dependency bridge,
-        OutWindowExternalizer must keep this producer unwindowed so auto deps
-        operate on the same parent Tensor object.
+        The view must be materialized before the task scope so the runtime can
+        observe the parent/view relationship before the windowed producer is
+        submitted.
         """
 
         backend.reset_for_testing()
@@ -2466,10 +2466,16 @@ class TestTensorReadWriteOffsetCodegen:
         )
         code = _generate_orch_code(transformed)
 
-        assert "produce__windowed" not in code, code
-        assert "params_t0.add_inout(score_flat)" in code, code
+        assert "produce__windowed" in code, code
+        assert "params_t0.add_inout(score_iter)" in code, code
         assert "params_t1.add_input(score_flat)" in code, code
-        assert "score_flat.view(" not in code, code
+        assert "Tensor score_iter = score_flat.view(" in code, code
+
+        loop_pos = code.index("for (int64_t c0 = 0; c0 < 2048; c0 += 8)")
+        view_pos = code.index("Tensor score_iter = score_flat.view(", loop_pos)
+        scope_pos = code.index("PTO2_SCOPE() {", view_pos)
+        task_pos = code.index("// Task 0: produce__windowed", view_pos)
+        assert view_pos < scope_pos < task_pos, code
 
     def test_group_submit_uses_both_aiv_slots_for_split_vector_kernel(self):
         """Cross-core split inferred from pipe ops should reuse one AIV kernel across both slots."""
@@ -3560,6 +3566,45 @@ class TestManualScopeCodegen:
         assert "params_t2_deps[params_t2_deps_count++] = a_tid;" in code
         assert "params_t2_deps[params_t2_deps_count++] = b_tid;" in code
         assert "params_t2.set_dependencies(params_t2_deps, params_t2_deps_count);" in code
+
+    def test_manual_scope_windowed_submit_hoists_view_before_manual_scope(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_stripe(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                with pl.manual_scope():
+                    out_next, _tid = pl.submit(self.kernel_stripe, data, 64, out)
+                return out_next
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert "kernel_stripe__windowed" in code, code
+        view_match = re.search(r"Tensor out\S*__window = ext_out\.view\(", code)
+        assert view_match is not None, code
+        view_pos = view_match.start()
+        scope_pos = code.index("PTO2_SCOPE(PTO2ScopeMode::MANUAL)")
+        task_pos = code.index("// Task 0: kernel_stripe__windowed")
+        assert view_pos < scope_pos < task_pos, code
 
     def test_user_written_task_dummy_lowers_to_dummy_submit(self):
         backend.reset_for_testing()

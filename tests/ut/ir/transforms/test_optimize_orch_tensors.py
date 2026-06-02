@@ -35,6 +35,37 @@ def _get_function(program, name: str):
     return func
 
 
+def _iter_stmts(stmt):
+    if isinstance(stmt, ir.SeqStmts):
+        for child in stmt.stmts:
+            yield from _iter_stmts(child)
+    elif isinstance(stmt, ir.ForStmt):
+        yield from _iter_stmts(stmt.body)
+    elif isinstance(stmt, ir.WhileStmt):
+        yield from _iter_stmts(stmt.body)
+    elif isinstance(stmt, ir.IfStmt):
+        yield from _iter_stmts(stmt.then_body)
+        if stmt.else_body is not None:
+            yield from _iter_stmts(stmt.else_body)
+    elif isinstance(stmt, ir.ScopeStmt):
+        yield from _iter_stmts(stmt.body)
+    else:
+        yield stmt
+
+
+def _count_runtime_scope_prelude_slices(func) -> int:
+    count = 0
+    for stmt in _iter_stmts(func.body):
+        if not isinstance(stmt, ir.AssignStmt):
+            continue
+        value = stmt.value
+        if not isinstance(value, ir.Call):
+            continue
+        if value.op.name == "tensor.slice" and value.attrs.get("runtime_scope_prelude") is True:
+            count += 1
+    return count
+
+
 class TestIterArgReuse:
     """Pattern 1: Merge Out params into In params via iter-arg feedback."""
 
@@ -1263,10 +1294,11 @@ class TestOutWindowExternalizer:
 
         After = _run_to_optimize_orch_tensors(Before)
 
-        assert After.get_function("kv_stripe__windowed") is None
+        assert After.get_function("kv_stripe__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
-        assert "pl.tensor.slice(k_out" not in printed_main
-        assert "pl.tensor.slice(v_out" not in printed_main
+        assert "pl.tensor.slice(k_out" in printed_main
+        assert "pl.tensor.slice(v_out" in printed_main
+        assert _count_runtime_scope_prelude_slices(_get_function(After, "main")) == 2
 
     def test_tensor_full_root_later_parent_read_stays_baseline(self):
         @pl.program
@@ -1301,9 +1333,10 @@ class TestOutWindowExternalizer:
 
         After = _run_to_optimize_orch_tensors(Before)
 
-        assert After.get_function("kernel_stripe__windowed") is None
+        assert After.get_function("kernel_stripe__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
-        assert "pl.tensor.slice(out" not in printed_main
+        assert "pl.tensor.slice(out" in printed_main
+        assert _count_runtime_scope_prelude_slices(_get_function(After, "main")) == 1
 
     def test_loop_returned_output_later_parent_read_stays_baseline(self):
         @pl.program
@@ -1341,9 +1374,10 @@ class TestOutWindowExternalizer:
 
         After = _run_to_optimize_orch_tensors(Before)
 
-        assert After.get_function("kernel_rows__windowed") is None
+        assert After.get_function("kernel_rows__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
-        assert "pl.tensor.slice(out" not in printed_main
+        assert "pl.tensor.slice(out" in printed_main
+        assert _count_runtime_scope_prelude_slices(_get_function(After, "main")) == 1
 
     def test_multi_out_final_store_all_or_nothing_stays_baseline(self):
         @pl.program

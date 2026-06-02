@@ -2157,6 +2157,13 @@ class OutWindowExternalizer {
       const std::unordered_set<const Var*>* loop_local_allocs = nullptr;
     };
 
+    static CallPtr WithRuntimeScopePreludeAttr(const CallPtr& call) {
+      auto attrs = call->attrs_;
+      attrs.emplace_back(kAttrRuntimeScopePrelude, true);
+      return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(attrs), call->GetType(),
+                                    call->span_);
+    }
+
     static bool IsTensorTypedExpr(const ExprPtr& expr) {
       return expr && AsTensorTypeLike(expr->GetType()) != nullptr;
     }
@@ -2430,7 +2437,7 @@ class OutWindowExternalizer {
 
       if (analysis.outputs.empty()) return std::nullopt;
       if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
-      if (HasLaterFullParentReadOfRewrittenOutput(call, analysis)) return std::nullopt;
+      if (submit && HasLaterFullParentReadOfRewrittenOutput(call, analysis)) return std::nullopt;
 
       std::unordered_map<const Var*, ExprPtr> callsite_subst;
       for (size_t i = 0; i < original_func->params_.size() && i < call->args_.size(); ++i) {
@@ -2464,9 +2471,10 @@ class OutWindowExternalizer {
         ExprPtr parent_expr = VisitExpr(call->args_[output.out_param_index]);
         auto slice_call = OpRegistry::GetInstance().Create(
             "tensor.slice", {parent_expr, shape_tuple, offset_tuple}, call_assign->span_);
-        auto slice_var =
-            std::make_shared<Var>(out_arg->name_hint_ + "__window", slice_call->GetType(), out_arg->span_);
-        stmts.push_back(std::make_shared<AssignStmt>(slice_var, slice_call, call_assign->span_));
+        auto marked_slice_call = WithRuntimeScopePreludeAttr(slice_call);
+        auto slice_var = std::make_shared<Var>(out_arg->name_hint_ + "__window", marked_slice_call->GetType(),
+                                               out_arg->span_);
+        stmts.push_back(std::make_shared<AssignStmt>(slice_var, marked_slice_call, call_assign->span_));
         slices_by_out_index.emplace(output.out_param_index,
                                     SliceBundle{slice_var, parent_expr, offset_tuple});
       }
