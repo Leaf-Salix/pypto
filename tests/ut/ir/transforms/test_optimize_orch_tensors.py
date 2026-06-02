@@ -1305,6 +1305,45 @@ class TestOutWindowExternalizer:
         printed_main = ir.python_print(_get_function(After, "main"))
         assert "pl.tensor.slice(out" not in printed_main
 
+    def test_submit_later_full_parent_read_stays_baseline(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_stripe(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume_full(
+                self,
+                src: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                return src
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                out: pl.Tensor[[256, 64], pl.FP32] = pl.full([256, 64], dtype=pl.FP32, value=0.0)
+                row: pl.Scalar[pl.INDEX] = 64
+                out_next: pl.Tensor[[256, 64], pl.FP32] = self.kernel_stripe(data, row, out)
+                with pl.manual_scope():
+                    consumed, tid = pl.submit(self.consume_full, out_next)
+                return consumed
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        assert After.get_function("kernel_stripe__windowed") is None
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "pl.tensor.slice(out" not in printed_main
+
     def test_loop_returned_output_later_parent_read_stays_baseline(self):
         @pl.program
         class Before:
