@@ -1395,6 +1395,98 @@ class TestOutWindowExternalizer:
         assert "score__ssa_v0: pl.Tensor[[32, 64]" in printed_consume
         assert "[0, 0], [32, 64]" in printed_consume
 
+    def test_consumer_input_with_other_full_use_keeps_parent_baseline(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def produce(
+                self,
+                x: pl.Tensor[[64, 128], pl.FP32],
+                score: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                tile: pl.Tile[[32, 32], pl.FP32] = pl.load(x, [0, 0], [32, 32])
+                return pl.store(tile, [0, 0], score)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def passthrough(
+                self,
+                value: pl.Tensor[[64, 128], pl.FP32],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                return value
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                score: pl.Tensor[[64, 128], pl.FP32],
+                probe: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[64, 128], pl.FP32], pl.Tensor[[64, 128], pl.FP32]]:
+                block: pl.Tensor[[32, 64], pl.FP32] = score[0:32, 0:64]
+                probe_next: pl.Tensor[[64, 128], pl.FP32] = pl.assemble(probe, block, [0, 0])
+                score_next: pl.Tensor[[64, 128], pl.FP32] = self.passthrough(score)
+                return score_next, probe_next
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64, 128], pl.FP32],
+                score: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+                probe: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[64, 128], pl.FP32], pl.Tensor[[64, 128], pl.FP32]]:
+                score_next: pl.Tensor[[64, 128], pl.FP32] = self.produce(x, score)
+                return self.consume(score_next, probe)
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "consume__windowed(" in printed_main
+        assert "pl.tensor.slice(score_next__ssa_v0, [32, 64]" not in printed_main
+
+        printed_consume = ir.python_print(_get_function(After, "consume__windowed"))
+        assert "score__ssa_v0: pl.Tensor[[64, 128]" in printed_consume
+        assert "passthrough(score__ssa_v0)" in printed_consume
+
+    def test_local_allocation_input_root_is_windowed(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def write_score(
+                self,
+                local: pl.Tensor[[64, 128], pl.FP32],
+                score: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                tile: pl.Tile[[32, 32], pl.FP32] = pl.load(local, [0, 0], [32, 32])
+                return pl.store(tile, [0, 0], score)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                local: pl.Tensor[[64, 128], pl.FP32],
+                probe: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                block: pl.Tensor[[32, 64], pl.FP32] = local[0:32, 0:64]
+                return pl.assemble(probe, block, [0, 0])
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                score: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+                probe: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[64, 128], pl.FP32], pl.Tensor[[64, 128], pl.FP32]]:
+                local: pl.Tensor[[64, 128], pl.FP32] = pl.full([64, 128], dtype=pl.FP32, value=1.0)
+                score_next: pl.Tensor[[64, 128], pl.FP32] = self.write_score(local, score)
+                probe_next: pl.Tensor[[64, 128], pl.FP32] = self.consume(local, probe)
+                return score_next, probe_next
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "write_score__windowed(" in printed_main
+        assert "consume__windowed(" in printed_main
+        assert "pl.tensor.slice(local__ssa_v0, [32, 64], [0, 0])" in printed_main
+
+        printed_consume = ir.python_print(_get_function(After, "consume__windowed"))
+        assert "local__ssa_v0: pl.Tensor[[32, 64]" in printed_consume
+
     def test_mixed_consumer_input_roots_keep_input_parent_baseline(self):
         @pl.program
         class Before:
@@ -2567,6 +2659,53 @@ class TestOutWindowSubmitCall:
         # call site.
         assert "kernel_stripe__windowed" not in printed_main
         assert "pl.tensor.slice(out" not in printed_main
+
+    def test_submit_callsite_participates_in_input_window_filter(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def produce(
+                self,
+                data: pl.Tensor[[64, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                tile: pl.Tile[[32, 32], pl.FP32] = pl.load(data, [0, 0], [32, 32])
+                return pl.store(tile, [0, 0], out)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consume(
+                self,
+                score: pl.Tensor[[64, 128], pl.FP32],
+                probe: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                block: pl.Tensor[[32, 64], pl.FP32] = score[0:32, 0:64]
+                return pl.assemble(probe, block, [0, 0])
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[64, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+                probe_a: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+                probe_b: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[64, 128], pl.FP32], pl.Tensor[[64, 128], pl.FP32]]:
+                out_next: pl.Tensor[[64, 128], pl.FP32] = self.produce(data, out)
+                probe_next: pl.Tensor[[64, 128], pl.FP32] = self.consume(out_next, probe_a)
+                with pl.manual_scope():
+                    # Submit callsite passes the same callee a non-writable In root.
+                    _probe_b, _tid = pl.submit(self.consume, data, probe_b)
+                return probe_next, _probe_b
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "consume__windowed(out_next__ssa_v0, " in printed_main
+        assert "pl.submit(\n            consume__windowed, data__ssa_v0, " in printed_main
+        assert "pl.tensor.slice(out_next__ssa_v0, [32, 64]" not in printed_main
+        assert "pl.tensor.slice(data__ssa_v0, [32, 64]" not in printed_main
+
+        printed_consume = ir.python_print(_get_function(After, "consume__windowed"))
+        assert "score__ssa_v0: pl.Tensor[[64, 128]" in printed_consume
 
 
 if __name__ == "__main__":
