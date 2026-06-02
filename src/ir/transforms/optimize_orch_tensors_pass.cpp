@@ -2083,6 +2083,7 @@ class OutWindowExternalizer {
           const auto& param = current_func->params_[i];
           if (param && AsTensorTypeLike(param->GetType())) {
             full_buffer_roots_[param.get()] = param.get();
+            param_roots_.insert(param.get());
             if (i < current_func->param_directions_.size() &&
                 IsOutputDirection(current_func->param_directions_[i], /*include_inout=*/true)) {
               writable_buffer_roots_.insert(param.get());
@@ -2244,7 +2245,9 @@ class OutWindowExternalizer {
 
     bool IsWritableRootExpr(const ExprPtr& expr) const {
       auto root = ResolveBufferRoot(expr);
-      return root && writable_buffer_roots_.count(root) > 0;
+      if (!root) return false;
+      if (param_roots_.count(root) == 0) return true;
+      return writable_buffer_roots_.count(root) > 0;
     }
 
     static bool IsReadDirection(ParamDirection direction) {
@@ -2518,7 +2521,8 @@ class OutWindowExternalizer {
         if (input.in_param_index >= call->args_.size()) return std::nullopt;
         auto in_arg = AsVarLike(call->args_[input.in_param_index]);
         if (!in_arg) return std::nullopt;
-        if (!IsWritableRootExpr(call->args_[input.in_param_index])) continue;
+        INTERNAL_CHECK_SPAN(IsWritableRootExpr(call->args_[input.in_param_index]), call_assign->span_)
+            << "Internal error: input window parameter must be backed by a writable root at callsite";
 
         std::vector<ExprPtr> shape_exprs;
         shape_exprs.reserve(input.window_shape.size());
@@ -2839,6 +2843,7 @@ class OutWindowExternalizer {
     std::unordered_map<const Var*, ExprPtr> loop_iter_init_subst_;
     std::unordered_map<const Var*, ExprPtr> scalar_defs_;
     std::unordered_map<const Var*, const Var*> full_buffer_roots_;
+    std::unordered_set<const Var*> param_roots_;
     std::unordered_set<const Var*> writable_buffer_roots_;
     std::unordered_map<const Var*, std::vector<const Var*>> tuple_output_roots_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
@@ -3023,6 +3028,7 @@ class OutWindowExternalizer {
     }
 
     std::unordered_map<size_t, InputRewriteInfo> by_index;
+    std::unordered_map<size_t, size_t> matched_refs_by_index;
     std::unordered_set<size_t> conflicted;
     for (const auto& stmt : body_stmts) {
       auto assign = As<AssignStmt>(stmt);
@@ -3088,6 +3094,7 @@ class OutWindowExternalizer {
       if (!exprs_ok) {
         conflicted.insert(param_index);
         by_index.erase(param_index);
+        matched_refs_by_index.erase(param_index);
         continue;
       }
 
@@ -3102,18 +3109,26 @@ class OutWindowExternalizer {
       auto existing = by_index.find(param_index);
       if (existing == by_index.end()) {
         by_index.emplace(param_index, std::move(info));
+        matched_refs_by_index[param_index] = CountVarRefsInStmt(stmt, parent.get());
         continue;
       }
       if (!AreExprVectorsEqual(existing->second.window_shape, info.window_shape) ||
           !AreExprVectorsEqual(existing->second.callsite_offsets, info.callsite_offsets)) {
         conflicted.insert(param_index);
         by_index.erase(param_index);
+        matched_refs_by_index.erase(param_index);
+        continue;
       }
+      matched_refs_by_index[param_index] += CountVarRefsInStmt(stmt, parent.get());
     }
 
     inputs.reserve(by_index.size());
     for (auto& [param_index, info] : by_index) {
-      if (conflicted.count(param_index) == 0) inputs.push_back(std::move(info));
+      if (conflicted.count(param_index) != 0 || param_index >= func->params_.size()) continue;
+      auto total_refs = CountVarRefsInStmt(func->body_, func->params_[param_index].get());
+      auto matched_it = matched_refs_by_index.find(param_index);
+      auto matched_refs = matched_it == matched_refs_by_index.end() ? 0 : matched_it->second;
+      if (total_refs == matched_refs) inputs.push_back(std::move(info));
     }
     return inputs;
   }
@@ -3146,6 +3161,7 @@ class OutWindowExternalizer {
 
     void ScanFunction(const FunctionPtr& func) {
       full_buffer_roots_.clear();
+      param_roots_.clear();
       writable_buffer_roots_.clear();
       tuple_output_roots_.clear();
       loop_iter_init_subst_.clear();
@@ -3153,6 +3169,7 @@ class OutWindowExternalizer {
         const auto& param = func->params_[i];
         if (!param || !AsTensorTypeLike(param->GetType())) continue;
         full_buffer_roots_[param.get()] = param.get();
+        param_roots_.insert(param.get());
         if (i < func->param_directions_.size() &&
             IsOutputDirection(func->param_directions_[i], /*include_inout=*/true)) {
           writable_buffer_roots_.insert(param.get());
@@ -3205,7 +3222,8 @@ class OutWindowExternalizer {
     }
 
     void VisitCallsite(const ExprPtr& expr) {
-      auto call = As<Call>(expr);
+      auto submit = As<Submit>(expr);
+      auto call = submit ? SubmitToCallView(submit) : As<Call>(expr);
       if (!call || codegen::IsBuiltinOp(call->op_->name_)) return;
       auto analysis_it = analyses_.find(call->op_->name_);
       if (analysis_it == analyses_.end()) return;
@@ -3240,7 +3258,9 @@ class OutWindowExternalizer {
 
     bool IsWritableRootExpr(const ExprPtr& expr) const {
       auto root = ResolveBufferRoot(expr);
-      return root && writable_buffer_roots_.count(root) > 0;
+      if (!root) return false;
+      if (param_roots_.count(root) == 0) return true;
+      return writable_buffer_roots_.count(root) > 0;
     }
 
     ExprPtr ResolveLoopInitExpr(const ExprPtr& expr) const {
@@ -3338,6 +3358,7 @@ class OutWindowExternalizer {
     const AnalysisMap& analyses_;
     std::unordered_map<std::string, std::unordered_map<size_t, InputCallsites>> input_callsites_;
     std::unordered_map<const Var*, const Var*> full_buffer_roots_;
+    std::unordered_set<const Var*> param_roots_;
     std::unordered_set<const Var*> writable_buffer_roots_;
     std::unordered_map<const Var*, ExprPtr> loop_iter_init_subst_;
     std::unordered_map<const Var*, std::vector<const Var*>> tuple_output_roots_;
