@@ -39,6 +39,15 @@ _SCORE_R = 32
 _SCORE_C = 32
 _PROBE_R = 32
 _PROBE_C = 64
+_CACHE_BLOCKS = 4
+_CACHE_BLOCK_SIZE = 16
+_CACHE_ROWS = _CACHE_BLOCKS * _CACHE_BLOCK_SIZE
+_CACHE_DIM = 64
+_CACHE_READ_DIM = 32
+_STATE_ROWS = 8
+_STATE_DIM = 64
+_STATE_ROW_TILE = 4
+_STATE_COL_TILE = 32
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -76,6 +85,84 @@ def _build_program():
     return WindowedConsumerInputDepsProgram
 
 
+def _build_cache_program():
+    """Build a v4 indexer-style cache flatten/write/readback program."""
+    BLOCKS, BLOCK_SIZE = _CACHE_BLOCKS, _CACHE_BLOCK_SIZE
+    ROWS, DIM, READ_DIM = _CACHE_ROWS, _CACHE_DIM, _CACHE_READ_DIM
+
+    @pl.program
+    class WindowedCacheInputDepsProgram:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[ROWS, DIM], pl.FP32],
+            cache: pl.Out[pl.Tensor[[BLOCKS, BLOCK_SIZE, 1, DIM], pl.FP32]],
+            probe: pl.Out[pl.Tensor[[ROWS, DIM], pl.FP32]],
+        ) -> pl.Tuple[
+            pl.Tensor[[BLOCKS, BLOCK_SIZE, 1, DIM], pl.FP32],
+            pl.Tensor[[ROWS, DIM], pl.FP32],
+        ]:
+            cache_flat: pl.Tensor[[ROWS, DIM], pl.FP32] = pl.reshape(cache, [ROWS, DIM])
+            for row0 in pl.parallel(0, ROWS, BLOCK_SIZE):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="cache_write"):
+                    block = x[row0 : row0 + BLOCK_SIZE, 0:DIM]
+                    cache_flat = pl.assemble(cache_flat, pl.add(block, block), [row0, 0])
+
+            for row0 in pl.parallel(0, ROWS, BLOCK_SIZE):
+                for col0 in pl.parallel(0, DIM, READ_DIM):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cache_read"):
+                        cache_block = cache_flat[row0 : row0 + BLOCK_SIZE, col0 : col0 + READ_DIM]
+                        probe = pl.assemble(probe, pl.add(cache_block, cache_block), [row0, col0])
+
+            cache = pl.reshape(cache_flat, [BLOCKS, BLOCK_SIZE, 1, DIM])
+            return cache, probe
+
+    return WindowedCacheInputDepsProgram
+
+
+def _build_state_pair_program():
+    """Build a prefill-compressor-style kv_state/score_state handoff."""
+    ROWS, DIM = _STATE_ROWS, _STATE_DIM
+    ROW_TILE, COL_TILE = _STATE_ROW_TILE, _STATE_COL_TILE
+
+    @pl.program
+    class WindowedStatePairInputDepsProgram:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            x: pl.Tensor[[ROWS, DIM], pl.FP32],
+            kv_state: pl.Out[pl.Tensor[[1, ROWS, DIM], pl.FP32]],
+            score_state: pl.Out[pl.Tensor[[1, ROWS, DIM], pl.FP32]],
+            probe: pl.Out[pl.Tensor[[ROWS, DIM], pl.FP32]],
+        ) -> pl.Tuple[
+            pl.Tensor[[1, ROWS, DIM], pl.FP32],
+            pl.Tensor[[1, ROWS, DIM], pl.FP32],
+            pl.Tensor[[ROWS, DIM], pl.FP32],
+        ]:
+            kv_flat: pl.Tensor[[ROWS, DIM], pl.FP32] = pl.reshape(kv_state, [ROWS, DIM])
+            score_flat: pl.Tensor[[ROWS, DIM], pl.FP32] = pl.reshape(score_state, [ROWS, DIM])
+
+            for col0 in pl.parallel(0, DIM, COL_TILE):
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_write"):
+                    chunk = x[:, col0 : col0 + COL_TILE]
+                    doubled = pl.add(chunk, chunk)
+                    kv_flat = pl.assemble(kv_flat, doubled, [0, col0])
+                    score_flat = pl.assemble(score_flat, doubled, [0, col0])
+
+            for row0 in pl.parallel(0, ROWS, ROW_TILE):
+                for col0 in pl.parallel(0, DIM, COL_TILE):
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="state_read"):
+                        kv_block = kv_flat[row0 : row0 + ROW_TILE, col0 : col0 + COL_TILE]
+                        score_block = score_flat[row0 : row0 + ROW_TILE, col0 : col0 + COL_TILE]
+                        probe = pl.assemble(probe, pl.add(kv_block, score_block), [row0, col0])
+
+            kv_state = pl.reshape(kv_flat, [1, ROWS, DIM])
+            score_state = pl.reshape(score_flat, [1, ROWS, DIM])
+            return kv_state, score_state, probe
+
+    return WindowedStatePairInputDepsProgram
+
+
 class _WindowedConsumerInputDepsPTO(PTOTestCase):
     """``probe = 4*x`` through windowed producer and consumer tasks."""
 
@@ -102,6 +189,79 @@ class _WindowedConsumerInputDepsPTO(PTOTestCase):
 
     def compute_expected(self, tensors, params=None):
         tensors["score"][:] = 2.0 * tensors["x"]
+        tensors["probe"][:] = 4.0 * tensors["x"]
+
+
+class _WindowedCacheInputDepsPTO(PTOTestCase):
+    """``probe = 4*x`` through a flattened 4D cache handoff."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return f"windowed_cache_input_deps_{_CACHE_ROWS}x{_CACHE_DIM}_r{_CACHE_BLOCK_SIZE}x{_CACHE_READ_DIM}"
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [_CACHE_ROWS, _CACHE_DIM], DataType.FP32, init_value=torch.randn),
+            TensorSpec(
+                "cache",
+                [_CACHE_BLOCKS, _CACHE_BLOCK_SIZE, 1, _CACHE_DIM],
+                DataType.FP32,
+                is_output=True,
+            ),
+            TensorSpec("probe", [_CACHE_ROWS, _CACHE_DIM], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_cache_program()
+
+    def compute_expected(self, tensors, params=None):
+        tensors["cache"][:] = (2.0 * tensors["x"]).reshape(
+            _CACHE_BLOCKS,
+            _CACHE_BLOCK_SIZE,
+            1,
+            _CACHE_DIM,
+        )
+        tensors["probe"][:] = 4.0 * tensors["x"]
+
+
+class _WindowedStatePairInputDepsPTO(PTOTestCase):
+    """``probe = 4*x`` through paired kv_state/score_state windows."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return (
+            f"windowed_state_pair_input_deps_{_STATE_ROWS}x{_STATE_DIM}_r{_STATE_ROW_TILE}x{_STATE_COL_TILE}"
+        )
+
+    def get_strategy(self) -> OptimizationStrategy:
+        return OptimizationStrategy.Default
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("x", [_STATE_ROWS, _STATE_DIM], DataType.FP32, init_value=torch.randn),
+            TensorSpec("kv_state", [1, _STATE_ROWS, _STATE_DIM], DataType.FP32, is_output=True),
+            TensorSpec("score_state", [1, _STATE_ROWS, _STATE_DIM], DataType.FP32, is_output=True),
+            TensorSpec("probe", [_STATE_ROWS, _STATE_DIM], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return _build_state_pair_program()
+
+    def compute_expected(self, tensors, params=None):
+        state = (2.0 * tensors["x"]).reshape(1, _STATE_ROWS, _STATE_DIM)
+        tensors["kv_state"][:] = state
+        tensors["score_state"][:] = state
         tensors["probe"][:] = 4.0 * tensors["x"]
 
 
@@ -137,6 +297,32 @@ def _assert_consumer_uses_score_window_input(code: str) -> None:
     assert "std::min<uint32_t>(64" in consumer_region, code
 
 
+def _assert_task_uses_window_inputs(code: str, task_name: str, parent_names: list[str]) -> None:
+    task_match = re.search(rf"// Task \d+: {re.escape(task_name)}__windowed", code)
+    assert task_match is not None, code
+
+    task_start = task_match.start()
+    next_task_match = re.search(r"\n\s*// Task \d+:", code[task_start + 1 :])
+    task_end = len(code) if next_task_match is None else task_start + 1 + next_task_match.start()
+    task_region = code[task_start:task_end]
+    scope_region = code[code.rfind("PTO2_SCOPE() {", 0, task_start) : task_start]
+
+    for parent_name in parent_names:
+        window_match = re.search(
+            rf"Tensor\s+({re.escape(parent_name)}[A-Za-z0-9_]*__window)\s*=\s*"
+            rf"{re.escape(parent_name)}[A-Za-z0-9_]*\.view\(",
+            scope_region,
+        )
+        assert window_match is not None, code
+        window_name = window_match.group(1)
+        assert f"add_input({window_name})" in task_region, code
+        assert f"add_input({parent_name})" not in task_region, code
+
+
+def _assert_pass_dump_has_window(optimized: str, parent_prefix: str, shape: str) -> None:
+    assert re.search(rf"pl\.tensor\.slice\({re.escape(parent_prefix)}\w*, \[{shape}\]", optimized), optimized
+
+
 class TestWindowedConsumerInputDepsCodegen:
     """Compile-time ST that inspects pass dumps and generated orchestration."""
 
@@ -164,13 +350,64 @@ class TestWindowedConsumerInputDepsCodegen:
         code = _read_single(work_dir / "orchestration", "*.cpp")
         _assert_consumer_uses_score_window_input(code)
 
+    def test_flattened_cache_consumer_uses_cache_window(self, request, tmp_path, monkeypatch):
+        if request.config.getoption("--save-kernels"):
+            output_dir = _default_saved_parent_dir("WindowedCacheInputDepsProgram")
+            monkeypatch.delenv("PYPTO_PROG_BUILD_DIR", raising=False)
+        else:
+            output_dir = None
+            monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path / "build_output"))
+
+        compiled = ir.compile(
+            _build_cache_program(),
+            output_dir=output_dir,
+            backend_type=BackendType.Ascend910B,
+            dump_passes=True,
+        )
+        work_dir = compiled.output_dir
+
+        optimized = _latest_pass_dump(work_dir, "OptimizeOrchTensors")
+        _assert_pass_dump_has_window(optimized, "cache_flat__rv_", "16, 32")
+        assert "cache_read__windowed(" in optimized and "__window" in optimized, optimized
+
+        code = _read_single(work_dir / "orchestration", "*.cpp")
+        _assert_task_uses_window_inputs(code, "cache_read", ["cache_flat"])
+
+    def test_state_pair_consumer_uses_both_state_windows(self, request, tmp_path, monkeypatch):
+        if request.config.getoption("--save-kernels"):
+            output_dir = _default_saved_parent_dir("WindowedStatePairInputDepsProgram")
+            monkeypatch.delenv("PYPTO_PROG_BUILD_DIR", raising=False)
+        else:
+            output_dir = None
+            monkeypatch.setenv("PYPTO_PROG_BUILD_DIR", str(tmp_path / "build_output"))
+
+        compiled = ir.compile(
+            _build_state_pair_program(),
+            output_dir=output_dir,
+            backend_type=BackendType.Ascend910B,
+            dump_passes=True,
+        )
+        work_dir = compiled.output_dir
+
+        optimized = _latest_pass_dump(work_dir, "OptimizeOrchTensors")
+        _assert_pass_dump_has_window(optimized, "kv_flat__rv_", "4, 32")
+        _assert_pass_dump_has_window(optimized, "score_flat__rv_", "4, 32")
+        assert "state_read__windowed(" in optimized and "__window" in optimized, optimized
+
+        code = _read_single(work_dir / "orchestration", "*.cpp")
+        _assert_task_uses_window_inputs(code, "state_read", ["kv_flat", "score_flat"])
+
 
 class TestWindowedConsumerInputDepsExecution:
     """Numerical correctness check for the same program."""
 
     @pytest.mark.parametrize("platform", PLATFORMS)
-    def test_runtime_correctness(self, test_runner, platform):
-        result = test_runner.run(_WindowedConsumerInputDepsPTO(platform=platform))
+    @pytest.mark.parametrize(
+        "case_cls",
+        [_WindowedConsumerInputDepsPTO, _WindowedCacheInputDepsPTO, _WindowedStatePairInputDepsPTO],
+    )
+    def test_runtime_correctness(self, test_runner, platform, case_cls):
+        result = test_runner.run(case_cls(platform=platform))
         assert result.passed, f"windowed consumer input dependency execution failed: {result.error}"
 
 
