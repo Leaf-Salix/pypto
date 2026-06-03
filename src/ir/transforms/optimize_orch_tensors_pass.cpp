@@ -128,6 +128,31 @@ size_t CountVarRefsInStmt(const StmtPtr& stmt, const Var* target) {
   return counter.count();
 }
 
+std::unordered_map<const Var*, size_t> CountAllVarRefsInStmt(const StmtPtr& stmt) {
+  class Counter : public IRVisitor {
+   public:
+    [[nodiscard]] const std::unordered_map<const Var*, size_t>& counts() const { return counts_; }
+
+   protected:
+    void VisitExpr_(const VarPtr& op) override {
+      ++counts_[op.get()];
+      IRVisitor::VisitExpr_(op);
+    }
+
+    void VisitExpr_(const IterArgPtr& op) override {
+      ++counts_[op.get()];
+      IRVisitor::VisitExpr_(op);
+    }
+
+   private:
+    std::unordered_map<const Var*, size_t> counts_;
+  };
+
+  Counter counter;
+  counter.VisitStmt(stmt);
+  return counter.counts();
+}
+
 bool ExprReferencesOnlyVarsIn(const ExprPtr& expr, const std::unordered_set<const Var*>& allowed) {
   class Checker : public IRVisitor {
    public:
@@ -3030,6 +3055,7 @@ class OutWindowExternalizer {
     std::unordered_map<size_t, InputRewriteInfo> by_index;
     std::unordered_map<size_t, size_t> matched_refs_by_index;
     std::unordered_set<size_t> conflicted;
+    auto total_refs_by_var = CountAllVarRefsInStmt(func->body_);
     for (const auto& stmt : body_stmts) {
       auto assign = As<AssignStmt>(stmt);
       auto call = assign ? As<Call>(assign->value_) : nullptr;
@@ -3125,7 +3151,8 @@ class OutWindowExternalizer {
     inputs.reserve(by_index.size());
     for (auto& [param_index, info] : by_index) {
       if (conflicted.count(param_index) != 0 || param_index >= func->params_.size()) continue;
-      auto total_refs = CountVarRefsInStmt(func->body_, func->params_[param_index].get());
+      auto total_refs_it = total_refs_by_var.find(func->params_[param_index].get());
+      auto total_refs = total_refs_it == total_refs_by_var.end() ? 0 : total_refs_it->second;
       auto matched_it = matched_refs_by_index.find(param_index);
       auto matched_refs = matched_it == matched_refs_by_index.end() ? 0 : matched_it->second;
       if (total_refs == matched_refs) inputs.push_back(std::move(info));
