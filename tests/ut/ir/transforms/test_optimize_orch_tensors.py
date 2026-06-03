@@ -7,6 +7,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+# ruff: noqa: E501
+
 """Unit tests for OptimizeOrchTensors pass.
 
 Each test uses explicit Before (post-ConvertTensorToTileOps tile-level IR)
@@ -1475,6 +1477,164 @@ class TestOutWindowExternalizer:
                 doubled: pl.Tile[[32, 32], pl.FP32, pl.Mem.Vec] = pl.tile.add(x_tile, x_tile)
                 result: pl.Tensor[[64, 128], pl.FP32] = pl.tile.store(doubled, [r0, c0], score)
                 return result
+
+        After = _run_to_optimize_orch_tensors(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_spmd_row_block_consumer_uses_input_window(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[8, 16], pl.FP32],
+                score: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+                probe: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+            ):
+                score_flat: pl.Tensor[[8, 16], pl.FP32] = pl.reshape(score, [8, 16])
+                for bg in pl.spmd(4, name_hint="score"):
+                    tb: pl.Scalar[pl.INDEX] = bg * 2
+                    for s in pl.range(2):
+                        r: pl.Scalar[pl.INDEX] = tb + s
+                        score_flat[r : r + 1, :] = x[r : r + 1, :]
+                for idx in pl.spmd(4, name_hint="topk"):
+                    t0: pl.Scalar[pl.INDEX] = idx * 2
+                    for ti in pl.range(2):
+                        t: pl.Scalar[pl.INDEX] = t0 + ti
+                        row: pl.Tensor[[1, 16], pl.FP32] = score_flat[t : t + 1, :]
+                        probe[t : t + 1, :] = row
+                return score_flat, probe
+
+        Expected = pl.parse_program(
+            """
+import pypto.language as pl
+
+@pl.program
+class Expected:
+    @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+    def score_spmd__windowed(
+        block_idx: pl.Scalar[pl.INDEX],
+        score_flat__ssa_v0: pl.Out[pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)]],
+        x__ssa_v0: pl.Tensor[[8, 16], pl.FP32],
+    ) -> pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)]:
+        tb__ssa_v0: pl.Scalar[pl.INDEX] = block_idx * 2
+        for s__idx_v0, (score_flat__iter_v1,) in pl.range(2, init_values=(score_flat__ssa_v0,)):
+            r__ssa_v0: pl.Scalar[pl.INDEX] = tb__ssa_v0 + s__idx_v0
+            t__tile: pl.Tile[[1, 16], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                x__ssa_v0, [r__ssa_v0, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec, transpose=False
+            )
+            score_flat__tile: pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)] = pl.tile.store(
+                t__tile, [r__ssa_v0 - block_idx * 2, 0], score_flat__iter_v1
+            )
+            score_flat__rv_v2: pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)] = pl.yield_(score_flat__tile)
+        return score_flat__rv_v2
+
+    @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+    def topk_spmd__windowed(
+        block_idx: pl.Scalar[pl.INDEX],
+        probe__ssa_v0: pl.Out[pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)]],
+        score_flat__rv_v2: pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)],
+    ) -> pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)]:
+        t0__ssa_v0: pl.Scalar[pl.INDEX] = block_idx * 2
+        for ti__idx_v0, (probe__iter_v1,) in pl.range(2, init_values=(probe__ssa_v0,)):
+            t__ssa_v0: pl.Scalar[pl.INDEX] = t0__ssa_v0 + ti__idx_v0
+            row__tile: pl.Tile[[1, 16], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                score_flat__rv_v2, [ti__idx_v0, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec, transpose=False
+            )
+            probe__tile: pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)] = pl.tile.store(
+                row__tile, [t__ssa_v0 - block_idx * 2, 0], probe__iter_v1
+            )
+            probe__rv_v2: pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)] = pl.yield_(probe__tile)
+        return probe__rv_v2
+
+    @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+    def main(
+        self,
+        x__ssa_v0: pl.Tensor[[8, 16], pl.FP32],
+        score__ssa_v0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+        probe__ssa_v0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+    ):
+        score_flat__ssa_v0: pl.Tensor[[8, 16], pl.FP32] = pl.tensor.reshape(score__ssa_v0, [8, 16])
+        for spmd_idx, (score_flat__ssa_v0_iter,) in pl.range(4, init_values=(score_flat__ssa_v0,)):
+            score_flat__ssa_v0_iter__window: pl.Tensor[[2, 16], pl.FP32] = pl.tensor.slice(
+                score_flat__ssa_v0_iter, [2, 16], [spmd_idx * 2, 0]
+            )
+            score_flat__rv_v2__windowed: pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)] = self.score_spmd__windowed(
+                spmd_idx, score_flat__ssa_v0_iter__window, x__ssa_v0
+            )
+            score_flat__rv_v2__assembled_0: pl.Tensor[[8, 16], pl.FP32] = pl.tensor.assemble(
+                score_flat__ssa_v0_iter, score_flat__rv_v2__windowed, [spmd_idx * 2, 0]
+            )
+            score_flat__ssa_v0_rv: pl.Tensor[[8, 16], pl.FP32] = pl.yield_(score_flat__rv_v2__assembled_0)
+        score_flat__rv_v2: pl.Tensor[[8, 16], pl.FP32] = score_flat__ssa_v0_rv
+        for spmd_idx_1, (probe__ssa_v0_iter,) in pl.range(4, init_values=(probe__ssa_v0,)):
+            score_flat__rv_v2__window: pl.Tensor[[2, 16], pl.FP32] = pl.tensor.slice(
+                score_flat__rv_v2, [2, 16], [spmd_idx_1 * 2, 0]
+            )
+            probe__ssa_v0_iter__window: pl.Tensor[[2, 16], pl.FP32] = pl.tensor.slice(
+                probe__ssa_v0_iter, [2, 16], [spmd_idx_1 * 2, 0]
+            )
+            probe__rv_v2__windowed: pl.Tensor[[2, 16], pl.FP32, pl.TensorView(stride=[16, 1], layout=pl.TensorLayout.ND)] = self.topk_spmd__windowed(
+                spmd_idx_1, probe__ssa_v0_iter__window, score_flat__rv_v2__window
+            )
+            probe__rv_v2__assembled_0: pl.Tensor[[8, 16], pl.FP32] = pl.tensor.assemble(
+                probe__ssa_v0_iter, probe__rv_v2__windowed, [spmd_idx_1 * 2, 0]
+            )
+            probe__ssa_v0_rv: pl.Tensor[[8, 16], pl.FP32] = pl.yield_(probe__rv_v2__assembled_0)
+        probe__rv_v2: pl.Tensor[[8, 16], pl.FP32] = probe__ssa_v0_rv
+        return score_flat__rv_v2, probe__rv_v2
+
+    @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+    def score(
+        score_flat__ssa_v0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+        x__ssa_v0: pl.Tensor[[8, 16], pl.FP32],
+    ) -> pl.Tensor[[8, 16], pl.FP32]:
+        bg__ssa_v0: pl.Scalar[pl.INDEX] = pl.tile.get_block_idx()
+        tb__ssa_v0: pl.Scalar[pl.INDEX] = bg__ssa_v0 * 2
+        for s__idx_v0, (score_flat__iter_v1,) in pl.range(2, init_values=(score_flat__ssa_v0,)):
+            r__ssa_v0: pl.Scalar[pl.INDEX] = tb__ssa_v0 + s__idx_v0
+            t__tile: pl.Tile[[1, 16], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                x__ssa_v0, [r__ssa_v0, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec, transpose=False
+            )
+            score_flat__tile: pl.Tensor[[8, 16], pl.FP32] = pl.tile.store(t__tile, [r__ssa_v0, 0], score_flat__iter_v1)
+            score_flat__rv_v2: pl.Tensor[[8, 16], pl.FP32] = pl.yield_(score_flat__tile)
+        return score_flat__rv_v2
+
+    @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": 4})
+    def score_spmd(
+        self,
+        score_flat__ssa_v0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+        x__ssa_v0: pl.Tensor[[8, 16], pl.FP32],
+    ) -> pl.Tensor[[8, 16], pl.FP32]:
+        score_flat__rv_v2: pl.Tensor[[8, 16], pl.FP32] = self.score(score_flat__ssa_v0, x__ssa_v0)
+        return score_flat__rv_v2
+
+    @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+    def topk(
+        probe__ssa_v0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+        score_flat__rv_v2: pl.Tensor[[8, 16], pl.FP32],
+    ) -> pl.Tensor[[8, 16], pl.FP32]:
+        idx__ssa_v0: pl.Scalar[pl.INDEX] = pl.tile.get_block_idx()
+        t0__ssa_v0: pl.Scalar[pl.INDEX] = idx__ssa_v0 * 2
+        for ti__idx_v0, (probe__iter_v1,) in pl.range(2, init_values=(probe__ssa_v0,)):
+            t__ssa_v0: pl.Scalar[pl.INDEX] = t0__ssa_v0 + ti__idx_v0
+            row__tile: pl.Tile[[1, 16], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                score_flat__rv_v2, [t__ssa_v0, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec, transpose=False
+            )
+            probe__tile: pl.Tensor[[8, 16], pl.FP32] = pl.tile.store(row__tile, [t__ssa_v0, 0], probe__iter_v1)
+            probe__rv_v2: pl.Tensor[[8, 16], pl.FP32] = pl.yield_(probe__tile)
+        return probe__rv_v2
+
+    @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": 4})
+    def topk_spmd(
+        self,
+        probe__ssa_v0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+        score_flat__rv_v2: pl.Tensor[[8, 16], pl.FP32],
+    ) -> pl.Tensor[[8, 16], pl.FP32]:
+        probe__rv_v2: pl.Tensor[[8, 16], pl.FP32] = self.topk(probe__ssa_v0, score_flat__rv_v2)
+        return probe__rv_v2
+"""
+        )
 
         After = _run_to_optimize_orch_tensors(Before)
         ir.assert_structural_equal(After, Expected)
