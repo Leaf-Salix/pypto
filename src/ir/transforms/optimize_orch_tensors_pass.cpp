@@ -2239,6 +2239,14 @@ class OutWindowExternalizer {
       const std::unordered_set<const Var*>* loop_local_allocs = nullptr;
     };
 
+    struct RewriteCallsiteCandidate {
+      SubmitPtr submit;
+      CallPtr call;
+      FunctionPtr original_func;
+      const CalleeRewriteAnalysis* analysis = nullptr;
+      FunctionPtr cloned_func;
+    };
+
     static bool IsTensorTypedExpr(const ExprPtr& expr) {
       return expr && AsTensorTypeLike(expr->GetType()) != nullptr;
     }
@@ -2448,29 +2456,47 @@ class OutWindowExternalizer {
       return false;
     }
 
-    bool CanSkipFullRootReadForWindowedCallsite(const AssignStmtPtr& call_assign, const CallPtr& call,
-                                                const CalleeRewriteAnalysis& analysis,
-                                                const RootSet& reads) const {
-      if (!call_assign || analysis.outputs.empty()) return false;
+    std::optional<RewriteCallsiteCandidate> GetRewriteCallsiteCandidate(
+        const AssignStmtPtr& call_assign) const {
+      if (!call_assign) return std::nullopt;
+      auto submit = As<Submit>(call_assign->value_);
+      auto call = submit ? SubmitToCallView(submit) : As<Call>(call_assign->value_);
+      if (!call) return std::nullopt;
+
+      auto callee_name = GetCallFuncName(call);
+      auto analysis_it = analyses_.find(callee_name);
+      if (analysis_it == analyses_.end()) return std::nullopt;
+      auto clone_it = cloned_funcs_.find(callee_name);
+      if (clone_it == cloned_funcs_.end()) return std::nullopt;
+      auto original_func = program_ ? program_->GetFunction(callee_name) : nullptr;
+      if (!original_func) return std::nullopt;
+
+      const auto& analysis = analysis_it->second;
+      if (analysis.outputs.empty()) return std::nullopt;
       for (const auto& input : analysis.inputs) {
-        if (input.in_param_index >= call->args_.size()) return false;
-        if (!AsVarLike(call->args_[input.in_param_index])) return false;
-        if (!IsWritableRootExpr(call->args_[input.in_param_index])) return false;
+        if (input.in_param_index >= call->args_.size()) return std::nullopt;
+        if (!AsVarLike(call->args_[input.in_param_index])) return std::nullopt;
+        if (!IsWritableRootExpr(call->args_[input.in_param_index])) return std::nullopt;
       }
       for (const auto& output : analysis.outputs) {
-        if (output.out_param_index >= call->args_.size()) return false;
-        if (!AsVarLike(call->args_[output.out_param_index])) return false;
+        if (output.out_param_index >= call->args_.size()) return std::nullopt;
+        if (!AsVarLike(call->args_[output.out_param_index])) return std::nullopt;
       }
       if (IsSubmitCall(call)) {
-        auto clone_it = cloned_funcs_.find(call->op_->name_);
         auto tuple_ty = As<TupleType>(call->GetType());
-        if (clone_it == cloned_funcs_.end() || !tuple_ty ||
-            tuple_ty->types_.size() != clone_it->second->return_types_.size() + 1) {
-          return false;
+        if (!tuple_ty || tuple_ty->types_.size() != clone_it->second->return_types_.size() + 1) {
+          return std::nullopt;
         }
       }
-      if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return false;
-      return !HasLaterFullParentReadOfRewrittenOutput(call, analysis, reads);
+      if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
+      return RewriteCallsiteCandidate{submit, call, original_func, &analysis, clone_it->second};
+    }
+
+    bool CanSkipFullRootReadForWindowedCallsite(const AssignStmtPtr& call_assign,
+                                                const RootSet& reads) const {
+      auto candidate = GetRewriteCallsiteCandidate(call_assign);
+      if (!candidate.has_value()) return false;
+      return !HasLaterFullParentReadOfRewrittenOutput(candidate->call, *candidate->analysis, reads);
     }
 
     void AddFullRootReadsFromCall(const AssignStmtPtr& call_assign, const CallPtr& call,
@@ -2484,7 +2510,7 @@ class OutWindowExternalizer {
           analysis_it == analyses_.end() || !cloned_funcs_.count(callee_name) ? nullptr
                                                                               : &analysis_it->second;
       const bool can_skip_windowed_reads =
-          analysis && CanSkipFullRootReadForWindowedCallsite(call_assign, call, *analysis, reads);
+          analysis && CanSkipFullRootReadForWindowedCallsite(call_assign, reads);
       for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
         if (!IsReadDirection(callee->param_directions_[i])) continue;
         if (can_skip_windowed_reads && HasAnalyzedInputWindow(*analysis, i) &&
@@ -2592,23 +2618,14 @@ class OutWindowExternalizer {
       // (.claude/rules/pass-submit-awareness.md). The per-callee analysis and
       // windowed clone are callee-body-driven (Analyze() over all functions),
       // so they exist regardless of the call-site kind.
-      auto submit = As<Submit>(call_assign->value_);
-      auto call = submit ? SubmitToCallView(submit) : As<Call>(call_assign->value_);
-      if (!call) return std::nullopt;
+      auto candidate = GetRewriteCallsiteCandidate(call_assign);
+      if (!candidate.has_value()) return std::nullopt;
+      auto submit = candidate->submit;
+      auto call = candidate->call;
+      auto original_func = candidate->original_func;
+      const auto& analysis = *candidate->analysis;
+      auto cloned_func = candidate->cloned_func;
 
-      auto callee_name = GetCallFuncName(call);
-      auto analysis_it = analyses_.find(callee_name);
-      if (analysis_it == analyses_.end()) return std::nullopt;
-      auto clone_it = cloned_funcs_.find(callee_name);
-      if (clone_it == cloned_funcs_.end()) return std::nullopt;
-      auto original_func = program_ ? program_->GetFunction(callee_name) : nullptr;
-      if (!original_func) return std::nullopt;
-
-      const auto& analysis = analysis_it->second;
-      auto cloned_func = clone_it->second;
-
-      if (analysis.outputs.empty()) return std::nullopt;
-      if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
       if (HasLaterFullParentReadOfRewrittenOutput(call, analysis)) return std::nullopt;
 
       std::unordered_map<const Var*, ExprPtr> callsite_subst;
