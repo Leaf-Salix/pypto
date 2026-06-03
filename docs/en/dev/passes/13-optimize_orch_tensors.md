@@ -74,13 +74,14 @@ for i in pl.range(N, init_values=[init_buf]):
 
 ### Pattern 5: Static Out-Window Externalization (OutWindowExternalizer)
 
-**Problem**: An outlined callee may write only a statically provable local window of a large `Out` tensor, but the call site still passes the whole tensor. Downstream dependence analysis then sees a whole-buffer writer and adds unnecessary serialization.
+**Problem**: An outlined callee may write only a statically provable local window of a large `Out` tensor, but the call site still passes the whole tensor. A later windowed consumer may also read only a statically provable input window while registering the full parent tensor as the task input. Downstream dependence analysis then sees whole-buffer regions instead of the actual windows and adds unnecessary serialization.
 
-**Solution**: Clone the callee to a `__windowed` variant with narrowed rewritten `Out` parameter types, narrowed rewritten return types, and localized internal `tile.store` offsets. Rewrite the orchestration call site to explicit `slice + __windowed call + assemble`:
+**Solution**: Clone the callee to a `__windowed` variant with narrowed rewritten `Out` parameter types, narrowed rewritten input-window parameter types when all uses are covered by the same window, narrowed rewritten return types, and localized internal `tile.store`, `tensor.slice`, or `tile.load` offsets. Rewrite the orchestration call site to explicit `slice + __windowed call + assemble` for outputs and to pass explicit read windows for eligible inputs:
 
 ```python
 out_window = pl.tensor.slice(out, shape, offset)
-out_window_next = self.kernel__windowed(..., out_window)
+in_window = pl.tensor.slice(parent, read_shape, read_offset)
+out_window_next = self.kernel__windowed(..., in_window, out_window)
 out = pl.tensor.assemble(out, out_window_next, offset)
 ```
 
@@ -94,7 +95,10 @@ Safety rules:
 - only statically provable affine offsets are accepted
 - multi-`Out` rewrite is all-or-nothing
 - sequential-loop siblings are rewritten only when every rewritten `Out` can be proven disjoint across sibling iterations
-- call-site externalization is skipped when a rewritten window output's buffer root is later read as a full-parent tensor in the enclosing orchestration scope; until the runtime has root-aware view/parent dependency tracking, this preserves auto dependency tracking on the same parent `Tensor`
+- call-site externalization is skipped when a rewritten window output's buffer root is later read as a full-parent tensor in the enclosing orchestration scope; reads that can themselves be represented as precise input windows are not treated as full-parent reads
+- input-window rewrites only apply to `In` params whose references are all covered by the matched `tensor.slice` / `tile.load`; if the callee also uses the param as a full tensor, that input remains on the parent/full-tensor baseline
+- input-window call sites must be backed by writable roots: `Out`/`InOut` parameters or local tensor allocations such as `tensor.create` / `tensor.full`; mixed call sites fall back conservatively
+- direct calls and `pl.submit` call sites are both considered when deciding input-window eligibility
 - `DeriveCallDirections` keeps its existing sound sequential `Out -> InOut` rule; Pattern 5 only makes disjoint windows explicit before that pass runs
 
 ## Example (Pattern 1)
@@ -169,7 +173,7 @@ The `tensor.create` is eliminated; the iter-arg buffer is reused across iteratio
 | `AssembleParentStridesOptimizer` | Pattern 2 — attaches parent strides via TensorView |
 | `SliceInputStridesOptimizer` | Pattern 4 — attaches parent strides to In params via TensorView for slice patterns |
 | `AssembleLoopRewriter` | Pattern 3 — rewrites tile.assemble loops to tile.store loops |
-| `OutWindowExternalizer` | Pattern 5 — rewrites statically provable local Out-window writes to explicit `slice + call + assemble` |
+| `OutWindowExternalizer` | Pattern 5 — rewrites statically provable local Out-window writes and eligible consumer input-window reads to explicit window arguments |
 | `BuildOutParamReturnMappings` | Shared helper — maps Out params to return indices via tile.store |
 | `ComputeRowMajorStrides` | Shared helper — computes row-major strides from a shape |
 

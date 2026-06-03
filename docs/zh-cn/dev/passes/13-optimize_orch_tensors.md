@@ -74,13 +74,14 @@ for i in pl.range(N, init_values=[init_buf]):
 
 ### 模式 5：静态 Out 窗口外提（OutWindowExternalizer）
 
-**问题**：某些 outlined callee 实际只写入大 `Out` 张量中的一个静态可证明局部窗口，但调用点仍传入整块张量。后续依赖分析会把它视为整块缓冲区写者，从而引入不必要的串行化。
+**问题**：某些 outlined callee 实际只写入大 `Out` 张量中的一个静态可证明局部窗口，但调用点仍传入整块张量。后续 windowed consumer 也可能只读取一个静态可证明输入窗口，却在任务输入里登记完整 parent tensor。后续依赖分析因此只能看到整块缓冲区区域，而不是实际窗口，从而引入不必要的串行化。
 
-**方案**：为 callee 克隆出 `__windowed` 版本，收窄被改写 `Out` 参数类型及返回类型，并局部化内部 `tile.store` offset。然后将 orchestration callsite 改写为显式的 `slice + __windowed call + assemble`：
+**方案**：为 callee 克隆出 `__windowed` 版本，收窄被改写 `Out` 参数类型；当 `In` 参数的所有使用都被同一个输入窗口覆盖时，也收窄对应输入窗口参数类型；同时收窄被改写返回类型，并局部化内部 `tile.store`、`tensor.slice` 或 `tile.load` offset。然后将 orchestration callsite 的输出改写为显式的 `slice + __windowed call + assemble`，并为符合条件的输入传入显式读窗口：
 
 ```python
 out_window = pl.tensor.slice(out, shape, offset)
-out_window_next = self.kernel__windowed(..., out_window)
+in_window = pl.tensor.slice(parent, read_shape, read_offset)
+out_window_next = self.kernel__windowed(..., in_window, out_window)
 out = pl.tensor.assemble(out, out_window_next, offset)
 ```
 
@@ -94,7 +95,10 @@ out = pl.tensor.assemble(out, out_window_next, offset)
 - 只接受静态可证明的仿射 offset
 - multi-`Out` 改写采用全有或全无策略
 - 顺序循环 sibling 只有在每个被改写 `Out` 都能证明跨 sibling iteration 不重叠时才改写
-- 如果被改写的窗口输出所属 buffer root 后续会在外围 orchestration scope 中以完整 parent tensor 形式读取，则跳过该 call-site externalization；在 runtime 尚未具备 view/parent root-aware 依赖跟踪前，这能让自动依赖继续落在同一个 parent `Tensor` 上
+- 如果被改写的窗口输出所属 buffer root 后续会在外围 orchestration scope 中以完整 parent tensor 形式读取，则跳过该 call-site externalization；如果后续读取本身可以表示为精确输入窗口，则不再把它当作 full-parent read
+- 输入窗口改写只应用于所有引用都被匹配到的 `tensor.slice` / `tile.load` 覆盖的 `In` 参数；如果 callee 还把该参数作为完整 tensor 使用，则该输入保持 parent/full-tensor baseline
+- 输入窗口 callsite 必须来自 writable root：`Out`/`InOut` 参数，或 `tensor.create` / `tensor.full` 等本地张量分配；混合 callsite 会保守回退
+- direct call 和 `pl.submit` callsite 都会参与输入窗口 eligibility 判断
 - `DeriveCallDirections` 保持现有 sound 的顺序 `Out -> InOut` 规则；Pattern 5 只是在该 pass 运行前显式化不重叠窗口
 
 ## 示例（模式 1）
@@ -169,7 +173,7 @@ class After:
 | `AssembleParentStridesOptimizer` | 模式 2 — 通过 TensorView 附加父张量步长 |
 | `SliceInputStridesOptimizer` | 模式 4 — 通过 TensorView 为切片输入的 In 参数附加父张量步长 |
 | `AssembleLoopRewriter` | 模式 3 — 将 tile.assemble 循环重写为 tile.store 循环 |
-| `OutWindowExternalizer` | 模式 5 — 识别静态可证明的局部 Out 窗口写，并改写为显式 `slice + call + assemble` |
+| `OutWindowExternalizer` | 模式 5 — 识别静态可证明的局部 Out 窗口写和符合条件的 consumer 输入窗口读，并改写为显式窗口参数 |
 | `BuildOutParamReturnMappings` | 共享辅助函数 — 通过 tile.store 映射 Out 参数到返回索引 |
 | `ComputeRowMajorStrides` | 共享辅助函数 — 从形状计算行主序步长 |
 
