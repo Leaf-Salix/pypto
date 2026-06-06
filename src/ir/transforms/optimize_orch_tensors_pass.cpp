@@ -2051,6 +2051,8 @@ class OutWindowExternalizer {
         }
       }
 
+      auto saved_outer_reads = std::move(enclosing_later_full_parent_reads_);
+
       bool is_sequential = op->kind_ != ForKind::Parallel;
       if (is_sequential) {
         sequential_loops_.push_back(op);
@@ -2064,6 +2066,8 @@ class OutWindowExternalizer {
       auto visited_loop = As<ForStmt>(result);
       AddLoopReturnRoots(visited_loop ? visited_loop : op);
       loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
+
+      enclosing_later_full_parent_reads_ = std::move(saved_outer_reads);
       return result;
     }
 
@@ -2077,12 +2081,16 @@ class OutWindowExternalizer {
           }
         }
       }
+
+      auto saved_outer_reads = std::move(enclosing_later_full_parent_reads_);
       ++while_depth_;
       auto result = IRMutator::VisitStmt_(op);
       --while_depth_;
       auto visited_loop = As<WhileStmt>(result);
       AddLoopReturnRoots(visited_loop ? visited_loop : op);
       loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
+
+      enclosing_later_full_parent_reads_ = std::move(saved_outer_reads);
       return result;
     }
 
