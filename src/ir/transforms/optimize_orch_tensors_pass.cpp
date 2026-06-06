@@ -2052,6 +2052,7 @@ class OutWindowExternalizer {
       }
 
       auto saved_outer_reads = std::move(enclosing_later_full_parent_reads_);
+      enclosing_later_full_parent_reads_.clear();
 
       bool is_sequential = op->kind_ != ForKind::Parallel;
       if (is_sequential) {
@@ -2083,6 +2084,7 @@ class OutWindowExternalizer {
       }
 
       auto saved_outer_reads = std::move(enclosing_later_full_parent_reads_);
+      enclosing_later_full_parent_reads_.clear();
       ++while_depth_;
       auto result = IRMutator::VisitStmt_(op);
       --while_depth_;
