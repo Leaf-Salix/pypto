@@ -30,7 +30,7 @@ for _path in (_CASE_DIR, _MODEL_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from golden import ratio_allclose, run_jit, topk_pair_compare  # noqa: E402
+from golden import ratio_allclose, run_jit  # noqa: E402
 from indexer import (  # noqa: E402
     IDX_KV_LEN,
     IDX_TOPK,
@@ -46,17 +46,32 @@ def _topk_idxs_compare(actual, expected, *, actual_outputs, expected_outputs, in
     score = actual_outputs["score"].cpu().to(torch.float32)
     actual_topk = actual[..., :IDX_TOPK]
     expected_topk = expected[..., :IDX_TOPK]
+
+    valid = expected_topk != -1
+    invalid_match = actual_topk[~valid].eq(expected_topk[~valid])
+    if not invalid_match.all().item():
+        bad_flat = torch.where(~invalid_match.flatten())[0]
+        return False, f"    invalid topk tail mismatch count={bad_flat.numel()}"
+
     actual_score_index = (actual_topk.long() - OFFSET).clamp(min=0, max=score.shape[-1] - 1)
-    paired_scores = torch.gather(score, dim=-1, index=actual_score_index)
-    synthetic_outputs = {**actual_outputs, "_paired_topk_scores": paired_scores}
-    return topk_pair_compare("_paired_topk_scores")(
-        actual_topk,
-        expected_topk,
-        actual_outputs=synthetic_outputs,
-        expected_outputs=expected_outputs,
-        inputs=inputs,
-        rtol=rtol,
-        atol=atol,
+    expected_score_index = (expected_topk.long() - OFFSET).clamp(min=0, max=score.shape[-1] - 1)
+    actual_paired = torch.gather(score, dim=-1, index=actual_score_index)
+    expected_paired = torch.gather(score, dim=-1, index=expected_score_index)
+    close = torch.isclose(actual_paired[valid], expected_paired[valid], rtol=rtol, atol=atol)
+    if close.all().item():
+        return True, ""
+
+    bad_valid = torch.where(valid)
+    bad_positions = torch.where(~close.flatten())[0]
+    lines = []
+    for flat_pos in bad_positions[:10]:
+        coord = tuple(int(axis_indices[flat_pos]) for axis_indices in bad_valid)
+        lines.append(
+            f"    {coord}: actual_idx={int(actual_topk[coord])}, expected_idx={int(expected_topk[coord])}, "
+            f"actual_score={float(actual_paired[coord])}, expected_score={float(expected_paired[coord])}"
+        )
+    return False, (
+        f"    paired score mismatch count={bad_positions.numel()}/{int(valid.sum())}\n" + "\n".join(lines)
     )
 
 
