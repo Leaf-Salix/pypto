@@ -1001,6 +1001,67 @@ class TestEdgeCases:
         ir.assert_structural_equal(After, Before)
 
 
+class TestStaticOutputWindows:
+    """Pattern 5: static output windows are precomputed at the parent tensor."""
+
+    @pytest.fixture(autouse=True)
+    def _no_roundtrip_verification(self):
+        """The static-window planner emits pass-internal tensor ops that are
+        consumed by orchestration codegen, not by the Python DSL parser.
+        Keep property verification, but skip print -> parse roundtrip here.
+        """
+        from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+        instruments: list[_core_passes.PassInstrument] = [
+            _core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)
+        ]
+        with _core_passes.PassContext(instruments):
+            yield
+
+    def test_direct_out_call_uses_precomputed_window_ops(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_stripe(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                bias: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, bias)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                out: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                row: pl.Scalar[pl.INDEX] = 64
+                out_next: pl.Tensor[[256, 64], pl.FP32] = self.kernel_stripe(
+                    data, row, 1.0, out
+                )
+                return out_next
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("kernel_stripe__windowed") is not None
+
+        call_names: list[str] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_call(self, op):
+                call_names.append(getattr(getattr(op, "op", None), "name", ""))
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        assert "tensor.precompute_static_windows" in call_names
+        assert "tensor.static_window_get" in call_names
+        assert "tensor.slice" not in call_names
+
+
 class TestPattern3WhileLoop:
     """Pattern 3 (AssembleLoopRewriter) is ForStmt-only.
 
