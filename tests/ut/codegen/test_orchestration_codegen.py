@@ -1615,9 +1615,8 @@ class TestOrchestration:
         # No third orch entry for the compound-named return var
         assert "orch_args.tensor(2)" not in code
 
-        # Task params should use the inplace param, either directly or through
-        # a window view of that param after OptimizeOrchTensors.
-        assert "ext_output_tensor" in code
+        # Task params should use ext_output_tensor (the inplace param), not a separate buffer
+        assert "ext_output_tensor)" in code
         assert "ext_output_tensor_iter" not in code
 
     def test_tensor_assemble_uses_precomputed_view(self):
@@ -2775,598 +2774,6 @@ class TestTensorReadWriteOffsetCodegen:
             f"Consumer inputs should all be distinct tensors, got {t1_inputs}"
         )
 
-    def test_windowed_tuple_outputs_rebind_loop_carried_tensor_without_redeclaration(self):
-        """OutWindowExternalizer tuple outputs must rebind loop-carried tensors instead of redeclaring them."""
-
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class WindowedTupleLoopCarryProgram:
-            @pl.function(type=pl.FunctionType.InCore)
-            def kv_proj(
-                self,
-                k_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
-                v_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
-                ob_chunk: pl.Scalar[pl.INDEX],
-                normed_tile: pl.Tensor[[16, 512], pl.BF16],
-                wk: pl.Tensor[[512, 512], pl.BF16],
-                wv: pl.Tensor[[512, 512], pl.BF16],
-            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]]:
-                for ob, (k_proj_iter, v_proj_iter) in pl.range(
-                    ob_chunk, ob_chunk + 4, init_values=(k_proj, v_proj)
-                ):
-                    kv0: pl.Scalar[pl.INDEX] = ob * 64
-                    tile_a: pl.Tile[[16, 128], pl.BF16] = pl.tile.load(
-                        normed_tile, [0, 0], [16, 128], [16, 128]
-                    )
-                    tile_wk: pl.Tile[[128, 64], pl.BF16] = pl.tile.load(wk, [0, kv0], [128, 64], [128, 64])
-                    k_acc: pl.Tile[[16, 64], pl.FP32] = pl.tile.matmul(tile_a, tile_wk)
-                    k_proj_next: pl.Tensor[[16, 512], pl.FP32] = pl.tile.store(k_acc, [0, kv0], k_proj_iter)
-
-                    tile_wv: pl.Tile[[128, 64], pl.BF16] = pl.tile.load(wv, [0, kv0], [128, 64], [128, 64])
-                    v_acc: pl.Tile[[16, 64], pl.FP32] = pl.tile.matmul(tile_a, tile_wv)
-                    v_proj_next: pl.Tensor[[16, 512], pl.FP32] = pl.tile.store(v_acc, [0, kv0], v_proj_iter)
-                    k_proj_rv, v_proj_rv = pl.yield_(k_proj_next, v_proj_next)
-                return k_proj_rv, v_proj_rv
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                normed_tile: pl.Tensor[[16, 512], pl.BF16],
-                wk: pl.Tensor[[512, 512], pl.BF16],
-                wv: pl.Tensor[[512, 512], pl.BF16],
-                k_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
-                v_proj: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]]:
-                for ob_chunk, (k_proj_iter, v_proj_iter) in pl.range(0, 8, 4, init_values=(k_proj, v_proj)):
-                    result: tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]] = (
-                        self.kv_proj(k_proj_iter, v_proj_iter, ob_chunk, normed_tile, wk, wv)
-                    )
-                    k_proj_next: pl.Tensor[[16, 512], pl.FP32] = result[0]
-                    v_proj_next: pl.Tensor[[16, 512], pl.FP32] = result[1]
-                    k_proj_rv, v_proj_rv = pl.yield_(k_proj_next, v_proj_next)
-                return k_proj_rv, v_proj_rv
-
-        pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        transformed = pm.run_passes(WindowedTupleLoopCarryProgram)
-        code = _generate_orch_code(transformed)
-
-        assert "kv_proj__windowed" in code, code
-
-        declared_names = re.findall(
-            r"^\s*(?:const\s+Tensor&|Tensor|PTO2TaskId|auto)\s+([A-Za-z_]\w*)\s*=",
-            code,
-            flags=re.MULTILINE,
-        )
-        duplicate_declarations = {name for name in declared_names if declared_names.count(name) > 1}
-        assert not duplicate_declarations, (
-            f"generated C++ redeclared names {sorted(duplicate_declarations)}:\n{code}"
-        )
-
-        mutable_tensor_names = set(re.findall(r"^\s*Tensor\s+([A-Za-z_]\w*)\s*=", code, flags=re.MULTILINE))
-        const_alias_names = set(
-            re.findall(r"^\s*const\s+Tensor&\s+([A-Za-z_]\w*)\s*=", code, flags=re.MULTILINE)
-        )
-        assert not (mutable_tensor_names & const_alias_names), code
-
-        rv_carry_names = {
-            name for name in mutable_tensor_names if name.endswith("_rv") or re.search(r"__rv(?:_|$)", name)
-        }
-        assert rv_carry_names, code
-        assert any(
-            re.search(rf"^\s*{re.escape(name)}\s*=\s*[^;]+;", code, flags=re.MULTILINE)
-            for name in rv_carry_names
-        ), code
-
-    def test_windowed_writer_before_full_parent_reader_uses_runtime_overlap(self):
-        """Window writes followed by full-parent reads stay windowed.
-
-        The intended codegen shape is:
-            producer writes score_flat.view(...) with add_output/add_inout
-            later consumer reads score_flat with add_input
-
-        Runtime TensorMap overlap detection bridges the window writer to the
-        full-parent reader without rewriting the reader input.
-        """
-
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        N, M, W = 64, 2048, 8
-
-        @pl.program
-        class WindowedWriteFullParentReadProgram:
-            @pl.function(type=pl.FunctionType.InCore)
-            def produce(
-                self,
-                x: pl.Tensor[[N, M], pl.FP32],
-                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
-                col: pl.Scalar[pl.INDEX],
-            ) -> pl.Tensor[[N, M], pl.FP32]:
-                tile: pl.Tile[[N, W], pl.FP32] = pl.tile.load(x, [0, col], [N, W], [N, W])
-                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(tile, [0, col], score)
-                return ret
-
-            @pl.function(type=pl.FunctionType.InCore)
-            def consume(
-                self,
-                score: pl.Tensor[[N, M], pl.FP32],
-                probe: pl.Out[pl.Tensor[[N, M], pl.FP32]],
-                row: pl.Scalar[pl.INDEX],
-            ) -> pl.Tensor[[N, M], pl.FP32]:
-                tile: pl.Tile[[1, M], pl.FP32] = pl.tile.load(score, [row, 0], [1, M], [1, M])
-                ret: pl.Tensor[[N, M], pl.FP32] = pl.tile.store(tile, [row, 0], probe)
-                return ret
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                x: pl.Tensor[[N, M], pl.FP32],
-                score: pl.Out[pl.Tensor[[N, M], pl.FP32]],
-                probe: pl.Out[pl.Tensor[[N, M], pl.FP32]],
-            ) -> pl.Tensor[[N, M], pl.FP32]:
-                score_flat: pl.Tensor[[N, M], pl.FP32] = pl.reshape(score, [N, M])
-                for c0, (score_iter,) in pl.range(0, M, W, init_values=(score_flat,)):
-                    score_next: pl.Tensor[[N, M], pl.FP32] = self.produce(x, score_iter, c0)
-                    score_rv = pl.yield_(score_next)
-                for r, (probe_iter,) in pl.range(N, init_values=(probe,)):
-                    probe_next: pl.Tensor[[N, M], pl.FP32] = self.consume(score_rv, probe_iter, r)
-                    probe_rv = pl.yield_(probe_next)
-                return probe_rv
-
-        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
-            WindowedWriteFullParentReadProgram
-        )
-        code = _generate_orch_code(transformed)
-
-        assert "produce__windowed" in code, code
-        assert re.search(r"Tensor score_iter = score_flat\.view\(", code), code
-        assert re.search(r"params_t0\.add_(?:output|inout)\(score_iter\)", code), code
-        assert "params_t1.add_input(score_flat)" in code, code
-
-    def test_group_submit_uses_both_aiv_slots_for_split_vector_kernel(self):
-        """Cross-core split inferred from pipe ops should reuse one AIV kernel across both slots."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class SplitGroupProgram:
-            @pl.function(type=pl.FunctionType.AIV)
-            def vector_producer(
-                self,
-                a: pl.Tensor[[16, 16], pl.FP16],
-                out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
-            ):
-                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="cube_consumer")
-                pl.aiv_initialize_pipe(dir_mask=2, slot_size=512, v2c_consumer_buf=v2c_peer)
-                tile_a: pl.Tile[[16, 16], pl.FP16] = pl.load(a, [0, 0], [16, 16])
-                pl.tpush_to_aic(tile_a, split=1)
-
-            @pl.function(type=pl.FunctionType.AIC)
-            def cube_consumer(
-                self,
-                a: pl.Tensor[[16, 16], pl.FP16],
-                out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
-            ) -> pl.Tensor[[16, 16], pl.FP16]:
-                pipe_buf = pl.reserve_buffer(name="v2c_slot_buffer", size=4096, base=0x1000)
-                pl.aic_initialize_pipe(dir_mask=2, slot_size=512, v2c_consumer_buf=pipe_buf)
-                received: pl.Tile[[16, 16], pl.FP16, pl.MemorySpace.Mat] = pl.tpop_from_aiv(split=1)
-                pl.tfree_to_aiv(received)
-                updated: pl.Tensor[[16, 16], pl.FP16] = pl.store(received, [0, 0], out)
-                return updated
-
-            @pl.function(type=pl.FunctionType.Group)
-            def group_func(
-                self,
-                a: pl.Tensor[[16, 16], pl.FP16],
-                out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
-            ) -> pl.Tensor[[16, 16], pl.FP16]:
-                updated = self.cube_consumer(a, out)
-                self.vector_producer(a, out)
-                return updated
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                a: pl.Tensor[[16, 16], pl.FP16],
-                out: pl.Out[pl.Tensor[[16, 16], pl.FP16]],
-            ) -> pl.Tensor[[16, 16], pl.FP16]:
-                updated = self.group_func(a, out)
-                return updated
-
-        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SplitGroupProgram)
-        vector_producer = transformed.get_function("vector_producer")
-        cube_consumer = transformed.get_function("cube_consumer")
-        assert vector_producer is not None
-        assert transformed.get_function("vector_producer__aiv1") is None
-        assert cube_consumer is not None
-        assert vector_producer.split == ir.SplitMode.UP_DOWN
-        assert cube_consumer.split == ir.SplitMode.UP_DOWN
-
-        orch_result = _generate_orch_result(transformed)
-        code = orch_result.code
-        expected_ids = (
-            orch_result.func_name_to_id["cube_consumer"],
-            orch_result.func_name_to_id["vector_producer"],
-            orch_result.func_name_to_id["vector_producer"],
-        )
-
-        assert f"MixedKernels mixed_0 = {{{expected_ids[0]}, {expected_ids[1]}, {expected_ids[2]}}};" in code
-        assert "rt_submit_task(mixed_0, params_t0);" in code
-
-    def test_no_split_mixed_group_dispatches_same_aiv_on_both_lanes(self):
-        """Ascend910B no-split mixed kernels should still launch both AIV lanes."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class NoSplitGroupProgram:
-            @pl.function(type=pl.FunctionType.Opaque)
-            def main(
-                self,
-                a: pl.Tensor[[32, 32], pl.FP32],
-                b: pl.Tensor[[32, 32], pl.FP32],
-                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
-            ) -> pl.Tensor[[32, 32], pl.FP32]:
-                with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-                    a_plus_b = pl.add(a, b)
-                    sub = pl.sub(a, b)
-                    result = pl.matmul(a_plus_b, sub)
-                    out = pl.assemble(out, result, [0, 0])
-                return out
-
-        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(NoSplitGroupProgram)
-
-        aic_funcs = [func for func in transformed.functions.values() if func.func_type == pl.FunctionType.AIC]
-        aiv_funcs = [func for func in transformed.functions.values() if func.func_type == pl.FunctionType.AIV]
-        assert len(aic_funcs) == 1
-        assert len(aiv_funcs) == 1
-        assert aiv_funcs[0].attrs.get("dual_aiv_dispatch") is True
-
-        orch_result = _generate_orch_result(transformed)
-        code = orch_result.code
-        expected_ids = (
-            orch_result.func_name_to_id[aic_funcs[0].name],
-            orch_result.func_name_to_id[aiv_funcs[0].name],
-            orch_result.func_name_to_id[aiv_funcs[0].name],
-        )
-
-        assert f"MixedKernels mixed_0 = {{{expected_ids[0]}, {expected_ids[1]}, {expected_ids[2]}}};" in code
-        assert "rt_submit_task(mixed_0, params_t0);" in code
-
-    def test_standalone_spmd_dispatches_group_with_spmd_launch_spec(self):
-        """Standalone Spmd should remain a wrapper and carry launch spec into Group dispatch."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class SpmdMixedProgram:
-            @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
-            def kernel(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                b: pl.Tensor[[64, 64], pl.FP32],
-                bias: pl.Tensor[[64, 64], pl.FP32],
-                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                tile_a_l1 = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
-                tile_b_l1 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
-                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
-                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
-                tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
-                tile_bias = pl.load(bias, [0, 0], [64, 64])
-                tile_out = pl.add(tile_mm, tile_bias)
-                out = pl.store(tile_out, [0, 0], out)
-                return out
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                b: pl.Tensor[[64, 64], pl.FP32],
-                bias: pl.Tensor[[64, 64], pl.FP32],
-                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                with pl.spmd(4, sync_start=True):
-                    out = self.kernel(a, b, bias, out)
-                return out
-
-        transformed = passes.expand_mixed_kernel()(
-            passes.infer_tile_memory_space()(
-                passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMixedProgram))
-            )
-        )
-        spmd_func = transformed.get_function("main_spmd_0")
-        group_func = transformed.get_function("kernel")
-        assert spmd_func is not None
-        assert group_func is not None
-        assert spmd_func.func_type == pl.FunctionType.Spmd
-        assert group_func.func_type == pl.FunctionType.Group
-
-        code = _generate_orch_code(transformed)
-
-        assert "MixedKernels mixed_0" in code
-        assert "rt_submit_task(mixed_0, params_t0);" in code
-        assert "params_t0.launch_spec.set_block_num(4);" in code
-        assert "params_t0.launch_spec.set_require_sync_start(true);" in code
-
-    def test_spmd_mixed_multi_out_single_return_alias_targets_actual_return(self):
-        """SPMD mixed kernel with multiple Out params + single return must alias the
-        call-site result SSA to the Out parameter that the kernel actually returns,
-        not the first Out (which would route downstream consumers into a scratch
-        buffer).
-
-        Regression for the multi-Out SPMD mixed-kernel orchestration codegen bug
-        where ``GenerateSingleReturnAlias`` always picked ``out_indices[0]``: a
-        downstream kernel reading the SPMD result would silently see the first
-        Out's storage (e.g. a per-block scratch tensor) instead of the actual
-        accumulator. The fix tracks ``ReturnStmt`` value lineage back through
-        the callee body to the source Param and uses that index for the alias.
-        """
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class SpmdMultiOutSingleReturnProgram:
-            # Mixed kernel with multiple Out params: a scratch buffer (1st Out)
-            # and the real result (2nd Out, the one that the kernel returns).
-            @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
-            def kernel(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                bias: pl.Tensor[[64, 64], pl.FP32],
-                scratch: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                tile_a_l1 = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
-                tile_b_l1 = pl.load(bias, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
-                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
-                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
-                tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
-                tile_bias = pl.load(bias, [0, 0], [64, 64])
-                tile_out = pl.add(tile_mm, tile_bias)
-                scratch = pl.store(tile_mm, [0, 0], scratch)
-                out = pl.store(tile_out, [0, 0], out)
-                return out
-
-            # Downstream kernel consumes the SPMD result so the SSA alias is
-            # forced into existence; if the bug regresses, this consumer reads
-            # the scratch buffer instead of `out`.
-            @pl.function(type=pl.FunctionType.InCore)
-            def consumer(
-                self,
-                in_buf: pl.Tensor[[64, 64], pl.FP32],
-                final: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                tile = pl.load(in_buf, [0, 0], [64, 64])
-                final = pl.store(tile, [0, 0], final)
-                return final
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                bias: pl.Tensor[[64, 64], pl.FP32],
-                scratch: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-                final: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                with pl.spmd(4):
-                    out = self.kernel(a, bias, scratch, out)
-                final = self.consumer(out, final)
-                return final
-
-        transformed = passes.expand_mixed_kernel()(
-            passes.infer_tile_memory_space()(
-                passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiOutSingleReturnProgram))
-            )
-        )
-
-        code = _generate_orch_code(transformed)
-
-        # The mixed SPMD dispatch and the downstream consumer must be present.
-        assert "MixedKernels mixed_0" in code, f"Expected mixed-kernel dispatch:\n{code}"
-        assert "params_t0.launch_spec.set_block_num(4);" in code
-
-        # The downstream consumer must read from the kernel's actual return
-        # value (``ext_out``), not from the scratch buffer (``ext_scratch``).
-        # Pre-fix, the multi-Out aliasing bug made the SPMD result SSA point
-        # at ``ext_scratch`` (the first Out), and the consumer's first input
-        # was rewritten to read from scratch.
-        consumer_input_lines = [line for line in code.splitlines() if "params_t1.add_input" in line]
-        assert consumer_input_lines, f"Expected a consumer task reading the SPMD result, got:\n{code}"
-        first_consumer_input = consumer_input_lines[0]
-        assert "ext_out" in first_consumer_input, (
-            "Downstream consumer of a multi-Out SPMD mixed kernel should read the "
-            "returned Out param (ext_out). "
-            f"Got: {first_consumer_input}\n\nFull code:\n{code}"
-        )
-        assert "ext_scratch" not in first_consumer_input, (
-            "Downstream consumer is reading from the scratch buffer (multi-Out "
-            f"aliasing bug):\n{first_consumer_input}\n\nFull code:\n{code}"
-        )
-
-        # If the codegen emits an explicit SSA alias for the SPMD result,
-        # it must bind to ext_out and never to ext_scratch.
-        out_alias_lines = [
-            line for line in code.splitlines() if line.lstrip().startswith("const Tensor& out__")
-        ]
-        for line in out_alias_lines:
-            assert "ext_out" in line and "ext_scratch" not in line, (
-                f"SSA alias for the multi-Out SPMD result must bind to ext_out:\n{line}\n\nFull code:\n{code}"
-            )
-
-    def test_spmd_multi_assemble(self):
-        """SPMD multi-output call with assemble should preserve both OutputExisting tuple aliases."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class SpmdMultiAssembleProgram:
-            @pl.function(type=pl.FunctionType.InCore)
-            def kernel(
-                self,
-                a: pl.Tensor[[16, 16], pl.FP32],
-                b0: pl.Tensor[[16, 16], pl.FP32],
-                b1: pl.Tensor[[16, 16], pl.FP32],
-                out0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
-                out1: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
-                tile_a: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
-                tile_b0: pl.Tile[[16, 16], pl.FP32] = pl.load(b0, [0, 0], [16, 16])
-                tile_b1: pl.Tile[[16, 16], pl.FP32] = pl.load(b1, [0, 0], [16, 16])
-                acc0: pl.Tile[[16, 16], pl.FP32] = pl.matmul(tile_a, tile_b0)
-                res0: pl.Tensor[[16, 16], pl.FP32] = pl.store(acc0, [0, 0], out0)
-                acc1: pl.Tile[[16, 16], pl.FP32] = pl.matmul(tile_a, tile_b1)
-                res1: pl.Tensor[[16, 16], pl.FP32] = pl.store(acc1, [0, 0], out1)
-                return res0, res1
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                a: pl.Tensor[[16, 16], pl.FP32],
-                b0: pl.Tensor[[16, 16], pl.FP32],
-                b1: pl.Tensor[[16, 16], pl.FP32],
-                out0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
-                out1: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
-                with pl.spmd(4):
-                    out0, out1 = self.kernel(a, b0, b1, out0, out1)
-                return out0, out1
-
-        # NOTE: bypass tracks a known print->parse round-trip limitation — a
-        # multi-output `out0, out1 = self.kernel(...)` inside `with pl.spmd(N):`
-        # desugars to a 3-statement body the printer emits verbatim, which the
-        # parser then rejects (spmd body must be a single statement). The IR is
-        # valid (passes BEFORE_AND_AFTER property verification); only roundtrip
-        # fails. Remove NONE once the printer/parser round-trips this shape.
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = passes.expand_mixed_kernel()(
-                passes.infer_tile_memory_space()(
-                    passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiAssembleProgram))
-                )
-            )
-        code = _generate_orch_code(transformed)
-
-        assert "add_output(ext_out0)" in code and "add_output(ext_out1)" in code, (
-            f"SPMD tuple outputs must remain OutputExisting at call site. Generated code:\n{code}"
-        )
-
-    def test_spmd_gm_pipe_buffer_tensor_create_scales_with_core_num(self):
-        """SPMD gm_pipe_buffer allocation should scale by launch core_num in orchestration codegen."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class SpmdGMPipeProgram:
-            @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
-            def kernel(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                b: pl.Tensor[[64, 64], pl.FP32],
-                bias: pl.Tensor[[64, 64], pl.FP32],
-                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                tile_a_l1 = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
-                tile_b_l1 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
-                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
-                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
-                tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
-                tile_bias = pl.load(bias, [0, 0], [64, 64])
-                tile_out = pl.add(tile_mm, tile_bias)
-                out = pl.store(tile_out, [0, 0], out)
-                return out
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(
-                self,
-                a: pl.Tensor[[64, 64], pl.FP32],
-                b: pl.Tensor[[64, 64], pl.FP32],
-                bias: pl.Tensor[[64, 64], pl.FP32],
-                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
-            ) -> pl.Tensor[[64, 64], pl.FP32]:
-                with pl.spmd(4):
-                    out = self.kernel(a, b, bias, out)
-                return out
-
-        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SpmdGMPipeProgram)
-
-        code = _generate_orch_code(transformed)
-        assert "params_t0.launch_spec.set_block_num(4);" in code
-        assert re.search(
-            r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{static_cast<uint32_t>\(\(\d+\) \* \(4\)\)\};",
-            code,
-        ), f"Expected gm_pipe_buffer tensor.create shape to scale by core_num. Generated code:\n{code}"
-
-    def test_gm_pipe_buffer_tensor_create_uses_callee_workspace(self):
-        """Each injected gm_pipe_buffer tensor.create is sized from its callee pipe layout."""
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-
-        @pl.program
-        class PerCalleeGMPipeProgram:
-            @pl.function(type=pl.FunctionType.AIC)
-            def small_cube(self):
-                buf = pl.reserve_buffer(name="small_v2c_slot_buffer", size=4096, base=pl.AUTO)
-                pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512)
-
-            @pl.function(type=pl.FunctionType.AIV)
-            def small_vector(self):
-                peer = pl.import_peer_buffer(name="small_v2c_slot_buffer", peer_func="small_cube")
-                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=512)
-
-            @pl.function(type=pl.FunctionType.Group)
-            def small_group(self):
-                self.small_cube()
-                self.small_vector()
-
-            @pl.function(type=pl.FunctionType.AIC)
-            def large_cube(self):
-                buf0 = pl.reserve_buffer(name="large_v2c_slot_buffer_0", size=8192, base=pl.AUTO)
-                buf1 = pl.reserve_buffer(name="large_v2c_slot_buffer_1", size=16384, base=pl.AUTO)
-                pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf0, dir_mask=2, slot_size=1024, id=0)
-                pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf1, dir_mask=2, slot_size=2048, id=1)
-
-            @pl.function(type=pl.FunctionType.AIV)
-            def large_vector(self):
-                peer0 = pl.import_peer_buffer(name="large_v2c_slot_buffer_0", peer_func="large_cube")
-                peer1 = pl.import_peer_buffer(name="large_v2c_slot_buffer_1", peer_func="large_cube")
-                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer0, dir_mask=2, slot_size=1024, id=0)
-                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer1, dir_mask=2, slot_size=2048, id=1)
-
-            @pl.function(type=pl.FunctionType.Group)
-            def large_group(self):
-                self.large_cube()
-                self.large_vector()
-
-            @pl.function(type=pl.FunctionType.Orchestration)
-            def main(self):
-                self.small_group()
-                self.large_group()
-
-        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
-            PerCalleeGMPipeProgram
-        )
-
-        code = _generate_orch_code(transformed)
-        shape_values = re.findall(r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{(\d+)\};", code)
-        assert shape_values == ["1024", "6144"], (
-            "Expected per-callee GM workspace shapes (small=512*8*1 side / f32, "
-            f"large=(1024*8+2048*8) / f32), got {shape_values}. Generated code:\n{code}"
-        )
-
-
-class TestTaskIsValidCodegen:
-    """``system.task_is_valid`` lowers to ``<expr>.is_valid()`` in C++.
-
-    The op guards each per-slot fill of a manual_scope array-carry TaskId
-    into the ``set_dependencies`` stack array.
-    Codegen is hand-tested here on minimal IR rather than waiting for the
-    end-to-end pass, so the emitter contract is pinned independently of the
-    pass implementation.
-    """
-
     def test_task_is_valid_emits_dot_is_valid(self):
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -3389,15 +2796,14 @@ class TestTaskIsValidCodegen:
 class TestTupleLineagePointerKeying:
     """Tuple return-alias lineage must be keyed by Var identity, not name_hint.
 
-    Regression for issue #1463: after inlining + OutWindowExternalizer, two
+    Regression for issue #1463: after inlining/rebuild transforms, two
     distinct tuple-producing assignments can share a ``name_hint`` (e.g. several
     rebuilt ``ret__tmp_v0`` MakeTuples). When the orchestration codegen keyed its
     tuple lineage maps by ``name_hint``, the colliding tuples' TupleGetItem
     consumers were cross-wired: the emit names of one tuple's elements were
     propagated onto the other tuple's consumers. In the DeepSeek-V4 KV compressor
-    this made the ``kv_state`` / ``score_state`` return aliases reuse the
-    externalized ``kv_cache`` / ``kv`` window reshape names, so the generated
-    orchestration C++ declared those names twice (``Tensor X = ...`` then
+    this made the ``kv_state`` / ``score_state`` return aliases reuse unrelated
+    reshape names, so the generated orchestration C++ declared names twice (``Tensor X = ...`` then
     ``const Tensor& X = ...``) and failed to compile with ``conflicting
     declaration``.
     """
@@ -3417,8 +2823,7 @@ class TestTupleLineagePointerKeying:
             orch_f.return_type(ir.TupleType([t2d, t2d]))
 
             # Two tuple-producing MakeTuple assignments that deliberately share
-            # the SAME name_hint "ret" (distinct Var objects) — exactly what the
-            # OutWindowExternalizer rebuild produces after inlining. Each tuple
+            # the SAME name_hint "ret" (distinct Var objects). Each tuple
             # wraps a distinct reshape local (rsh0 / rsh1); its TupleGetItem
             # consumer is then reshaped again, so the consumer's lineage must
             # resolve to its OWN tuple's element. Old name_hint keying collapsed
@@ -4449,17 +3854,16 @@ class TestManualScopeCodegen:
         assert code.count("PTO2_SCOPE() {") == 1, code
         assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
-        # The producer TaskId is preserved through windowed rewriting and is
-        # threaded into the consumer dependency edge.
+        # The ``pl.submit`` producer TaskId binds to
+        # ``PTO2TaskId stage1_tid = task_0_outs.task_id();``.
         assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
-        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
-        assert producer_tid, code
+        assert "PTO2TaskId stage1_tid = task_0_outs.task_id();" in code, code
         assert "TaskOutputTensors task_1_outs = rt_submit_aiv_task(" in code, code
 
         # *** Manual dep correctly established WITHIN each iteration ***
         # stage2 reads what stage1 just wrote to ``scratch``: this dep is
         # required for correctness.
-        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1_deps[params_t1_deps_count++] = stage1_tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
         # *** Correct parallelism ACROSS iterations ***
@@ -4538,15 +3942,13 @@ class TestManualScopeCodegen:
         assert code.count("PTO2_SCOPE() {") == 1, code
         assert code.count("PTO2_SCOPE(PTO2ScopeMode::MANUAL)") == 1, code
 
-        # The producer TaskId is preserved through windowed rewriting and is
-        # threaded into the consumer dependency edge.
+        # The ``pl.submit`` producer TaskId binds to the user-named variable.
         assert "TaskOutputTensors task_0_outs = rt_submit_aiv_task(" in code, code
-        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
-        assert producer_tid, code
+        assert "PTO2TaskId stage1_tid = task_0_outs.task_id();" in code, code
         assert "TaskOutputTensors task_1_outs = rt_submit_aiv_task(" in code, code
 
         # Manual dep WITHIN each iteration: stage2 follows stage1.
-        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1_deps[params_t1_deps_count++] = stage1_tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
         # Cross-iteration parallel: the ONLY set_dependencies is the
@@ -4800,17 +4202,19 @@ class TestManualScopeCodegen:
 
     def test_manual_scope_submit_task_id_dep(self):
         """The producer TaskId of a ``pl.submit(...)`` threaded into a later
-        submit's ``deps=[...]`` reaches the dependency edge.
+        submit's ``deps=[...]`` emits the user-named TaskId variable directly.
 
         Pattern:
             scratch, tid = pl.submit(self.stage1, x, scratch, row, col)
             out, _       = pl.submit(self.stage2, scratch, out, row, col, deps=[tid])
 
         Expected codegen for the dep chain:
+            PTO2TaskId tid = task_0_outs.task_id();   // submit producer TaskId
+            ...
             Arg params_t1;
             PTO2TaskId params_t1_deps[1];
             uint32_t params_t1_deps_count = 0;
-            params_t1_deps[params_t1_deps_count++] = <producer TaskId>;
+            params_t1_deps[params_t1_deps_count++] = tid;
             params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);
         """
         backend.reset_for_testing()
@@ -4868,12 +4272,12 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        # The producer TaskId is attached to the consumer dependency edge.
-        producer_tid = re.search(r"PTO2TaskId (\w+) = task_0_outs\.task_id\(\);", code)
-        assert producer_tid, code
+        # The user-named ``tid`` becomes the C++ identifier directly, bound to
+        # the submit's producer TaskId.
+        assert "PTO2TaskId tid = task_0_outs.task_id();" in code, code
         # The dep edge is filled into the consumer's stack deps array and
         # attached with a single ``set_dependencies`` call.
-        assert f"params_t1_deps[params_t1_deps_count++] = {producer_tid.group(1)};" in code, code
+        assert "params_t1_deps[params_t1_deps_count++] = tid;" in code, code
         assert "params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);" in code, code
 
     def test_manual_scope_submit_iter_arg_taskid_carry(self):

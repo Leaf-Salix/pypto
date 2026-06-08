@@ -1024,8 +1024,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
     } else if (As<TupleGetItemExpr>(assign->value_)) {
       // No-op: tuple elements handled via tuple_var_to_elements_
-    } else if (auto make_tuple = As<MakeTuple>(assign->value_)) {
-      PropagateMakeTupleAssign(assign, make_tuple);
     } else {
       std::string value_expr = GenerateExprString(assign->value_);
       // Drop a no-op `X = X;` that arises when VarLineageCollector has
@@ -1040,14 +1038,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // about no-op aliases at all (today's Simplify only does scalar
       // constant propagation, not tensor-Var copy prop). Once such a pass
       // exists, this guard can go.
-      if (auto input_var = AsVarLike(assign->value_)) {
-        auto tid_it = manual_task_id_map_.find(input_var.get());
-        if (tid_it != manual_task_id_map_.end()) {
-          manual_task_id_map_[assign->var_.get()] = tid_it->second;
-        }
-        if (value_expr == var_name) {
-          return;
-        }
+      if (AsVarLike(assign->value_) && value_expr == var_name) {
+        return;
       }
       const std::string cpp_type = GetCppType(assign->var_->GetType());
       code_ << Indent() << cpp_type << " " << var_name << " = " << value_expr << ";\n";
