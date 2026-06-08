@@ -1278,7 +1278,7 @@ class TestOutWindowExternalizer:
         After = _run_to_optimize_orch_tensors(Before)
         ir.assert_structural_equal(After, Expected)
 
-    def test_return_reordered_multi_out_later_parent_read_stays_baseline(self):
+    def test_return_reordered_multi_out_later_parent_read_stays_windowed(self):
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
@@ -1317,12 +1317,12 @@ class TestOutWindowExternalizer:
 
         After = _run_to_optimize_orch_tensors(Before)
 
-        assert After.get_function("kv_stripe__windowed") is None
+        assert After.get_function("kv_stripe__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
-        assert "pl.tensor.slice(k_out" not in printed_main
-        assert "pl.tensor.slice(v_out" not in printed_main
+        assert "pl.tensor.slice(k_out" in printed_main
+        assert "pl.tensor.slice(v_out" in printed_main
 
-    def test_tensor_full_root_later_parent_read_stays_baseline(self):
+    def test_tensor_full_root_later_parent_read_stays_windowed(self):
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
@@ -1355,11 +1355,11 @@ class TestOutWindowExternalizer:
 
         After = _run_to_optimize_orch_tensors(Before)
 
-        assert After.get_function("kernel_stripe__windowed") is None
+        assert After.get_function("kernel_stripe__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
-        assert "pl.tensor.slice(out" not in printed_main
+        assert "pl.tensor.slice(out" in printed_main
 
-    def test_loop_returned_output_later_parent_read_stays_baseline(self):
+    def test_loop_returned_output_later_parent_read_stays_windowed(self):
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
@@ -1395,9 +1395,9 @@ class TestOutWindowExternalizer:
 
         After = _run_to_optimize_orch_tensors(Before)
 
-        assert After.get_function("kernel_rows__windowed") is None
+        assert After.get_function("kernel_rows__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
-        assert "pl.tensor.slice(out" not in printed_main
+        assert "pl.tensor.slice(out" in printed_main
 
     def test_multi_out_final_store_all_or_nothing_stays_baseline(self):
         @pl.program
@@ -2475,16 +2475,13 @@ class TestOutWindowSubmitCall:
         assert "pl.tensor.slice(out" in printed_main
         assert "kernel_stripe__windowed" in printed_main
 
-    def test_submit_windowable_suppressed_by_later_full_submit_read(self):
-        """The later-full-parent-read safety guard must see Submit readers.
+    def test_submit_windowable_kept_with_later_full_submit_read(self):
+        """A windowable Submit writer stays windowed even when a later Submit reads the full parent.
 
         A windowed submit writes a 64x64 window of ``out``; a *later* submit
-        reads the full ``out``. ``HasLaterFullParentReadOfRewrittenOutput`` is
-        fed by ``AddFullRootReadsFromStmt``, whose reverse scan must treat the
-        later Submit reader like a Call (via ``SubmitToCallView``) — otherwise
-        the first submit gets externalized even though the equivalent plain-call
-        safety check would keep it baseline (regression for the Submit-blind
-        reverse scan, #1616 review)."""
+        reads the full ``out``. The producer is still externalized; the runtime
+        TensorMap overlap path is responsible for connecting the window writer
+        to the full-parent reader."""
 
         @pl.program
         class Before:
@@ -2525,11 +2522,8 @@ class TestOutWindowSubmitCall:
 
         After = passes.optimize_orch_tensors()(Before)
         printed_main = ir.python_print(_get_function(After, "main"))
-        # Externalizing the windowed first submit would be unsafe — the guard
-        # keeps it baseline: no windowed-clone call and no Out-param slice at the
-        # call site.
-        assert "kernel_stripe__windowed" not in printed_main
-        assert "pl.tensor.slice(out" not in printed_main
+        assert "kernel_stripe__windowed" in printed_main
+        assert "pl.tensor.slice(out" in printed_main
 
 
 if __name__ == "__main__":

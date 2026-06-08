@@ -2023,8 +2023,6 @@ class OutWindowExternalizer {
 
   class OrchRewriter : public IRMutator {
    public:
-    using RootSet = std::unordered_set<const Var*>;
-
     OrchRewriter(ProgramPtr program, const AnalysisMap& analyses,
                  const std::unordered_map<std::string, FunctionPtr>& cloned_funcs,
                  const FunctionPtr& current_func)
@@ -2093,20 +2091,7 @@ class OutWindowExternalizer {
       auto saved_scalar_defs = scalar_defs_;
       auto saved_tuple_result_subst = tuple_result_subst_;
 
-      RootSet later_reads = enclosing_later_full_parent_reads_;
-      std::unordered_map<const Stmt*, RootSet> later_reads_by_stmt;
-      later_reads_by_stmt.reserve(op->stmts_.size());
-      for (auto stmt_it = op->stmts_.rbegin(); stmt_it != op->stmts_.rend(); ++stmt_it) {
-        later_reads_by_stmt.emplace(stmt_it->get(), later_reads);
-        AddFullRootReadsFromStmt(*stmt_it, later_reads);
-      }
-
       for (const auto& stmt : op->stmts_) {
-        auto saved_enclosing_reads = enclosing_later_full_parent_reads_;
-        auto later_it = later_reads_by_stmt.find(stmt.get());
-        enclosing_later_full_parent_reads_ =
-            later_it != later_reads_by_stmt.end() ? later_it->second : saved_enclosing_reads;
-
         auto call_assign = As<AssignStmt>(stmt);
         auto bundle = call_assign ? TryRewriteCall(call_assign) : std::nullopt;
         if (bundle.has_value()) {
@@ -2121,7 +2106,6 @@ class OutWindowExternalizer {
             }
             new_stmts.push_back(visited);
           }
-          enclosing_later_full_parent_reads_ = std::move(saved_enclosing_reads);
           continue;
         }
 
@@ -2134,7 +2118,6 @@ class OutWindowExternalizer {
         if (visited_assign && As<ScalarType>(visited_assign->var_->GetType())) {
           scalar_defs_[visited_assign->var_.get()] = visited_assign->value_;
         }
-        enclosing_later_full_parent_reads_ = std::move(saved_enclosing_reads);
       }
 
       scalar_defs_ = std::move(saved_scalar_defs);
@@ -2180,16 +2163,6 @@ class OutWindowExternalizer {
         current = it->second;
       }
       return current;
-    }
-
-    bool IsFullRootExpr(const ExprPtr& expr) const {
-      auto current = ResolveLoopInitExpr(expr);
-      auto var = AsVarLike(current);
-      return var && full_buffer_roots_.count(var.get()) > 0 && ResolveBufferRoot(var.get()) != nullptr;
-    }
-
-    static bool IsReadDirection(ParamDirection direction) {
-      return direction == ParamDirection::In || direction == ParamDirection::InOut;
     }
 
     void AddFullBufferRootForAssign(const AssignStmtPtr& assign) {
@@ -2344,70 +2317,6 @@ class OutWindowExternalizer {
       }
     }
 
-    void AddFullRootReadsFromCall(const CallPtr& call, RootSet& reads) const {
-      if (!call || !program_ || codegen::IsBuiltinOp(call->op_->name_)) return;
-      auto callee = program_->GetFunction(call->op_->name_);
-      if (!callee) return;
-      for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
-        if (!IsReadDirection(callee->param_directions_[i])) continue;
-        if (!IsFullRootExpr(call->args_[i])) continue;
-        if (const Var* root = ResolveBufferRoot(call->args_[i])) {
-          reads.insert(root);
-        }
-      }
-    }
-
-    // A later reader can be a Call OR a Submit (pl.submit in a manual_scope).
-    // Route the Submit through its augmented-Call view so its In/InOut full-root
-    // reads are counted by the later-read safety guard — otherwise a windowed
-    // submit could be externalized even though a subsequent submit reads the
-    // full output (.claude/rules/pass-submit-awareness.md).
-    void AddFullRootReadsFromCallLike(const ExprPtr& value, RootSet& reads) const {
-      if (auto call = As<Call>(value)) {
-        AddFullRootReadsFromCall(call, reads);
-      } else if (auto submit = As<Submit>(value)) {
-        AddFullRootReadsFromCall(SubmitToCallView(submit), reads);
-      }
-    }
-
-    void AddFullRootReadsFromStmt(const StmtPtr& stmt, RootSet& reads) const {
-      if (!stmt) return;
-      if (auto assign = As<AssignStmt>(stmt)) {
-        AddFullRootReadsFromCallLike(assign->value_, reads);
-      } else if (auto eval = As<EvalStmt>(stmt)) {
-        AddFullRootReadsFromCallLike(eval->expr_, reads);
-      } else if (auto seq = As<SeqStmts>(stmt)) {
-        for (auto it = seq->stmts_.rbegin(); it != seq->stmts_.rend(); ++it) {
-          AddFullRootReadsFromStmt(*it, reads);
-        }
-      } else if (auto for_stmt = As<ForStmt>(stmt)) {
-        AddFullRootReadsFromStmt(for_stmt->body_, reads);
-      } else if (auto while_stmt = As<WhileStmt>(stmt)) {
-        AddFullRootReadsFromStmt(while_stmt->body_, reads);
-      } else if (auto if_stmt = As<IfStmt>(stmt)) {
-        AddFullRootReadsFromStmt(if_stmt->then_body_, reads);
-        if (if_stmt->else_body_.has_value()) {
-          AddFullRootReadsFromStmt(if_stmt->else_body_.value(), reads);
-        }
-      } else if (auto scope = As<ScopeStmt>(stmt)) {
-        AddFullRootReadsFromStmt(scope->body_, reads);
-      } else if (auto rscope = As<RuntimeScopeStmt>(stmt)) {
-        AddFullRootReadsFromStmt(rscope->body_, reads);
-      }
-    }
-
-    bool HasLaterFullParentReadOfRewrittenOutput(const CallPtr& call,
-                                                 const CalleeRewriteAnalysis& analysis) const {
-      for (const auto& output : analysis.outputs) {
-        if (output.out_param_index >= call->args_.size()) return true;
-        const Var* root = ResolveBufferRoot(call->args_[output.out_param_index]);
-        if (root && enclosing_later_full_parent_reads_.count(root) > 0) {
-          return true;
-        }
-      }
-      return false;
-    }
-
     std::optional<RewriteBundle> TryRewriteCall(const AssignStmtPtr& call_assign) {
       // Submit (pl.submit inside pl.manual_scope) is a sibling call-like kind;
       // run the windowing analysis/rewrite on its augmented-Call view, then
@@ -2432,7 +2341,6 @@ class OutWindowExternalizer {
 
       if (analysis.outputs.empty()) return std::nullopt;
       if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
-      if (HasLaterFullParentReadOfRewrittenOutput(call, analysis)) return std::nullopt;
 
       std::unordered_map<const Var*, ExprPtr> callsite_subst;
       for (size_t i = 0; i < original_func->params_.size() && i < call->args_.size(); ++i) {
@@ -2735,7 +2643,6 @@ class OutWindowExternalizer {
     std::unordered_map<const Var*, const Var*> full_buffer_roots_;
     std::unordered_map<const Var*, std::vector<const Var*>> tuple_output_roots_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
-    RootSet enclosing_later_full_parent_reads_;
     int while_depth_ = 0;
   };
 
