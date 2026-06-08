@@ -71,9 +71,10 @@ repos:
         - id: ruff-check
           types_or: [python, pyi]
           args: [--fix]
-          exclude: ^tests/ut/codegen/test_orchestration_codegen\.py$
+          exclude: ^(tests/ut/codegen/test_orchestration_codegen\.py|tests/st/runtime/framework_and_models/deepseek_v4_indexer_guard_repro/(golden|models)/.*\.py)$
         - id: ruff-format
           types_or: [python, pyi]
+          exclude: ^tests/st/runtime/framework_and_models/deepseek_v4_indexer_guard_repro/(golden|models)/.*\.py$
 
     - repo: https://github.com/RobertCraigie/pyright-python
       rev: v1.1.407
