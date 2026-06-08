@@ -39,8 +39,8 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
-#include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -61,9 +61,10 @@ constexpr const char* kStaticWindowLoopStartsAttr = "static_window_loop_starts";
 constexpr const char* kStaticWindowLoopStepsAttr = "static_window_loop_steps";
 constexpr const char* kStaticWindowLoopTripsAttr = "static_window_loop_trips";
 
-ExprPtr SubstituteStaticWindowLoopValues(
-    const ExprPtr& expr, const std::vector<VarPtr>& loop_vars, const std::vector<ExprPtr>& loop_starts,
-    const std::vector<ExprPtr>& loop_steps, const std::vector<int64_t>& loop_trips, int64_t linear_index) {
+ExprPtr SubstituteStaticWindowLoopValues(const ExprPtr& expr, const std::vector<VarPtr>& loop_vars,
+                                         const std::vector<ExprPtr>& loop_starts,
+                                         const std::vector<ExprPtr>& loop_steps,
+                                         const std::vector<int64_t>& loop_trips, int64_t linear_index) {
   std::unordered_map<const Var*, ExprPtr> subst;
   int64_t remainder = linear_index;
   for (auto i = static_cast<int64_t>(loop_vars.size()) - 1; i >= 0; --i) {
@@ -83,6 +84,18 @@ ExprPtr SubstituteStaticWindowLoopValues(
 
 std::string EmitStaticWindowAsUint32(const ExprPtr& expr, codegen::CodegenBase& codegen) {
   return "static_cast<uint32_t>(" + codegen.GenerateExprString(expr) + ")";
+}
+
+bool ExprUsesAnyVar(const ExprPtr& expr, const std::vector<VarPtr>& vars) {
+  if (!expr || vars.empty()) return false;
+  var_collectors::VarDefUseCollector collector;
+  collector.VisitExpr(expr);
+  for (const auto* var : collector.var_uses) {
+    for (const auto& candidate : vars) {
+      if (var == candidate.get()) return true;
+    }
+  }
+  return false;
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_precompute_static_windows, ("tensor.precompute_static_windows")) {
@@ -107,40 +120,96 @@ REGISTER_ORCHESTRATION_OP(tensor_precompute_static_windows, ("tensor.precompute_
   int64_t window_count = 1;
   for (auto trip : loop_trips) window_count *= trip;
   CHECK(window_count > 0) << "tensor.precompute_static_windows requires at least one window";
+  bool shape_is_loop_invariant = true;
+  for (const auto& dim : shape) {
+    if (ExprUsesAnyVar(dim, loop_vars)) {
+      shape_is_loop_invariant = false;
+      break;
+    }
+  }
 
   std::ostringstream oss;
   const size_t ndim = shape.size();
-  for (int64_t i = 0; i < window_count; ++i) {
-    oss << "uint32_t " << array_name << "_" << i << "_offsets[" << ndim << "] = {";
-    for (size_t d = 0; d < ndim; ++d) {
-      if (d > 0) oss << ", ";
-      oss << EmitStaticWindowAsUint32(
-          SubstituteStaticWindowLoopValues(offset[d], loop_vars, loop_starts, loop_steps, loop_trips, i),
-          codegen);
-    }
-    oss << "};\n";
 
-    oss << "uint32_t " << array_name << "_" << i << "_shapes[" << ndim << "] = {";
-    for (size_t d = 0; d < ndim; ++d) {
-      if (d > 0) oss << ", ";
-      std::string offset_slot = array_name + "_" + std::to_string(i) + "_offsets[" + std::to_string(d) + "]";
-      oss << "(" << offset_slot << " >= " << parent_name << ".shapes[" << d
-          << "] ? 0u : std::min<uint32_t>("
-          << EmitStaticWindowAsUint32(
-                 SubstituteStaticWindowLoopValues(shape[d], loop_vars, loop_starts, loop_steps, loop_trips, i),
-                 codegen)
-          << ", " << parent_name << ".shapes[" << d << "] - " << offset_slot << "))";
+  oss << "uint32_t " << array_name << "_offsets[" << window_count << "][" << ndim << "];\n";
+  oss << "for (int64_t " << array_name << "_i = 0; " << array_name << "_i < " << window_count << "; ++"
+      << array_name << "_i) {";
+  if (!loop_vars.empty()) {
+    oss << "\n    int64_t " << array_name << "_rem = " << array_name << "_i;";
+    for (auto i = static_cast<int64_t>(loop_vars.size()) - 1; i >= 0; --i) {
+      const auto idx = static_cast<size_t>(i);
+      auto start = As<ConstInt>(loop_starts[idx]);
+      auto step = As<ConstInt>(loop_steps[idx]);
+      INTERNAL_CHECK(start && step) << "static window loop start/step must be const";
+      oss << "\n    int64_t " << codegen.GenerateExprString(loop_vars[idx]) << " = " << start->value_
+          << " + (" << array_name << "_rem % " << loop_trips[idx] << ") * " << step->value_ << ";";
+      if (i > 0) {
+        oss << "\n    " << array_name << "_rem /= " << loop_trips[idx] << ";";
+      }
     }
-    oss << "};\n";
+  }
+  for (size_t d = 0; d < ndim; ++d) {
+    oss << "\n    " << array_name << "_offsets[" << array_name << "_i][" << d
+        << "] = " << EmitStaticWindowAsUint32(offset[d], codegen) << ";";
+  }
+  oss << "\n}\n";
+
+  if (shape_is_loop_invariant) {
+    oss << "uint32_t " << array_name << "_shapes[" << window_count << "][" << ndim << "];\n";
+    oss << "for (int64_t " << array_name << "_i = 0; " << array_name << "_i < " << window_count << "; ++"
+        << array_name << "_i) {";
+    for (size_t d = 0; d < ndim; ++d) {
+      std::string shape_index = array_name + "_i";
+      std::string offset_slot = array_name + "_offsets[" + shape_index + "][" + std::to_string(d) + "]";
+      oss << "\n    " << array_name << "_shapes[" << shape_index << "][" << d << "] = ";
+      oss << "(" << offset_slot << " >= " << parent_name << ".shapes[" << d << "] ? 0u : std::min<uint32_t>(";
+      oss << EmitStaticWindowAsUint32(shape[d], codegen) << ", " << parent_name << ".shapes[" << d << "] - "
+          << offset_slot << "));";
+    }
+    oss << "\n}\n";
+  } else {
+    oss << "uint32_t " << array_name << "_shapes[" << window_count << "][" << ndim << "];\n";
+    oss << "for (int64_t " << array_name << "_i = 0; " << array_name << "_i < " << window_count << "; ++"
+        << array_name << "_i) {";
+    if (!loop_vars.empty()) {
+      oss << "\n    int64_t " << array_name << "_rem = " << array_name << "_i;";
+      for (auto i = static_cast<int64_t>(loop_vars.size()) - 1; i >= 0; --i) {
+        const auto idx = static_cast<size_t>(i);
+        auto start = As<ConstInt>(loop_starts[idx]);
+        auto step = As<ConstInt>(loop_steps[idx]);
+        INTERNAL_CHECK(start && step) << "static window loop start/step must be const";
+        oss << "\n    int64_t " << codegen.GenerateExprString(loop_vars[idx]) << " = " << start->value_
+            << " + (" << array_name << "_rem % " << loop_trips[idx] << ") * " << step->value_ << ";";
+        if (i > 0) {
+          oss << "\n    " << array_name << "_rem /= " << loop_trips[idx] << ";";
+        }
+      }
+    }
+    for (size_t d = 0; d < ndim; ++d) {
+      std::string shape_index = array_name + "_i";
+      std::string offset_slot = array_name + "_offsets[" + shape_index + "][" + std::to_string(d) + "]";
+      oss << "\n    " << array_name << "_shapes[" << shape_index << "][" << d << "] = ";
+      oss << "(" << offset_slot << " >= " << parent_name << ".shapes[" << d << "] ? 0u : std::min<uint32_t>(";
+      oss << EmitStaticWindowAsUint32(shape[d], codegen) << ", " << parent_name << ".shapes[" << d << "] - "
+          << offset_slot << "));";
+    }
+    oss << "\n}\n";
   }
 
+  oss << "auto " << array_name << "_make = [&](int64_t i) { return " << parent_name << ".view(" << array_name
+      << "_shapes[i], " << array_name << "_offsets[i]); };\n";
   oss << "Tensor " << array_name << "[" << window_count << "] = {";
+  constexpr int64_t kWindowsPerLine = 8;
   for (int64_t i = 0; i < window_count; ++i) {
-    if (i > 0) oss << ", ";
-    oss << parent_name << ".view(" << array_name << "_" << i << "_shapes, " << array_name << "_" << i
-        << "_offsets)";
+    if (i % kWindowsPerLine == 0) {
+      oss << "\n    ";
+    } else {
+      oss << " ";
+    }
+    oss << array_name << "_make(" << i << ")";
+    if (i + 1 < window_count) oss << ",";
   }
-  oss << "};";
+  oss << "\n};";
   return oss.str();
 }
 
@@ -160,9 +229,10 @@ REGISTER_ORCHESTRATION_OP(tensor_static_window_get, ("tensor.static_window_get")
     std::string loop_name = codegen.GenerateExprString(loop_vars[i]);
     std::string start = codegen.GenerateExprString(loop_starts[i]);
     std::string step = codegen.GenerateExprString(loop_steps[i]);
-    std::string loop_idx = (start == "0" && step == "1") ? loop_name
-                         : "((" + loop_name + " - " + start + ") / " + step + ")";
-    idx_expr = (i == 0) ? loop_idx : "(" + idx_expr + " * " + std::to_string(loop_trips[i]) + " + " + loop_idx + ")";
+    std::string loop_idx =
+        (start == "0" && step == "1") ? loop_name : "((" + loop_name + " - " + start + ") / " + step + ")";
+    idx_expr =
+        (i == 0) ? loop_idx : "(" + idx_expr + " * " + std::to_string(loop_trips[i]) + " + " + loop_idx + ")";
   }
 
   std::string result = codegen.GetCurrentResultTarget();
@@ -2317,10 +2387,10 @@ class StaticOutputWindowPlanner {
         window_get_attrs.emplace_back("static_window_group_id", group_id);
         auto window_get_call = std::make_shared<Call>(
             std::make_shared<Op>("tensor.static_window_get"), std::vector<ExprPtr>{materialized_parent_expr},
-            std::vector<std::pair<std::string, std::any>>{},
-            std::move(window_get_attrs), raw_slice_call->GetType(), call_assign->span_);
-        auto slice_var =
-            std::make_shared<Var>(out_arg->name_hint_ + "__window", window_get_call->GetType(), out_arg->span_);
+            std::vector<std::pair<std::string, std::any>>{}, std::move(window_get_attrs),
+            raw_slice_call->GetType(), call_assign->span_);
+        auto slice_var = std::make_shared<Var>(out_arg->name_hint_ + "__window", window_get_call->GetType(),
+                                               out_arg->span_);
         stmts.push_back(std::make_shared<AssignStmt>(slice_var, window_get_call, call_assign->span_));
         if (planned_windows_) {
           planned_windows_->push_back(
@@ -2708,9 +2778,9 @@ class StaticOutputWindowPlanner {
       attrs.emplace_back(kStaticWindowLoopStartsAttr, group.emitted_loop_starts);
       attrs.emplace_back(kStaticWindowLoopStepsAttr, group.emitted_loop_steps);
       attrs.emplace_back(kStaticWindowLoopTripsAttr, group.emitted_loop_trips);
-      auto call = std::make_shared<Call>(std::make_shared<Op>("tensor.precompute_static_windows"),
-                                         std::vector<ExprPtr>{group.parent}, std::vector<std::pair<std::string, std::any>>{},
-                                         std::move(attrs), GetUnknownType(), span);
+      auto call = std::make_shared<Call>(
+          std::make_shared<Op>("tensor.precompute_static_windows"), std::vector<ExprPtr>{group.parent},
+          std::vector<std::pair<std::string, std::any>>{}, std::move(attrs), GetUnknownType(), span);
       return std::make_shared<EvalStmt>(call, span);
     }
 
@@ -3112,8 +3182,7 @@ class StaticOutputWindowPlanner {
   AnalysisMap Analyze(const ProgramPtr& program) {
     AnalysisMap analyses;
     for (const auto& [gvar, func] : program->functions_) {
-      if (!func || pypto::codegen::IsBuiltinOp(func->name_) ||
-          func->func_type_ != FunctionType::InCore) {
+      if (!func || pypto::codegen::IsBuiltinOp(func->name_) || func->func_type_ != FunctionType::InCore) {
         continue;
       }
       if (ContainsGeneratedChunkLoop(func)) continue;
