@@ -2450,6 +2450,7 @@ class StaticOutputWindowPlanner {
 
       auto cloned_gvar = std::make_shared<GlobalVar>(cloned_func->name_);
       const bool is_submit_call = submit != nullptr || IsSubmitCall(call);
+      VarPtr captured_task_id_var;
       std::vector<TypePtr> result_types = cloned_func->return_types_;
       if (is_submit_call) {
         auto tuple_ty = As<TupleType>(call->GetType());
@@ -2460,6 +2461,18 @@ class StaticOutputWindowPlanner {
           result_types.size() == 1 ? result_types[0] : std::make_shared<TupleType>(result_types);
 
       auto new_attrs = RewriteCallAttrs(call, analysis, slices_by_out_index);
+      if (!is_submit_call && writer_records_) {
+        auto tid_type = std::make_shared<ScalarType>(DataType::TASK_ID);
+        captured_task_id_var =
+            std::make_shared<Var>(call_assign->var_->name_hint_ + "__tid", tid_type, call_assign->span_);
+        auto invalid_tid_call = std::make_shared<Call>(
+            OpRegistry::GetInstance().GetOp("system.task_invalid"), std::vector<ExprPtr>{},
+            std::vector<std::pair<std::string, std::any>>{}, std::vector<std::pair<std::string, std::any>>{},
+            tid_type, call_assign->span_);
+        stmts.push_back(
+            std::make_shared<AssignStmt>(captured_task_id_var, invalid_tid_call, call_assign->span_));
+        new_attrs.emplace_back(kAttrTaskIdVar, captured_task_id_var);
+      }
       ExprPtr new_dispatch_expr;
       if (submit) {
         auto new_deps = ExtractSubmitDeps(&new_attrs);
@@ -2478,7 +2491,8 @@ class StaticOutputWindowPlanner {
                                                   new_return_type, call_assign->var_->span_);
       stmts.push_back(std::make_shared<AssignStmt>(tmp_result_var, new_dispatch_expr, call_assign->span_));
 
-      if (!is_submit_call && analysis.outputs.size() == 1 && result_types.size() == 1) {
+      if (!captured_task_id_var && !is_submit_call && analysis.outputs.size() == 1 &&
+          result_types.size() == 1) {
         const auto& output = analysis.outputs[0];
         const auto& slice_bundle = slices_by_out_index.at(output.out_param_index);
         auto assemble_call = OpRegistry::GetInstance().Create(
@@ -2497,12 +2511,17 @@ class StaticOutputWindowPlanner {
 
       std::unordered_map<size_t, VarPtr> tuple_items;
       for (const auto& output : analysis.outputs) {
-        auto get_item = std::make_shared<TupleGetItemExpr>(
-            tmp_result_var, static_cast<int>(output.return_index), call_assign->span_);
+        ExprPtr result_item;
+        if (!is_submit_call && result_types.size() == 1) {
+          result_item = tmp_result_var;
+        } else {
+          result_item = std::make_shared<TupleGetItemExpr>(
+              tmp_result_var, static_cast<int>(output.return_index), call_assign->span_);
+        }
         auto item_var = std::make_shared<Var>(
             call_assign->var_->name_hint_ + "__windowed_" + std::to_string(output.return_index),
             result_types[output.return_index], call_assign->var_->span_);
-        tail_stmts.push_back(std::make_shared<AssignStmt>(item_var, get_item, call_assign->span_));
+        tail_stmts.push_back(std::make_shared<AssignStmt>(item_var, result_item, call_assign->span_));
 
         const auto& slice_bundle = slices_by_out_index.at(output.out_param_index);
         auto assemble_call = OpRegistry::GetInstance().Create(
@@ -2518,11 +2537,16 @@ class StaticOutputWindowPlanner {
 
       for (size_t i = 0; i < assembled_result_exprs.size(); ++i) {
         if (!assembled_result_exprs[i]) {
-          auto get_item =
-              std::make_shared<TupleGetItemExpr>(tmp_result_var, static_cast<int>(i), call_assign->span_);
+          ExprPtr item_expr;
+          if (!is_submit_call && result_types.size() == 1) {
+            item_expr = tmp_result_var;
+          } else {
+            item_expr =
+                std::make_shared<TupleGetItemExpr>(tmp_result_var, static_cast<int>(i), call_assign->span_);
+          }
           auto item_var = std::make_shared<Var>(call_assign->var_->name_hint_ + "__pass_" + std::to_string(i),
                                                 result_types[i], call_assign->var_->span_);
-          tail_stmts.push_back(std::make_shared<AssignStmt>(item_var, get_item, call_assign->span_));
+          tail_stmts.push_back(std::make_shared<AssignStmt>(item_var, item_expr, call_assign->span_));
           assembled_result_exprs[i] = item_var;
         }
       }
@@ -2530,14 +2554,8 @@ class StaticOutputWindowPlanner {
       tuple_result_subst_[call_assign->var_.get()] = std::move(assembled_result_exprs);
       stmts.insert(stmts.end(), tail_stmts.begin(), tail_stmts.end());
 
-      if (is_submit_call && writer_records_) {
-        int tid_idx = static_cast<int>(result_types.size() - 1);
-        auto tid_type = result_types.back();
-        auto tid_expr = tuple_result_subst_.at(call_assign->var_.get())[static_cast<size_t>(tid_idx)];
-        auto tid_var =
-            std::make_shared<Var>(call_assign->var_->name_hint_ + "__tid", tid_type, call_assign->span_);
-        stmts.push_back(std::make_shared<AssignStmt>(tid_var, tid_expr, call_assign->span_));
-
+      auto make_writer_records = [&](const VarPtr& tid_var) {
+        if (!tid_var) return;
         ForStmtPtr enclosing_static_loop;
         ExprPtr window_index_expr;
         if (!loop_stack_.empty()) {
@@ -2573,11 +2591,28 @@ class StaticOutputWindowPlanner {
                                                        enclosing_static_loop, enclosing_loop_var,
                                                        window_index_expr, write_region});
         }
+      };
+
+      if (is_submit_call && writer_records_) {
+        int tid_idx = static_cast<int>(result_types.size() - 1);
+        auto tid_type = result_types.back();
+        auto tid_expr = tuple_result_subst_.at(call_assign->var_.get())[static_cast<size_t>(tid_idx)];
+        auto tid_var =
+            std::make_shared<Var>(call_assign->var_->name_hint_ + "__tid", tid_type, call_assign->span_);
+        stmts.push_back(std::make_shared<AssignStmt>(tid_var, tid_expr, call_assign->span_));
+        make_writer_records(tid_var);
+      } else if (writer_records_) {
+        make_writer_records(captured_task_id_var);
       }
       if (!is_submit_call) {
-        auto rebuilt_tuple =
-            std::make_shared<MakeTuple>(tuple_result_subst_.at(call_assign->var_.get()), call_assign->span_);
-        stmts.push_back(std::make_shared<AssignStmt>(call_assign->var_, rebuilt_tuple, call_assign->span_));
+        const auto& result_exprs = tuple_result_subst_.at(call_assign->var_.get());
+        if (result_exprs.size() == 1) {
+          stmts.push_back(
+              std::make_shared<AssignStmt>(call_assign->var_, result_exprs[0], call_assign->span_));
+        } else {
+          auto rebuilt_tuple = std::make_shared<MakeTuple>(result_exprs, call_assign->span_);
+          stmts.push_back(std::make_shared<AssignStmt>(call_assign->var_, rebuilt_tuple, call_assign->span_));
+        }
       }
 
       RewriteBundle bundle;
@@ -3462,7 +3497,9 @@ class StaticOutputWindowPlanner {
     }
 
     void PropagateAvailableDeps(const AssignStmtPtr& assign) {
-      auto it = tid_to_record_.find(assign->var_.get());
+      auto tid_var = CompletedWriterTid(assign);
+      if (!tid_var) return;
+      auto it = tid_to_record_.find(tid_var.get());
       if (it == tid_to_record_.end()) return;
       auto* record = it->second;
       if (!record->parent) return;
@@ -3470,6 +3507,22 @@ class StaticOutputWindowPlanner {
       if (parent_root) {
         available_parent_deps_[parent_root.get()].push_back(record->task_id_var);
       }
+    }
+
+    VarPtr CompletedWriterTid(const AssignStmtPtr& assign) const {
+      auto call = As<Call>(assign->value_);
+      if (call && call->op_ && call->op_->name_ == "system.task_invalid") {
+        return nullptr;
+      }
+      if (call) {
+        if (auto captured_tid = call->GetAttr<VarPtr>(kAttrTaskIdVar, nullptr)) {
+          return captured_tid;
+        }
+      }
+      if (writer_tid_set_.count(assign->var_.get())) {
+        return assign->var_;
+      }
+      return nullptr;
     }
 
     std::optional<std::vector<StmtPtr>> MaybeTransformForStmt(const ForStmtPtr& op) {
@@ -3596,10 +3649,19 @@ class StaticOutputWindowPlanner {
               : carries_(carries), tid_to_carry_(tid_to_carry), all_tids_(all_tids), idx_(idx) {}
 
           StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
-            if (!all_tids_.count(op->var_.get())) {
+            VarPtr defined_tid = op->var_;
+            if (auto call = As<Call>(op->value_)) {
+              if (call->op_ && call->op_->name_ == "system.task_invalid") {
+                return IRMutator::VisitStmt_(op);
+              }
+              if (auto captured_tid = call->GetAttr<VarPtr>(kAttrTaskIdVar, nullptr)) {
+                defined_tid = captured_tid;
+              }
+            }
+            if (!all_tids_.count(defined_tid.get())) {
               return IRMutator::VisitStmt_(op);
             }
-            auto it = tid_to_carry_.find(op->var_.get());
+            auto it = tid_to_carry_.find(defined_tid.get());
             if (it == tid_to_carry_.end()) {
               return IRMutator::VisitStmt_(op);
             }
@@ -3617,7 +3679,7 @@ class StaticOutputWindowPlanner {
                 carry.iter_var->name_hint_ + "_updated_" + std::to_string(update_counter_++),
                 carry.iter_var->GetType(), op->span_);
             auto update_call = std::make_shared<Call>(OpRegistry::GetInstance().GetOp("array.update_element"),
-                                                      std::vector<ExprPtr>{current_array, idx_, op->var_},
+                                                      std::vector<ExprPtr>{current_array, idx_, defined_tid},
                                                       std::vector<std::pair<std::string, std::any>>{},
                                                       std::vector<std::pair<std::string, std::any>>{},
                                                       carry.iter_var->GetType(), op->span_);

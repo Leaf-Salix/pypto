@@ -1001,6 +1001,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
         }
         int task_idx_before = task_counter_;
         GenerateFunctionCallCode(call, result_key);
+        if (auto task_id_var = call->GetAttr<VarPtr>(kAttrTaskIdVar, nullptr)) {
+          const std::string tid_name = ReserveVarEmitName(task_id_var.get());
+          code_ << Indent() << tid_name << " = task_" << task_idx_before << "_outs.task_id();\n";
+          manual_task_id_map_[task_id_var.get()] = tid_name;
+        }
 
         if (in_manual_scope_depth_ > 0 && task_counter_ > task_idx_before) {
           // Bind the LHS Var to the just-emitted ``task_<n>`` so a downstream
@@ -2209,7 +2214,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     std::string submit_expr =
         CoreTypeToSubmitPrefix(core_type) + std::to_string(func_id) + ", " + task_var + ")";
-    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call));
+    EmitTaskSubmitAndBind(submit_expr, IsSubmitCall(call) || call->GetAttr<VarPtr>(kAttrTaskIdVar, nullptr));
   }
 
   void GenerateSpmdCallCode(const CallPtr& call, const FunctionPtr& spmd_func) {

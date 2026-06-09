@@ -1385,6 +1385,80 @@ class TestWindowDependencyPlanner:
         assert "system.task_dummy" in call_names
         assert reader_dep_edges == 1
 
+    def test_parallel_plain_call_writer_full_reader_uses_captured_task_id_barrier(self):
+        """Plain InCore calls also launch runtime tasks in orchestration codegen.
+
+        Static output-window writers reached through normal ``self.writer(...)``
+        calls need an internal ``task_id_var`` capture so their producer TaskIds
+        can be carried out of a parallel loop and used to fence a later full
+        reader.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                for bi in pl.parallel(4):
+                    row: pl.Scalar[pl.INDEX] = bi * 64
+                    score = self.writer(data, row, score)
+                result = self.reader(score, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        reader_dep_edges = 0
+        writer_task_id_attrs = 0
+        call_names: list[str] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges, writer_task_id_attrs
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "writer__windowed"):
+                    if (op.value.attrs or {}).get("task_id_var") is not None:
+                        writer_task_id_attrs += 1
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+            def visit_call(self, op):
+                call_names.append(_call_name(op))
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        assert writer_task_id_attrs == 1
+        assert "array.create" in call_names
+        assert "array.update_element" in call_names
+        assert "system.task_dummy" in call_names
+        assert reader_dep_edges == 1
+
     def test_two_loop_writers_same_parent_keep_separate_task_id_arrays(self):
         """Two loop writers to one parent must both feed the later full reader.
 
