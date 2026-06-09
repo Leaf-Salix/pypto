@@ -3364,19 +3364,20 @@ class StaticOutputWindowPlanner {
     return out;
   }
 
-  class YieldAppender : public IRMutator {
-   public:
-    explicit YieldAppender(std::vector<ExprPtr> values) : values_(std::move(values)) {}
-
-    StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
-      auto new_values = op->value_;
-      new_values.insert(new_values.end(), values_.begin(), values_.end());
-      return std::make_shared<YieldStmt>(std::move(new_values), op->span_);
+  static StmtPtr AppendToTrailingYield(const StmtPtr& body, const std::vector<ExprPtr>& values) {
+    if (auto yield = As<YieldStmt>(body)) {
+      auto new_values = yield->value_;
+      new_values.insert(new_values.end(), values.begin(), values.end());
+      return std::make_shared<YieldStmt>(std::move(new_values), yield->span_);
     }
-
-   private:
-    std::vector<ExprPtr> values_;
-  };
+    auto seq = As<SeqStmts>(body);
+    if (!seq || seq->stmts_.empty()) return body;
+    auto new_stmts = seq->stmts_;
+    auto new_last = AppendToTrailingYield(new_stmts.back(), values);
+    if (new_last.get() == new_stmts.back().get()) return body;
+    new_stmts.back() = new_last;
+    return std::make_shared<SeqStmts>(std::move(new_stmts), seq->span_);
+  }
 
   class WindowDependencyPlanner : public IRMutator {
    public:
@@ -3721,7 +3722,7 @@ class StaticOutputWindowPlanner {
         for (auto& carry : carries) {
           yield_values.push_back(ExprPtr(carry.update_var));
         }
-        new_body = YieldAppender(std::move(yield_values)).VisitStmt(new_body);
+        new_body = AppendToTrailingYield(new_body, yield_values);
       } else {
         std::vector<ExprPtr> yield_values;
         for (auto& carry : carries) {
