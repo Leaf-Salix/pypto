@@ -1240,6 +1240,49 @@ class TestOutWindowExternalizer:
         assert "pl.tensor.slice(q_rv" not in printed_main
         assert "pl.tensor.slice(k_rv" not in printed_main
 
+    def test_aggregate_output_preserves_existing_pure_input_window(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def aggregate_with_header(
+                self,
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+                data: pl.Tensor[[16, 256], pl.FP32],
+                header: pl.Tensor[[16, 256], pl.FP32],
+                row: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                header_tile: pl.Tile[[16, 64], pl.FP32] = pl.load(header, [row, 0], [16, 64])
+                for h, (out_iter,) in pl.range(4, init_values=(out,)):
+                    col: pl.Scalar[pl.INDEX] = h * 64
+                    data_tile: pl.Tile[[16, 64], pl.FP32] = pl.load(data, [row, col], [16, 64])
+                    mixed: pl.Tile[[16, 64], pl.FP32] = pl.tile.add(data_tile, header_tile)
+                    out_next: pl.Tensor[[16, 256], pl.FP32] = pl.store(mixed, [row, col], out_iter)
+                    out_rv = pl.yield_(out_next)
+                return out_rv
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[16, 256], pl.FP32],
+                header: pl.Tensor[[16, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 256], pl.FP32]],
+            ) -> pl.Tensor[[16, 256], pl.FP32]:
+                row: pl.Scalar[pl.INDEX] = 0
+                return self.aggregate_with_header(out, data, header, row)
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "aggregate_with_header__windowed" in printed_main
+        assert "pl.tensor.slice(data" in printed_main
+        assert "pl.tensor.slice(header" in printed_main
+
+        printed_windowed = ir.python_print(_get_function(After, "aggregate_with_header__windowed"))
+        assert "data__ssa_v0: pl.Tensor[[16, 256], pl.FP32" in printed_windowed
+        assert "header__ssa_v0: pl.Tensor[[16, 64], pl.FP32" in printed_windowed
+        assert "pl.tile.load(header__ssa_v0, [0, 0]" in printed_windowed
+        assert "pl.tile.load(data__ssa_v0, [0, col__ssa_v0]" in printed_windowed
+
     def test_direct_out_call_rewrites_to_windowed_clone(self):
         @pl.program
         class Before:

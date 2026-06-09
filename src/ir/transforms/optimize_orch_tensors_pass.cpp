@@ -3422,7 +3422,10 @@ class OutWindowExternalizer {
           std::move(base_offsets), std::move(local_offsets), match.iter_arg_index});
     }
 
-    analysis.inputs = AnalyzeAggregateInputWindows(func, existing_inputs, loop);
+    analysis.inputs = existing_inputs;
+    auto aggregate_inputs = AnalyzeAggregateInputWindows(func, existing_inputs, loop);
+    analysis.inputs.insert(analysis.inputs.end(), std::make_move_iterator(aggregate_inputs.begin()),
+                           std::make_move_iterator(aggregate_inputs.end()));
     return analysis;
   }
 
