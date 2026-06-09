@@ -3497,6 +3497,70 @@ class TestManualScopeCodegen:
             code,
         ), code
 
+    def test_static_output_window_full_reader_dependency_codegen(self):
+        """A windowed submit loop followed by a full reader emits a C++ barrier.
+
+        This pins the codegen-facing part of OptimizeOrchTensors' canonical
+        region dependency planner: writer TaskIds are carried in a TaskId array,
+        compressed by ``system.task_dummy``, then attached to the later reader.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for bi in pl.range(4):
+                        row: pl.Scalar[pl.INDEX] = bi * 64
+                        _score_next, _tid = pl.submit(self.writer, data, row, score)
+                    result = self.reader(score, result)
+                return result
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(Prog)
+        code = _generate_orch_code(transformed)
+
+        assert re.search(r"Tensor score.*__windows\[4\]", code), code
+        assert re.search(
+            r"const Tensor& score.*__window = score.*__windows\[score.*__window__window_idx\];", code
+        ), code
+        assert re.search(r"PTO2TaskId bi.*\[4\];", code), code
+        assert re.search(r"bi.*\[bi\] = .*__tid;", code), code
+        assert "rt_submit_dummy_task(params_" in code, code
+        assert re.search(r"PTO2TaskId params_t\d+_deps\[1\];", code), code
+        assert re.search(
+            r"params_t\d+\.set_dependencies\(params_t\d+_deps, params_t\d+_deps_count\);", code
+        ), code
+
     def test_user_written_task_dummy_accepts_scalar_dep_codegen(self):
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)

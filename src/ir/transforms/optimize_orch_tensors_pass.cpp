@@ -2035,11 +2035,16 @@ class StaticOutputWindowPlanner {
     for (auto& func : new_functions) {
       if (!func || func->func_type_ != FunctionType::Orchestration) continue;
       std::vector<PlannedWindowGroup> planned_windows;
-      OrchRewriter rewriter(program, analyses, cloned_funcs, &planned_windows);
+      std::vector<WindowWriteRecord> writer_records;
+      OrchRewriter rewriter(program, analyses, cloned_funcs, &planned_windows, &writer_records);
       auto new_body = rewriter.VisitStmt(func->body_);
       if (!planned_windows.empty()) {
         StaticWindowMaterializer materializer(std::move(planned_windows));
         new_body = materializer.VisitStmt(new_body);
+      }
+      if (!writer_records.empty()) {
+        WindowDependencyPlanner planner(program, std::move(writer_records));
+        new_body = planner.VisitStmt(new_body);
       }
       if (new_body.get() == func->body_.get()) continue;
       changed = true;
@@ -2086,6 +2091,28 @@ class StaticOutputWindowPlanner {
     std::vector<ExprPtr> emitted_loop_starts;
     std::vector<ExprPtr> emitted_loop_steps;
     std::vector<int64_t> emitted_loop_trips;
+  };
+
+  struct RegionDim {
+    ExprPtr extent;
+    ExprPtr stride;
+  };
+
+  struct CanonicalRegion {
+    VarPtr root;
+    std::vector<ExprPtr> root_shape;
+    ExprPtr base_linear;
+    std::vector<RegionDim> dims;
+  };
+
+  struct WindowWriteRecord {
+    VarPtr task_id_var;
+    std::string group_id;
+    VarPtr parent;
+    ForStmtPtr enclosing_loop;
+    VarPtr enclosing_loop_var;
+    ExprPtr window_index_expr;
+    CanonicalRegion write_region;
   };
 
   struct AffineForm {
@@ -2230,11 +2257,13 @@ class StaticOutputWindowPlanner {
    public:
     OrchRewriter(ProgramPtr program, const AnalysisMap& analyses,
                  const std::unordered_map<std::string, FunctionPtr>& cloned_funcs,
-                 std::vector<PlannedWindowGroup>* planned_windows)
+                 std::vector<PlannedWindowGroup>* planned_windows,
+                 std::vector<WindowWriteRecord>* writer_records)
         : program_(std::move(program)),
           analyses_(analyses),
           cloned_funcs_(cloned_funcs),
-          planned_windows_(planned_windows) {}
+          planned_windows_(planned_windows),
+          writer_records_(writer_records) {}
 
    protected:
     StmtPtr VisitStmt_(const ForStmtPtr& op) override {
@@ -2305,6 +2334,9 @@ class StaticOutputWindowPlanner {
       VarPtr slice_var;
       ExprPtr parent_expr;
       MakeTuplePtr offset_tuple;
+      std::string group_id;
+      std::vector<ExprPtr> shape_exprs;
+      std::vector<ExprPtr> offset_exprs;
     };
 
     struct RewriteBundle {
@@ -2317,7 +2349,8 @@ class StaticOutputWindowPlanner {
     };
 
     std::optional<RewriteBundle> TryRewriteCall(const AssignStmtPtr& call_assign) {
-      auto call = As<Call>(call_assign->value_);
+      auto submit = As<Submit>(call_assign->value_);
+      auto call = submit ? SubmitToCallView(submit) : As<Call>(call_assign->value_);
       if (!call) return std::nullopt;
 
       auto callee_name = GetCallFuncName(call);
@@ -2332,7 +2365,8 @@ class StaticOutputWindowPlanner {
       auto cloned_func = clone_it->second;
 
       if (analysis.outputs.empty()) return std::nullopt;
-      if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
+      bool disjoint_ok = ProveCallsiteDisjointness(call_assign, call, analysis);
+      if (!disjoint_ok) return std::nullopt;
 
       std::unordered_map<const Var*, ExprPtr> callsite_subst;
       for (size_t i = 0; i < original_func->params_.size() && i < call->args_.size(); ++i) {
@@ -2396,8 +2430,11 @@ class StaticOutputWindowPlanner {
           planned_windows_->push_back(
               PlannedWindowGroup{group_id, array_name, parent_var, shape_exprs, offset_exprs, loop_stack_});
         }
-        slices_by_out_index.emplace(output.out_param_index,
-                                    SliceBundle{slice_var, parent_expr, offset_tuple});
+        slices_by_out_index.emplace(output.out_param_index, SliceBundle{slice_var, parent_expr, offset_tuple,
+                                                                        group_id, shape_exprs, offset_exprs});
+        if (writer_records_) {
+          group_id_to_parent_[group_id] = parent_var;
+        }
       }
 
       std::vector<ExprPtr> new_args;
@@ -2423,11 +2460,23 @@ class StaticOutputWindowPlanner {
           result_types.size() == 1 ? result_types[0] : std::make_shared<TupleType>(result_types);
 
       auto new_attrs = RewriteCallAttrs(call, analysis, slices_by_out_index);
-      auto new_call = std::make_shared<Call>(cloned_gvar, new_args, call->kwargs_, new_attrs, new_return_type,
-                                             call->span_);
+      ExprPtr new_dispatch_expr;
+      if (submit) {
+        auto new_deps = ExtractSubmitDeps(&new_attrs);
+        std::optional<ExprPtr> new_core_num = submit->core_num_;
+        if (new_core_num.has_value()) {
+          new_core_num = VisitExpr(*new_core_num);
+        }
+        new_dispatch_expr = std::make_shared<Submit>(
+            cloned_gvar, new_args, std::move(new_deps), submit->kwargs_, std::move(new_attrs),
+            new_return_type, call->span_, std::move(new_core_num), submit->sync_start_);
+      } else {
+        new_dispatch_expr = std::make_shared<Call>(cloned_gvar, new_args, call->kwargs_, std::move(new_attrs),
+                                                   new_return_type, call->span_);
+      }
       auto tmp_result_var = std::make_shared<Var>(call_assign->var_->name_hint_ + "__windowed",
                                                   new_return_type, call_assign->var_->span_);
-      stmts.push_back(std::make_shared<AssignStmt>(tmp_result_var, new_call, call_assign->span_));
+      stmts.push_back(std::make_shared<AssignStmt>(tmp_result_var, new_dispatch_expr, call_assign->span_));
 
       if (!is_submit_call && analysis.outputs.size() == 1 && result_types.size() == 1) {
         const auto& output = analysis.outputs[0];
@@ -2480,9 +2529,57 @@ class StaticOutputWindowPlanner {
 
       tuple_result_subst_[call_assign->var_.get()] = std::move(assembled_result_exprs);
       stmts.insert(stmts.end(), tail_stmts.begin(), tail_stmts.end());
-      auto rebuilt_tuple =
-          std::make_shared<MakeTuple>(tuple_result_subst_.at(call_assign->var_.get()), call_assign->span_);
-      stmts.push_back(std::make_shared<AssignStmt>(call_assign->var_, rebuilt_tuple, call_assign->span_));
+
+      if (is_submit_call && writer_records_) {
+        int tid_idx = static_cast<int>(result_types.size() - 1);
+        auto tid_type = result_types.back();
+        auto tid_expr = tuple_result_subst_.at(call_assign->var_.get())[static_cast<size_t>(tid_idx)];
+        auto tid_var =
+            std::make_shared<Var>(call_assign->var_->name_hint_ + "__tid", tid_type, call_assign->span_);
+        stmts.push_back(std::make_shared<AssignStmt>(tid_var, tid_expr, call_assign->span_));
+
+        ForStmtPtr enclosing_sequential_loop;
+        ExprPtr window_index_expr;
+        if (!sequential_loops_.empty()) {
+          auto loop = sequential_loops_.back();
+          auto trip = GetStaticTripCount(loop);
+          auto step = GetConstIntValue(loop->step_);
+          if (trip.has_value() && *trip > 0 && step.has_value() && *step == 1) {
+            enclosing_sequential_loop = loop;
+            window_index_expr = MakeSub(loop->loop_var_, loop->start_, loop->span_);
+            window_index_expr = arith::Analyzer().Simplify(window_index_expr);
+          }
+        }
+
+        for (const auto& output : analysis.outputs) {
+          auto slice_it = slices_by_out_index.find(output.out_param_index);
+          if (slice_it == slices_by_out_index.end()) continue;
+          auto parent_it = group_id_to_parent_.find(slice_it->second.group_id);
+          if (parent_it == group_id_to_parent_.end()) continue;
+          VarPtr enclosing_loop_var =
+              enclosing_sequential_loop ? enclosing_sequential_loop->loop_var_ : nullptr;
+          CanonicalRegion write_region;
+          // Compute canonical write region for this output. Use a no-alias
+          // tracker because the parent var is the resolved loop-init / out
+          // param root and not part of an alias chain here.
+          AliasTracker no_alias;
+          auto parent_region = CanonicalRegionAnalysis(no_alias, loop_iter_init_subst_, tuple_result_subst_)
+                                   .Resolve(parent_it->second);
+          if (parent_region.has_value()) {
+            auto slice_region = BuildWriteRegionForSlice(*parent_region, slice_it->second.shape_exprs,
+                                                         slice_it->second.offset_exprs);
+            if (slice_region.has_value()) write_region = *slice_region;
+          }
+          writer_records_->push_back(WindowWriteRecord{tid_var, slice_it->second.group_id, parent_it->second,
+                                                       enclosing_sequential_loop, enclosing_loop_var,
+                                                       window_index_expr, write_region});
+        }
+      }
+      if (!is_submit_call) {
+        auto rebuilt_tuple =
+            std::make_shared<MakeTuple>(tuple_result_subst_.at(call_assign->var_.get()), call_assign->span_);
+        stmts.push_back(std::make_shared<AssignStmt>(call_assign->var_, rebuilt_tuple, call_assign->span_));
+      }
 
       RewriteBundle bundle;
       bundle.stmts = std::move(stmts);
@@ -2494,6 +2591,27 @@ class StaticOutputWindowPlanner {
       if (!tuple_ty || tuple_ty->types_.empty()) return false;
       auto last = As<ScalarType>(tuple_ty->types_.back());
       return last != nullptr && last->dtype_ == DataType::TASK_ID;
+    }
+
+    static std::vector<ExprPtr> ExtractSubmitDeps(std::vector<std::pair<std::string, std::any>>* attrs) {
+      std::vector<ExprPtr> deps;
+      if (!attrs) return deps;
+      std::vector<std::pair<std::string, std::any>> kept_attrs;
+      kept_attrs.reserve(attrs->size());
+      for (auto& [k, v] : *attrs) {
+        if (k != kAttrManualDepEdges) {
+          kept_attrs.emplace_back(k, v);
+          continue;
+        }
+        const auto* dep_vars = std::any_cast<std::vector<VarPtr>>(&v);
+        if (!dep_vars) continue;
+        deps.reserve(deps.size() + dep_vars->size());
+        for (const auto& dep : *dep_vars) {
+          if (dep) deps.push_back(dep);
+        }
+      }
+      *attrs = std::move(kept_attrs);
+      return deps;
     }
 
     std::vector<std::pair<std::string, std::any>> RewriteCallAttrs(
@@ -2641,6 +2759,8 @@ class StaticOutputWindowPlanner {
     const AnalysisMap& analyses_;
     const std::unordered_map<std::string, FunctionPtr>& cloned_funcs_;
     std::vector<PlannedWindowGroup>* planned_windows_ = nullptr;
+    std::vector<WindowWriteRecord>* writer_records_ = nullptr;
+    std::unordered_map<std::string, VarPtr> group_id_to_parent_;
     std::vector<ForStmtPtr> sequential_loops_;
     std::vector<ForStmtPtr> loop_stack_;
     std::vector<std::unordered_set<const Var*>> loop_local_allocs_;
@@ -2790,6 +2910,957 @@ class StaticOutputWindowPlanner {
     std::unordered_map<std::string, PlannedWindowGroup*> groups_by_id_;
     std::unordered_set<std::string> materialized_groups_;
     std::vector<const Var*> active_loops_;
+  };
+
+  class AliasTracker {
+   public:
+    void TrackAlias(const VarPtr& result, const VarPtr& source, const CallPtr& producing_call = nullptr) {
+      if (!result || !source) return;
+      alias_to_source_[result.get()] = source;
+      if (producing_call) {
+        var_to_call_[result.get()] = producing_call;
+      }
+    }
+
+    VarPtr CanonicalRoot(const VarPtr& var) const {
+      if (!var) return nullptr;
+      const Var* current = var.get();
+      VarPtr current_ptr = var;
+      std::unordered_set<const Var*> seen;
+      while (seen.insert(current).second) {
+        auto it = alias_to_source_.find(current);
+        if (it == alias_to_source_.end()) return current_ptr;
+        current = it->second.get();
+        current_ptr = it->second;
+      }
+      return current_ptr;
+    }
+
+    const Var* CanonicalRoot(const Var* var) const {
+      if (!var) return var;
+      std::unordered_set<const Var*> seen;
+      while (seen.insert(var).second) {
+        auto it = alias_to_source_.find(var);
+        if (it == alias_to_source_.end()) return var;
+        var = it->second.get();
+      }
+      return var;
+    }
+
+    CallPtr ProducingCall(const Var* var) const {
+      if (!var) return nullptr;
+      auto it = var_to_call_.find(var);
+      return it != var_to_call_.end() ? it->second : nullptr;
+    }
+
+   private:
+    std::unordered_map<const Var*, VarPtr> alias_to_source_;
+    std::unordered_map<const Var*, CallPtr> var_to_call_;
+  };
+
+  // ============================================================================
+  // CanonicalRegionAnalysis
+  //
+  // Resolves a tensor expression to a rectilinear region
+  //   (root, root_shape, base_linear, dims[])
+  // on top of the root's logical row-major layout.
+  //
+  // Supported input expressions:
+  //   * Var            — full region of the variable's tensor type. Walks the
+  //                      alias chain (alias_to_source_) to find the storage
+  //                      root, and follows loop_iter_init_subst_ for the
+  //                      initial value of an IterArg (loop init alias).
+  //   * tensor.reshape(parent, new_shape)
+  //                   — element-count equivalent contiguous reshape. Inherits
+  //                      root / base_linear, rewrites dims from new_shape.
+  //   * tensor.slice / tensor.view(parent, shape, offset)
+  //                   — keeps root, adds a base_linear offset, dims extents
+  //                      from shape, dims strides inherited from parent.
+  //   * tensor.static_window_get(parent)
+  //                   — same as slice, using the planned shape/offset.
+  //   * tensor.assemble(parent, source, offset)
+  //                   — alias to parent's full region (the assemble result
+  //                      is the parent).
+  //   * tuple_get_item  — pass-through (uses tuple_result_subst_).
+  //   * MakeTuple / make_tuple result — follow tuple_result_subst_.
+  //
+  // Returns nullopt for anything it cannot prove (dynamic rank, unknown
+  // shape, …). The dependency planner treats unknown as "may overlap" with
+  // any same-root writer so we never miss a dep.
+  // ============================================================================
+  class CanonicalRegionAnalysis {
+   public:
+    CanonicalRegionAnalysis(const AliasTracker& alias_tracker,
+                            const std::unordered_map<const Var*, ExprPtr>& loop_iter_init_subst,
+                            const std::unordered_map<const Var*, std::vector<ExprPtr>>& tuple_result_subst)
+        : alias_tracker_(alias_tracker),
+          loop_iter_init_subst_(loop_iter_init_subst),
+          tuple_result_subst_(tuple_result_subst) {}
+
+    std::optional<CanonicalRegion> Resolve(const ExprPtr& expr) const {
+      if (!expr) return std::nullopt;
+      auto seen_it = memo_.find(expr.get());
+      if (seen_it != memo_.end()) return seen_it->second;
+
+      ExprPtr current = expr;
+      std::unordered_set<const Expr*> guard;
+      while (current && guard.insert(current.get()).second) {
+        auto memo_it = memo_.find(current.get());
+        if (memo_it != memo_.end()) return memo_it->second;
+
+        if (auto ia = As<IterArg>(current)) {
+          auto it = loop_iter_init_subst_.find(ia.get());
+          if (it == loop_iter_init_subst_.end() || !it->second) return std::nullopt;
+          current = it->second;
+          continue;
+        }
+
+        if (auto var = AsVarLike(current)) {
+          if (auto region = ResolveVar(var)) {
+            memo_[expr.get()] = *region;
+            memo_[current.get()] = *region;
+            return region;
+          }
+          memo_[expr.get()] = std::nullopt;
+          memo_[current.get()] = std::nullopt;
+          return std::nullopt;
+        }
+
+        if (auto call = As<Call>(current)) {
+          if (auto region = ResolveCall(call)) {
+            memo_[expr.get()] = *region;
+            memo_[current.get()] = *region;
+            return region;
+          }
+          memo_[expr.get()] = std::nullopt;
+          memo_[current.get()] = std::nullopt;
+          return std::nullopt;
+        }
+
+        if (auto tgi = As<TupleGetItemExpr>(current)) {
+          auto tuple_var = AsVarLike(tgi->tuple_);
+          if (!tuple_var) return std::nullopt;
+          auto subst_it = tuple_result_subst_.find(tuple_var.get());
+          if (subst_it == tuple_result_subst_.end()) return std::nullopt;
+          if (tgi->index_ < 0 || static_cast<size_t>(tgi->index_) >= subst_it->second.size()) {
+            return std::nullopt;
+          }
+          current = subst_it->second[static_cast<size_t>(tgi->index_)];
+          continue;
+        }
+
+        return std::nullopt;
+      }
+      return std::nullopt;
+    }
+
+   private:
+    std::optional<CanonicalRegion> ResolveVar(const VarPtr& var) const {
+      if (!var) return std::nullopt;
+      VarPtr current = var;
+      std::unordered_set<const Var*> seen;
+      while (current && seen.insert(current.get()).second) {
+        // If this var has a producing call (slice/reshape/assemble/...
+        // tracked by the alias tracker), apply the transform on top of
+        // the parent region's region.
+        auto producing = alias_tracker_.ProducingCall(current.get());
+        if (producing) {
+          return ResolveCall(producing);
+        }
+        auto alias_it = alias_tracker_.CanonicalRoot(current);
+        if (!alias_it) return std::nullopt;
+        if (alias_it.get() == current.get()) {
+          return RegionForVarPtr(current);
+        }
+        current = alias_it;
+        auto iter_it = loop_iter_init_subst_.find(current.get());
+        if (iter_it != loop_iter_init_subst_.end() && iter_it->second) {
+          return Resolve(iter_it->second);
+        }
+      }
+      return std::nullopt;
+    }
+
+    std::optional<CanonicalRegion> ResolveCall(const CallPtr& call) const {
+      if (!call || !call->op_) return std::nullopt;
+      const auto& name = call->op_->name_;
+      if (name == "tensor.reshape" && call->args_.size() == 2) {
+        auto parent = AsVarLike(call->args_[0]);
+        if (!parent) return std::nullopt;
+        auto parent_region = Resolve(parent);
+        if (!parent_region.has_value()) return std::nullopt;
+        auto shape_tuple = As<MakeTuple>(call->args_[1]);
+        if (!shape_tuple) return std::nullopt;
+        std::vector<ExprPtr> new_shape = shape_tuple->elements_;
+        if (new_shape.empty()) return std::nullopt;
+        for (const auto& d : new_shape) {
+          if (!As<ConstInt>(d)) return std::nullopt;
+        }
+        auto old_product = ProductConstInt(parent_region->root_shape);
+        auto new_product = ProductConstInt(new_shape);
+        if (old_product < 0 || new_product < 0 || old_product != new_product) return std::nullopt;
+        CanonicalRegion out = *parent_region;
+        out.dims = MakeRowMajorDims(new_shape);
+        return out;
+      }
+      if ((name == "tensor.slice" || name == "tensor.view") && call->args_.size() >= 3) {
+        auto parent = AsVarLike(call->args_[0]);
+        if (!parent) return std::nullopt;
+        auto parent_region = Resolve(parent);
+        if (!parent_region.has_value()) return std::nullopt;
+        auto shape_tuple = As<MakeTuple>(call->args_[1]);
+        auto offset_tuple = As<MakeTuple>(call->args_[2]);
+        if (!shape_tuple || !offset_tuple) return std::nullopt;
+        if (shape_tuple->elements_.size() != parent_region->dims.size()) return std::nullopt;
+        if (offset_tuple->elements_.size() != parent_region->dims.size()) return std::nullopt;
+        for (const auto& d : shape_tuple->elements_) {
+          if (!As<ConstInt>(d)) return std::nullopt;
+        }
+        CanonicalRegion out;
+        out.root = parent_region->root;
+        out.root_shape = parent_region->root_shape;
+        auto base_linear =
+            AddLinearOffset(parent_region->base_linear, parent_region->dims, offset_tuple->elements_);
+        if (!base_linear.has_value()) return std::nullopt;
+        out.base_linear = *base_linear;
+        out.dims.reserve(parent_region->dims.size());
+        for (size_t i = 0; i < parent_region->dims.size(); ++i) {
+          out.dims.push_back(RegionDim{shape_tuple->elements_[i], parent_region->dims[i].stride});
+        }
+        return out;
+      }
+      if (name == "tensor.static_window_get" && call->args_.size() >= 1) {
+        auto parent = AsVarLike(call->args_[0]);
+        if (!parent) return std::nullopt;
+        auto shape_attr = call->GetAttr<std::vector<ExprPtr>>(kStaticWindowShapeAttr, {});
+        auto offset_attr = call->GetAttr<std::vector<ExprPtr>>(kStaticWindowOffsetAttr, {});
+        if (shape_attr.empty() || offset_attr.empty()) return std::nullopt;
+        if (shape_attr.size() != offset_attr.size()) return std::nullopt;
+        for (const auto& d : shape_attr) {
+          if (!As<ConstInt>(d)) return std::nullopt;
+        }
+        auto parent_region = Resolve(parent);
+        if (!parent_region.has_value()) return std::nullopt;
+        if (shape_attr.size() != parent_region->dims.size()) return std::nullopt;
+        CanonicalRegion out;
+        out.root = parent_region->root;
+        out.root_shape = parent_region->root_shape;
+        auto base_linear = AddLinearOffset(parent_region->base_linear, parent_region->dims, offset_attr);
+        if (!base_linear.has_value()) return std::nullopt;
+        out.base_linear = *base_linear;
+        out.dims.reserve(parent_region->dims.size());
+        for (size_t i = 0; i < parent_region->dims.size(); ++i) {
+          out.dims.push_back(RegionDim{shape_attr[i], parent_region->dims[i].stride});
+        }
+        return out;
+      }
+      if ((name == "tensor.assemble" || name == "tensor.as_layout" || name == "tensor.set_validshape") &&
+          !call->args_.empty()) {
+        auto parent = AsVarLike(call->args_[0]);
+        if (!parent) return std::nullopt;
+        return Resolve(parent);
+      }
+      return std::nullopt;
+    }
+
+    std::optional<CanonicalRegion> RegionForVarPtr(const VarPtr& var) const {
+      if (!var) return std::nullopt;
+      auto tensor_type = As<TensorType>(var->GetType());
+      if (!tensor_type) return std::nullopt;
+      if (tensor_type->shape_.empty()) return std::nullopt;
+      for (const auto& d : tensor_type->shape_) {
+        if (!As<ConstInt>(d)) return std::nullopt;
+      }
+      CanonicalRegion out;
+      out.root = var;
+      out.root_shape = tensor_type->shape_;
+      out.base_linear = std::make_shared<ConstInt>(0, DataType::INDEX, var->span_);
+      out.dims = MakeRowMajorDims(tensor_type->shape_);
+      return out;
+    }
+
+    static std::vector<RegionDim> MakeRowMajorDims(const std::vector<ExprPtr>& shape) {
+      std::vector<RegionDim> dims;
+      dims.reserve(shape.size());
+      int64_t product = 1;
+      for (auto it = shape.rbegin(); it != shape.rend(); ++it) {
+        auto ci = As<ConstInt>(*it);
+        if (!ci) return {};
+        dims.insert(dims.begin(),
+                    RegionDim{*it, std::make_shared<ConstInt>(product, DataType::INDEX, (*it)->span_)});
+        product *= ci->value_;
+      }
+      return dims;
+    }
+
+    static int64_t ProductConstInt(const std::vector<ExprPtr>& exprs) {
+      int64_t product = 1;
+      for (const auto& e : exprs) {
+        auto ci = As<ConstInt>(e);
+        if (!ci) return -1;
+        product *= ci->value_;
+      }
+      return product;
+    }
+
+    static std::optional<ExprPtr> AddLinearOffset(const ExprPtr& base,
+                                                  const std::vector<RegionDim>& parent_dims,
+                                                  const std::vector<ExprPtr>& offset) {
+      if (!base) return std::nullopt;
+      auto base_ci = As<ConstInt>(base);
+      if (!base_ci) return std::nullopt;
+      int64_t total = base_ci->value_;
+      bool touched = false;
+      for (size_t i = 0; i < parent_dims.size() && i < offset.size(); ++i) {
+        auto off_ci = As<ConstInt>(offset[i]);
+        auto stride_ci = As<ConstInt>(parent_dims[i].stride);
+        if (!off_ci || !stride_ci) return std::nullopt;
+        if (off_ci->value_ == 0) continue;
+        int64_t contribution = off_ci->value_ * stride_ci->value_;
+        total += contribution;
+        touched = true;
+      }
+      if (!touched) return base;
+      return std::make_shared<ConstInt>(total, DataType::INDEX, base->span_);
+    }
+
+    const AliasTracker& alias_tracker_;
+    const std::unordered_map<const Var*, ExprPtr>& loop_iter_init_subst_;
+    const std::unordered_map<const Var*, std::vector<ExprPtr>>& tuple_result_subst_;
+    mutable std::unordered_map<const Expr*, std::optional<CanonicalRegion>> memo_;
+  };
+
+  // ============================================================================
+  // RegionOverlapper
+  //
+  // Conservative may-overlap test for two regions sharing the same root.
+  //   * If dim strides differ → "may overlap" (cannot compare intervals).
+  //   * If at least one dim's offset/extent proves the intervals
+  //     [off, off+extent) and [other_off, other_off+other_extent) are
+  //     disjoint (via ConstInt arithmetic) → "disjoint".
+  //   * Otherwise → "may overlap".
+  // Only ConstInt extents/offsets are handled in v1; loop-affine
+  // expressions fall through to "may overlap" so the planner errs on the
+  // side of inserting a dep.
+  // ============================================================================
+  static bool RegionsMayOverlap(const CanonicalRegion& a, const CanonicalRegion& b) {
+    if (a.root.get() != b.root.get()) return false;
+    if (a.dims.size() != b.dims.size()) return true;
+    if (a.dims.size() != a.root_shape.size() || b.dims.size() != b.root_shape.size()) return true;
+    for (size_t i = 0; i < a.dims.size(); ++i) {
+      auto a_stride = As<ConstInt>(a.dims[i].stride);
+      auto b_stride = As<ConstInt>(b.dims[i].stride);
+      if (!a_stride || !b_stride || a_stride->value_ != b_stride->value_) return true;
+    }
+    auto a_base = As<ConstInt>(a.base_linear);
+    auto b_base = As<ConstInt>(b.base_linear);
+    if (!a_base || !b_base) return true;
+
+    auto coord_for_dim = [](int64_t base, const RegionDim& dim,
+                            const ExprPtr& root_dim) -> std::optional<int64_t> {
+      auto stride = As<ConstInt>(dim.stride);
+      auto root_extent = As<ConstInt>(root_dim);
+      if (!stride || !root_extent || stride->value_ <= 0 || root_extent->value_ <= 0) return std::nullopt;
+      return (base / stride->value_) % root_extent->value_;
+    };
+
+    for (size_t i = 0; i < a.dims.size(); ++i) {
+      auto a_extent = As<ConstInt>(a.dims[i].extent);
+      auto b_extent = As<ConstInt>(b.dims[i].extent);
+      if (!a_extent || !b_extent) return true;
+      auto a_coord = coord_for_dim(a_base->value_, a.dims[i], a.root_shape[i]);
+      auto b_coord = coord_for_dim(b_base->value_, b.dims[i], b.root_shape[i]);
+      if (!a_coord.has_value() || !b_coord.has_value()) return true;
+      int64_t a_start = *a_coord;
+      int64_t a_end = a_start + a_extent->value_;
+      int64_t b_start = *b_coord;
+      int64_t b_end = b_start + b_extent->value_;
+      if (a_end <= b_start || b_end <= a_start) return false;
+    }
+    return true;
+  }
+
+  // True if the region's extent matches the parent root's shape on every
+  // dim and base_linear is zero. Used to fast-path "full read" — for a
+  // full-region reader we keep every pending writer dep.
+  static bool IsFullRegion(const CanonicalRegion& region, const Var* canonical) {
+    if (region.root.get() != canonical) return false;
+    if (region.dims.size() != region.root_shape.size()) return false;
+    auto base = As<ConstInt>(region.base_linear);
+    if (!base || base->value_ != 0) return false;
+    for (size_t i = 0; i < region.dims.size(); ++i) {
+      auto ext = As<ConstInt>(region.dims[i].extent);
+      auto root = As<ConstInt>(region.root_shape[i]);
+      if (!ext || !root || ext->value_ != root->value_) return false;
+    }
+    return true;
+  }
+
+  static std::optional<CanonicalRegion> BuildWriteRegionForSlice(const CanonicalRegion& parent_region,
+                                                                 const std::vector<ExprPtr>& shape,
+                                                                 const std::vector<ExprPtr>& offset) {
+    if (shape.size() != parent_region.dims.size()) return std::nullopt;
+    if (offset.size() != parent_region.dims.size()) return std::nullopt;
+    for (const auto& d : shape) {
+      if (!As<ConstInt>(d)) return std::nullopt;
+    }
+    CanonicalRegion out = parent_region;
+    out.dims.clear();
+    out.dims.reserve(parent_region.dims.size());
+    for (size_t i = 0; i < parent_region.dims.size(); ++i) {
+      out.dims.push_back(RegionDim{shape[i], parent_region.dims[i].stride});
+    }
+    auto base_ci = As<ConstInt>(parent_region.base_linear);
+    if (!base_ci) return std::nullopt;
+    int64_t total = base_ci->value_;
+    bool touched = false;
+    for (size_t i = 0; i < parent_region.dims.size() && i < offset.size(); ++i) {
+      auto off_ci = As<ConstInt>(offset[i]);
+      auto stride_ci = As<ConstInt>(parent_region.dims[i].stride);
+      if (!off_ci || !stride_ci) return std::nullopt;
+      if (off_ci->value_ == 0) continue;
+      total += off_ci->value_ * stride_ci->value_;
+      touched = true;
+    }
+    if (touched || base_ci) {
+      out.base_linear = std::make_shared<ConstInt>(total, DataType::INDEX, parent_region.base_linear->span_);
+    } else {
+      out.base_linear = parent_region.base_linear;
+    }
+    return out;
+  }
+
+  class YieldAppender : public IRMutator {
+   public:
+    explicit YieldAppender(std::vector<ExprPtr> values) : values_(std::move(values)) {}
+
+    StmtPtr VisitStmt_(const YieldStmtPtr& op) override {
+      auto new_values = op->value_;
+      new_values.insert(new_values.end(), values_.begin(), values_.end());
+      return std::make_shared<YieldStmt>(std::move(new_values), op->span_);
+    }
+
+   private:
+    std::vector<ExprPtr> values_;
+  };
+
+  class WindowDependencyPlanner : public IRMutator {
+   public:
+    WindowDependencyPlanner(const ProgramPtr& program, std::vector<WindowWriteRecord> writer_records)
+        : program_(program), writer_records_(std::move(writer_records)) {
+      for (const auto& record : writer_records_) {
+        if (record.task_id_var) {
+          writer_tid_set_.insert(record.task_id_var.get());
+          tid_to_record_[record.task_id_var.get()] = &record;
+        }
+        if (record.enclosing_loop) {
+          records_by_loop_[record.enclosing_loop.get()].push_back(&record);
+        }
+        if (record.enclosing_loop_var) {
+          records_by_loop_var_[record.enclosing_loop_var.get()].push_back(&record);
+        }
+      }
+    }
+
+   protected:
+    StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+      auto saved_tids = defined_tids_;
+      auto saved_available_deps = available_parent_deps_;
+      std::vector<StmtPtr> new_stmts;
+      new_stmts.reserve(op->stmts_.size() * 2);
+      bool changed = false;
+
+      for (const auto& stmt : op->stmts_) {
+        auto assign = As<AssignStmt>(stmt);
+
+        if (assign) {
+          TrackAliasFromAssign(assign);
+        }
+
+        if (assign && writer_tid_set_.count(assign->var_.get())) {
+          defined_tids_.insert(assign->var_.get());
+        }
+
+        if (assign) {
+          auto rewritten = MaybeInsertBarrier(assign);
+          if (rewritten.size() > 1) {
+            changed = true;
+            for (const auto& s : rewritten) new_stmts.push_back(VisitStmt(s));
+            continue;
+          }
+        }
+
+        auto for_stmt = As<ForStmt>(stmt);
+        if (for_stmt && for_stmt->kind_ != ForKind::Parallel) {
+          auto rewritten_for = MaybeTransformForStmt(for_stmt);
+          if (rewritten_for.has_value()) {
+            changed = true;
+            for (const auto& s : rewritten_for.value()) new_stmts.push_back(s);
+            continue;
+          }
+        }
+
+        auto visited = VisitStmt(stmt);
+        changed = changed || visited.get() != stmt.get();
+        new_stmts.push_back(visited);
+
+        if (assign) {
+          PropagateAvailableDeps(assign);
+        }
+      }
+
+      defined_tids_ = std::move(saved_tids);
+      available_parent_deps_ = std::move(saved_available_deps);
+      if (!changed) return op;
+      return SeqStmts::Flatten(std::move(new_stmts), op->span_);
+    }
+
+    StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+      auto saved_tids = defined_tids_;
+      auto saved_available_deps = available_parent_deps_;
+      auto visited = IRMutator::VisitStmt_(op);
+      defined_tids_ = std::move(saved_tids);
+      available_parent_deps_ = std::move(saved_available_deps);
+      return visited;
+    }
+
+    StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+      auto saved_tids = defined_tids_;
+      auto visited = IRMutator::VisitStmt_(op);
+      defined_tids_ = std::move(saved_tids);
+      return visited;
+    }
+
+    ExprPtr VisitExpr_(const CallPtr& op) override {
+      if (IsTrackedTensorAliasOp(op->op_->name_) && !op->args_.empty()) {
+        auto result_var = current_assign_var_;
+        auto parent_var = AsVarLike(op->args_[0]);
+        if (result_var && parent_var) {
+          alias_tracker_.TrackAlias(result_var, parent_var, op);
+        }
+      }
+      return IRMutator::VisitExpr_(op);
+    }
+
+   private:
+    void TrackAliasFromAssign(const AssignStmtPtr& assign) {
+      current_assign_var_ = assign->var_;
+      if (auto source_var = AsVarLike(assign->value_)) {
+        if (As<TensorType>(assign->var_->GetType()) && As<TensorType>(source_var->GetType())) {
+          alias_tracker_.TrackAlias(assign->var_, source_var);
+        }
+        return;
+      }
+      auto call = As<Call>(assign->value_);
+      if (!call || !call->op_) return;
+      const auto& name = call->op_->name_;
+      if (IsTrackedTensorAliasOp(name) && !call->args_.empty()) {
+        auto parent_var = AsVarLike(call->args_[0]);
+        if (parent_var) {
+          alias_tracker_.TrackAlias(assign->var_, parent_var, call);
+        }
+      }
+    }
+
+    void PropagateAvailableDeps(const AssignStmtPtr& assign) {
+      auto it = tid_to_record_.find(assign->var_.get());
+      if (it == tid_to_record_.end()) return;
+      auto* record = it->second;
+      if (!record->parent) return;
+      auto parent_root = alias_tracker_.CanonicalRoot(record->parent);
+      if (parent_root) {
+        available_parent_deps_[parent_root.get()].push_back(record->task_id_var);
+      }
+    }
+
+    std::optional<std::vector<StmtPtr>> MaybeTransformForStmt(const ForStmtPtr& op) {
+      auto loop_var = op->loop_var_;
+      auto trip = GetStaticTripCount(op);
+
+      std::vector<const WindowWriteRecord*> loop_tids;
+      std::unordered_set<const WindowWriteRecord*> seen_loop_records;
+      auto by_loop = records_by_loop_.find(op.get());
+      if (by_loop != records_by_loop_.end()) {
+        for (auto* record : by_loop->second) {
+          if (seen_loop_records.insert(record).second) loop_tids.push_back(record);
+        }
+      }
+      if (op->loop_var_) {
+        auto by_loop_var = records_by_loop_var_.find(op->loop_var_.get());
+        if (by_loop_var != records_by_loop_var_.end()) {
+          for (auto* record : by_loop_var->second) {
+            if (seen_loop_records.insert(record).second) loop_tids.push_back(record);
+          }
+        }
+      }
+      loop_tids.erase(std::remove_if(loop_tids.begin(), loop_tids.end(),
+                                     [](const WindowWriteRecord* record) {
+                                       return !record || !record->parent || !record->window_index_expr;
+                                     }),
+                      loop_tids.end());
+
+      TrackLoopIterArgAliases(op);
+
+      if (loop_tids.empty() || !trip.has_value() || *trip <= 0) return std::nullopt;
+
+      auto step = GetConstIntValue(op->step_);
+      if (!step.has_value() || *step != 1) return std::nullopt;
+
+      struct CarryGroup {
+        VarPtr parent_root;
+        ExprPtr window_index_expr;
+        std::vector<const Var*> tid_vars;
+      };
+      std::vector<CarryGroup> carry_groups;
+      carry_groups.reserve(loop_tids.size());
+      for (auto* record : loop_tids) {
+        auto parent_root = alias_tracker_.CanonicalRoot(record->parent);
+        if (!parent_root) parent_root = record->parent;
+        carry_groups.push_back(
+            CarryGroup{parent_root, record->window_index_expr, {record->task_id_var.get()}});
+      }
+
+      if (carry_groups.empty()) return std::nullopt;
+
+      std::vector<StmtPtr> pre_loop_stmts;
+      auto new_iter_args = op->iter_args_;
+      std::vector<VarPtr> new_return_vars = op->return_vars_;
+      StmtPtr new_body = VisitStmt(op->body_);
+      TrackLoopReturnAliases(op, new_body);
+      std::string loop_var_name = loop_var ? loop_var->name_hint_ : "i";
+      int64_t trip_count = *trip;
+
+      struct ArrayCarry {
+        VarPtr init_var;
+        VarPtr iter_var;
+        VarPtr result_var;
+        VarPtr update_var;
+        VarPtr parent_root;
+        std::vector<const Var*> tid_vars;
+      };
+      std::vector<ArrayCarry> carries;
+
+      auto array_type = std::make_shared<ArrayType>(DataType::TASK_ID, trip_count);
+
+      int carry_idx = 0;
+      for (auto& group : carry_groups) {
+        std::string suffix = "__tids_" + std::to_string(carry_idx++);
+
+        auto init_var = std::make_shared<Var>(loop_var_name + suffix + "_init", array_type, op->span_);
+        auto extent = std::make_shared<ConstInt>(trip_count, DataType::INDEX, op->span_);
+        std::vector<ExprPtr> create_args{extent};
+        std::vector<std::pair<std::string, std::any>> create_kwargs;
+        create_kwargs.emplace_back("dtype", DataType::TASK_ID);
+        auto create_call = std::make_shared<Call>(
+            OpRegistry::GetInstance().GetOp("array.create"), std::move(create_args), std::move(create_kwargs),
+            std::vector<std::pair<std::string, std::any>>{}, array_type, op->span_);
+        pre_loop_stmts.push_back(std::make_shared<AssignStmt>(init_var, create_call, op->span_));
+
+        auto iter_var = std::make_shared<IterArg>(loop_var_name + suffix + "_iter", array_type,
+                                                  ExprPtr(init_var), op->span_);
+
+        auto result_var = std::make_shared<Var>(loop_var_name + suffix + "_final", array_type, op->span_);
+
+        new_iter_args.push_back(iter_var);
+        new_return_vars.push_back(result_var);
+
+        carries.push_back(
+            {init_var, iter_var, result_var, iter_var, group.parent_root, std::move(group.tid_vars)});
+      }
+
+      std::unordered_map<const Var*, size_t> tid_to_carry_idx;
+      std::unordered_set<const Var*> all_tid_vars_in_loop;
+      for (size_t ci = 0; ci < carries.size(); ++ci) {
+        for (auto* tid_var : carries[ci].tid_vars) {
+          tid_to_carry_idx[tid_var] = ci;
+          all_tid_vars_in_loop.insert(tid_var);
+        }
+      }
+
+      ExprPtr window_index_expr;
+      if (!loop_tids.empty()) {
+        window_index_expr = loop_tids[0]->window_index_expr;
+        for (auto* record : loop_tids) {
+          if (record->window_index_expr) {
+            window_index_expr = record->window_index_expr;
+            break;
+          }
+        }
+      }
+
+      auto rewrite_body_with_tid_updates = [&](const StmtPtr& body) -> StmtPtr {
+        class TidUpdateRewriter : public IRMutator {
+         public:
+          TidUpdateRewriter(std::vector<ArrayCarry>* carries,
+                            const std::unordered_map<const Var*, size_t>& tid_to_carry,
+                            const std::unordered_set<const Var*>& all_tids, const ExprPtr& idx)
+              : carries_(carries), tid_to_carry_(tid_to_carry), all_tids_(all_tids), idx_(idx) {}
+
+          StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+            if (!all_tids_.count(op->var_.get())) {
+              return IRMutator::VisitStmt_(op);
+            }
+            auto it = tid_to_carry_.find(op->var_.get());
+            if (it == tid_to_carry_.end()) {
+              return IRMutator::VisitStmt_(op);
+            }
+            size_t ci = it->second;
+            auto& carry = (*carries_)[ci];
+            auto original_assign = IRMutator::VisitStmt_(op);
+
+            auto current_array = ExprPtr(carry.iter_var);
+            if (carry_updated_in_iteration_.count(ci)) {
+              current_array = ExprPtr(carry.update_var);
+            }
+            carry_updated_in_iteration_.insert(ci);
+
+            auto update_var = std::make_shared<Var>(
+                carry.iter_var->name_hint_ + "_updated_" + std::to_string(update_counter_++),
+                carry.iter_var->GetType(), op->span_);
+            auto update_call = std::make_shared<Call>(OpRegistry::GetInstance().GetOp("array.update_element"),
+                                                      std::vector<ExprPtr>{current_array, idx_, op->var_},
+                                                      std::vector<std::pair<std::string, std::any>>{},
+                                                      std::vector<std::pair<std::string, std::any>>{},
+                                                      carry.iter_var->GetType(), op->span_);
+            auto update_assign = std::make_shared<AssignStmt>(update_var, update_call, op->span_);
+            carry.update_var = update_var;
+            return SeqStmts::Flatten({original_assign, update_assign}, op->span_);
+          }
+
+          StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+            std::vector<StmtPtr> new_stmts;
+            bool changed = false;
+            for (const auto& stmt : op->stmts_) {
+              auto visited = VisitStmt(stmt);
+              changed = changed || visited.get() != stmt.get();
+              new_stmts.push_back(visited);
+            }
+            if (!changed) return op;
+            return SeqStmts::Flatten(std::move(new_stmts), op->span_);
+          }
+
+         private:
+          std::vector<ArrayCarry>* carries_;
+          const std::unordered_map<const Var*, size_t>& tid_to_carry_;
+          const std::unordered_set<const Var*>& all_tids_;
+          ExprPtr idx_;
+          std::unordered_set<size_t> carry_updated_in_iteration_;
+          int update_counter_ = 0;
+        };
+        return TidUpdateRewriter(&carries, tid_to_carry_idx, all_tid_vars_in_loop, window_index_expr)
+            .VisitStmt(body);
+      };
+
+      new_body = rewrite_body_with_tid_updates(new_body);
+
+      auto existing_yield = transform_utils::GetLastYieldStmt(new_body);
+      if (existing_yield) {
+        std::vector<ExprPtr> yield_values;
+        yield_values.reserve(carries.size());
+        for (auto& carry : carries) {
+          yield_values.push_back(ExprPtr(carry.update_var));
+        }
+        new_body = YieldAppender(std::move(yield_values)).VisitStmt(new_body);
+      } else {
+        std::vector<ExprPtr> yield_values;
+        for (auto& carry : carries) {
+          yield_values.push_back(ExprPtr(carry.update_var));
+        }
+        auto yield_stmt = std::make_shared<YieldStmt>(std::move(yield_values), op->span_);
+        auto body_stmts = FlattenToStmts(new_body);
+        body_stmts.push_back(yield_stmt);
+        new_body = SeqStmts::Flatten(std::move(body_stmts), op->span_);
+      }
+
+      auto new_for = std::make_shared<ForStmt>(op->loop_var_, op->start_, op->stop_, op->step_, new_iter_args,
+                                               new_body, new_return_vars, op->span_, op->kind_,
+                                               op->chunk_config_, op->attrs_, op->leading_comments_);
+      pre_loop_stmts.push_back(new_for);
+
+      for (auto& carry : carries) {
+        available_parent_deps_[carry.parent_root.get()].push_back(carry.result_var);
+        defined_tids_.insert(carry.result_var.get());
+      }
+
+      return pre_loop_stmts;
+    }
+
+    bool IsTensorOp(const std::string& name) const {
+      return name == "tensor.assemble" || name == "tensor.slice" || name == "tensor.static_window_get" ||
+             name == "tensor.precompute_static_windows" || name == "tensor.create" || name == "tensor.full" ||
+             name == "tensor.reshape" || name == "tensor.as_layout" || name == "tensor.set_validshape" ||
+             name == "array.create" || name == "array.update_element" || name == "array.get_element";
+    }
+
+    static bool IsTrackedTensorAliasOp(const std::string& name) {
+      return name == "tensor.reshape" || name == "tensor.assemble" || name == "tensor.slice" ||
+             name == "tensor.static_window_get" || name == "tensor.as_layout" ||
+             name == "tensor.set_validshape";
+    }
+
+    void TrackLoopIterArgAliases(const ForStmtPtr& op) {
+      for (size_t i = 0; i < op->iter_args_.size() && i < op->return_vars_.size(); ++i) {
+        auto iter_arg = op->iter_args_[i];
+        if (!iter_arg || !iter_arg->initValue_) continue;
+        if (!As<TensorType>(iter_arg->GetType())) continue;
+        auto init_var = AsVarLike(iter_arg->initValue_);
+        if (!init_var) continue;
+        alias_tracker_.TrackAlias(iter_arg, init_var);
+      }
+    }
+
+    void TrackLoopReturnAliases(const ForStmtPtr& op, const StmtPtr& body) {
+      auto yield = transform_utils::GetLastYieldStmt(body);
+      if (!yield) return;
+      std::unordered_map<const Var*, ExprPtr> loop_iter_init;
+      for (const auto& iter_arg : op->iter_args_) {
+        if (iter_arg && iter_arg->initValue_) loop_iter_init[iter_arg.get()] = iter_arg->initValue_;
+      }
+      std::unordered_map<const Var*, std::vector<ExprPtr>> empty_tuple_subst;
+      CanonicalRegionAnalysis region_analysis(alias_tracker_, loop_iter_init, empty_tuple_subst);
+      for (size_t i = 0; i < op->iter_args_.size() && i < op->return_vars_.size() && i < yield->value_.size();
+           ++i) {
+        auto iter_arg = op->iter_args_[i];
+        auto return_var = op->return_vars_[i];
+        if (!iter_arg || !return_var || !iter_arg->initValue_) continue;
+        if (!As<TensorType>(return_var->GetType())) continue;
+        auto init_var = AsVarLike(iter_arg->initValue_);
+        if (!init_var) continue;
+        auto init_root = alias_tracker_.CanonicalRoot(init_var);
+        auto yielded_region = region_analysis.Resolve(yield->value_[i]);
+        if (init_root && yielded_region.has_value() && yielded_region->root.get() == init_root.get()) {
+          alias_tracker_.TrackAlias(return_var, init_root);
+        }
+      }
+    }
+
+    bool IsReaderArg(const Var* arg_var, const FunctionPtr& callee, size_t arg_index) const {
+      if (!callee || arg_index >= callee->param_directions_.size()) {
+        return false;
+      }
+      auto dir = callee->param_directions_[arg_index];
+      return dir == ParamDirection::In || dir == ParamDirection::InOut;
+    }
+
+    std::vector<StmtPtr> MaybeInsertBarrier(const AssignStmtPtr& assign) {
+      auto submit = As<Submit>(assign->value_);
+      auto call = submit ? SubmitToCallView(submit) : As<Call>(assign->value_);
+      if (!call) return {assign};
+      auto gvar = std::dynamic_pointer_cast<const GlobalVar>(call->op_);
+      if (!gvar) return {assign};
+
+      std::string callee_name = gvar->name_;
+      if (callee_name == "system.task_dummy") return {assign};
+      if (IsTensorOp(callee_name)) return {assign};
+
+      auto callee = program_ ? program_->GetFunction(callee_name) : nullptr;
+
+      // Reader-side region analysis: for each tensor read arg, compute its
+      // canonical region so we can prove disjointness against pending writers.
+      // The planner only uses alias_tracker_ here — iter-arg init / tuple
+      // substitutions live in OrchRewriter's stack and are not visible to a
+      // sibling pass; in v1 the reader is always a fresh tensor var / slice
+      // call (the only test shapes for the indexer-like case), so the
+      // pass-local alias chain is enough.
+      std::unordered_map<const Var*, ExprPtr> empty_iter_init;
+      std::unordered_map<const Var*, std::vector<ExprPtr>> empty_tuple_subst;
+      CanonicalRegionAnalysis region_analysis(alias_tracker_, empty_iter_init, empty_tuple_subst);
+
+      std::vector<VarPtr> overlapping_deps;
+      std::unordered_set<const Var*> overlapping_dep_set;
+      std::unordered_set<const Var*> roots_to_summarize;
+      for (size_t i = 0; i < call->args_.size(); ++i) {
+        auto arg_var = AsVarLike(call->args_[i]);
+        if (!arg_var) continue;
+        if (callee && !IsReaderArg(arg_var.get(), callee, i)) continue;
+        const Var* canonical = alias_tracker_.CanonicalRoot(arg_var.get());
+        if (!canonical) canonical = arg_var.get();
+
+        auto dep_it = available_parent_deps_.find(canonical);
+        if (dep_it == available_parent_deps_.end()) continue;
+
+        std::optional<CanonicalRegion> reader_region = region_analysis.Resolve(arg_var);
+        // If the reader's region is unknown / not provable, conservatively
+        // assume overlap with every pending writer.
+        bool reader_is_full = reader_region.has_value() && IsFullRegion(*reader_region, canonical);
+        bool summarize_root = reader_is_full || !reader_region.has_value();
+        bool root_has_overlap = false;
+
+        for (const auto& dep : dep_it->second) {
+          if (!defined_tids_.count(dep.get())) continue;
+          bool overlaps = false;
+          if (reader_is_full) {
+            overlaps = true;
+          } else if (!reader_region.has_value()) {
+            overlaps = true;
+          } else {
+            // Region known and not provably full: keep only writers whose
+            // region may overlap the reader's.
+            auto writer_it = tid_to_record_.find(dep.get());
+            if (writer_it == tid_to_record_.end() || !writer_it->second ||
+                writer_it->second->write_region.root == nullptr) {
+              overlaps = true;
+            } else {
+              overlaps = RegionsMayOverlap(*reader_region, writer_it->second->write_region);
+            }
+          }
+          if (overlaps && overlapping_dep_set.insert(dep.get()).second) {
+            overlapping_deps.push_back(dep);
+            root_has_overlap = true;
+          }
+        }
+        if (summarize_root && root_has_overlap) {
+          roots_to_summarize.insert(canonical);
+        }
+      }
+      if (overlapping_deps.empty()) return {assign};
+
+      auto span = assign->span_;
+      auto tid_type = std::make_shared<ScalarType>(DataType::TASK_ID);
+      auto barrier_var =
+          std::make_shared<Var>(assign->var_->name_hint_ + "__window_barrier_tid", tid_type, span);
+      std::vector<std::pair<std::string, std::any>> barrier_attrs;
+      barrier_attrs.emplace_back(kAttrDummyTask, true);
+      barrier_attrs.emplace_back(kAttrManualDepEdges, std::move(overlapping_deps));
+      auto barrier_call = std::make_shared<Call>(
+          OpRegistry::GetInstance().GetOp("system.task_dummy"), std::vector<ExprPtr>{},
+          std::vector<std::pair<std::string, std::any>>{}, std::move(barrier_attrs), tid_type, span);
+      auto barrier_stmt = std::make_shared<AssignStmt>(barrier_var, barrier_call, span);
+
+      ExprPtr new_dispatch_expr;
+      if (submit) {
+        std::vector<ExprPtr> new_deps = submit->deps_;
+        new_deps.push_back(barrier_var);
+        new_dispatch_expr = std::make_shared<Submit>(submit->op_, submit->args_, std::move(new_deps),
+                                                     submit->kwargs_, submit->attrs_, submit->GetType(),
+                                                     submit->span_, submit->core_num_, submit->sync_start_);
+      } else {
+        new_dispatch_expr = std::make_shared<Call>(call->op_, call->args_, call->kwargs_,
+                                                   WithManualDepEdgesAttr(call->attrs_, {barrier_var}),
+                                                   call->GetType(), call->span_);
+      }
+      auto new_assign = std::make_shared<AssignStmt>(assign->var_, new_dispatch_expr, assign->span_);
+
+      defined_tids_.insert(barrier_var.get());
+      for (const auto* root : roots_to_summarize) {
+        available_parent_deps_[root] = {barrier_var};
+      }
+
+      return {barrier_stmt, new_assign};
+    }
+
+    ProgramPtr program_;
+    std::vector<WindowWriteRecord> writer_records_;
+    std::unordered_set<const Var*> writer_tid_set_;
+    std::unordered_set<const Var*> defined_tids_;
+    std::unordered_map<const Var*, const WindowWriteRecord*> tid_to_record_;
+    std::unordered_map<const ForStmt*, std::vector<const WindowWriteRecord*>> records_by_loop_;
+    std::unordered_map<const Var*, std::vector<const WindowWriteRecord*>> records_by_loop_var_;
+    std::unordered_map<const Var*, std::vector<VarPtr>> available_parent_deps_;
+    AliasTracker alias_tracker_;
+    VarPtr current_assign_var_;
+
+    friend class BodyRewriter;
   };
 
   struct FinalStoreInfo {

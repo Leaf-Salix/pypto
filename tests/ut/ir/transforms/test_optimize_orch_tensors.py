@@ -18,6 +18,16 @@ import pytest
 from pypto import ir, passes
 
 
+def _call_name(expr) -> str:
+    if not isinstance(expr, ir.Call):
+        return ""
+    return getattr(getattr(expr, "op", None), "name", "")
+
+
+def _is_call_named(expr, *names: str) -> bool:
+    return _call_name(expr) in names
+
+
 class TestIterArgReuse:
     """Pattern 1: Merge Out params into In params via iter-arg feedback."""
 
@@ -117,7 +127,7 @@ class TestIterArgReuse:
 
         class _Collector(ir.IRVisitor):
             def visit_call(self, op):
-                name = getattr(getattr(op, "op", None), "name", "")
+                name = _call_name(op)
                 if name == "main_incore_0":
                     dv = (op.attrs or {}).get("dump_vars")
                     if dv:
@@ -1041,9 +1051,7 @@ class TestStaticOutputWindows:
             ) -> pl.Tensor[[256, 64], pl.FP32]:
                 out: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
                 row: pl.Scalar[pl.INDEX] = 64
-                out_next: pl.Tensor[[256, 64], pl.FP32] = self.kernel_stripe(
-                    data, row, 1.0, out
-                )
+                out_next: pl.Tensor[[256, 64], pl.FP32] = self.kernel_stripe(data, row, 1.0, out)
                 return out_next
 
         After = passes.optimize_orch_tensors()(Before)
@@ -1053,7 +1061,7 @@ class TestStaticOutputWindows:
 
         class _Collector(ir.IRVisitor):
             def visit_call(self, op):
-                call_names.append(getattr(getattr(op, "op", None), "name", ""))
+                call_names.append(_call_name(op))
                 super().visit_call(op)
 
         _Collector().visit_program(After)
@@ -1111,6 +1119,907 @@ class TestPattern3WhileLoop:
         # nowhere, and there is no iter-arg-fed In/Out merge.)
         ir.assert_structural_equal(After, Before)
 
+
+class TestWindowDependencyPlanner:
+    """WindowDependencyPlanner: barrier insertion and Array[TASK_ID] carry."""
+
+    @pytest.fixture(autouse=True)
+    def _no_roundtrip_verification(self):
+        from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+        instruments: list[_core_passes.PassInstrument] = [
+            _core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)
+        ]
+        with _core_passes.PassContext(instruments):
+            yield
+
+    def test_alias_tracker_reshapes_to_same_root(self):
+        """tensor.reshape and tensor.assemble chain resolves to the same root."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                bias: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, bias)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                out: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                row: pl.Scalar[pl.INDEX] = 64
+                out_next: pl.Tensor[[256, 64], pl.FP32] = self.kernel(data, row, 1.0, out)
+                return out_next
+
+        After = passes.optimize_orch_tensors()(Before)
+        windowed = After.get_function("kernel__windowed")
+        assert windowed is not None
+
+        call_names: list[str] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_call(self, op):
+                call_names.append(_call_name(op))
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        assert "tensor.precompute_static_windows" in call_names
+        assert "tensor.static_window_get" in call_names
+
+    def test_different_roots_no_false_dep(self):
+        """Two windowed writes to different parents must not produce cross-deps.
+
+        If q_proj writes to data_q and k_proj writes to data_k,
+        no task_dummy barrier should appear (different storage roots).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_q(
+                self,
+                data: pl.Tensor[[128, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                bias: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, bias)
+                ret: pl.Tensor[[128, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_k(
+                self,
+                data: pl.Tensor[[128, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                bias: pl.Scalar[pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, bias)
+                ret: pl.Tensor[[128, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data_q: pl.Tensor[[128, 64], pl.FP32],
+                data_k: pl.Tensor[[128, 64], pl.FP32],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                out_q: pl.Tensor[[128, 64], pl.FP32] = pl.create_tensor([128, 64], dtype=pl.FP32)
+                out_k: pl.Tensor[[128, 64], pl.FP32] = pl.create_tensor([128, 64], dtype=pl.FP32)
+                row: pl.Scalar[pl.INDEX] = 0
+                result_q: pl.Tensor[[128, 64], pl.FP32] = self.kernel_q(data_q, row, 1.0, out_q)
+                result_k: pl.Tensor[[128, 64], pl.FP32] = self.kernel_k(data_k, row, 1.0, out_k)
+                return result_k
+
+        After = passes.optimize_orch_tensors()(Before)
+
+        call_names: list[str] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_call(self, op):
+                call_names.append(_call_name(op))
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        dummy_calls = [name for name in call_names if name == "system.task_dummy"]
+        assert "system.task_dummy" not in call_names, (
+            f"Expected no cross-root task_dummy barriers, found: {dummy_calls}"
+        )
+
+    def test_submit_loop_writer_full_reader_uses_task_id_array_barrier(self):
+        """Loop-local submit writers are collected into Array[TASK_ID].
+
+        This is the indexer-like shape: the loop submits static output-window
+        writes to ``score``, then a later full-parent reader consumes ``score``.
+        The scalar writer tids are loop-local, so the pass must thread a
+        TaskId array through the loop and use that array to feed a barrier
+        before the full reader.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for bi in pl.range(4):
+                        row: pl.Scalar[pl.INDEX] = bi * 64
+                        _score_next, _tid = pl.submit(self.writer, data, row, score)
+                    result = self.reader(score, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        call_names: list[str] = []
+        submit_count = 0
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal submit_count, reader_dep_edges
+                if isinstance(op.value, ir.Submit):
+                    submit_count += 1
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+            def visit_call(self, op):
+                call_names.append(_call_name(op))
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        assert submit_count == 1
+        assert "tensor.precompute_static_windows" in call_names
+        assert "tensor.static_window_get" in call_names
+        assert "array.create" in call_names
+        assert "array.update_element" in call_names
+        assert "system.task_dummy" in call_names
+        assert reader_dep_edges == 1
+
+    def test_two_loop_writers_same_parent_keep_separate_task_id_arrays(self):
+        """Two loop writers to one parent must both feed the later full reader.
+
+        A single per-parent array would overwrite slot ``bi`` when the second
+        writer runs in the same iteration, leaving the reader dependent only on
+        the second writer. Keep one TaskId array per writer record instead.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer_a(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 32], pl.FP32] = pl.load(data, [row_offset, 0], [64, 32])
+                result: pl.Tile[[64, 32], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer_b(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 32], pl.FP32] = pl.load(data, [row_offset, 32], [64, 32])
+                result: pl.Tile[[64, 32], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 32], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for bi in pl.range(4):
+                        row: pl.Scalar[pl.INDEX] = bi * 64
+                        _score_a, _tid_a = pl.submit(self.writer_a, data, row, score)
+                        _score_b, _tid_b = pl.submit(self.writer_b, data, row, score)
+                    result = self.reader(score, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer_a__windowed") is not None
+        assert After.get_function("writer_b__windowed") is not None
+
+        array_create_count = 0
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal array_create_count, reader_dep_edges
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "array.create"):
+                    array_create_count += 1
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert array_create_count == 2
+        assert reader_dep_edges == 1
+
+    def test_scalar_submit_writer_full_reader_gets_dep(self):
+        """A scalar (non-loop) submit writer + later full reader must take a dep.
+
+        The writer tids are not loop-local, so the pass must drop the scalar
+        tid directly into ``available_parent_deps_`` for the canonical root
+        and the reader call's ``manual_dep_edges`` must reference it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    _score_next, _tid = pl.submit(self.writer, data, 0, score)
+                    result = self.reader(score, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        call_names: list[str] = []
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+            def visit_call(self, op):
+                call_names.append(_call_name(op))
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        assert "tensor.precompute_static_windows" in call_names
+        assert "tensor.static_window_get" in call_names
+        # Scalar writer does NOT need an Array[TASK_ID] carry.
+        assert "array.create" not in call_names
+        assert "array.update_element" not in call_names
+        assert "system.task_dummy" in call_names
+        assert reader_dep_edges == 1
+
+    def test_window_writer_full_reader_with_reshape_chain(self):
+        """Reader passes score through ``tensor.reshape``; the alias chain must
+        resolve to the writer's root so the dep is still inserted.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[128, 64], pl.FP32] = pl.load(data, [row_offset, 0], [128, 64])
+                result: pl.Tile[[128, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score_flat: pl.Tensor[[16384], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[16384], pl.FP32] = pl.load(score_flat, [0], [16384])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                # 1D reshape of the 2D parent — same root, same storage.
+                score_flat: pl.Tensor[[16384], pl.FP32] = pl.reshape(score, [16384])
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    _score_next, _tid = pl.submit(self.writer, data, 0, score)
+                    result = self.reader(score_flat, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert reader_dep_edges == 1, "reshape chain must still resolve to writer root and insert dep"
+
+    def test_loop_carried_parent_full_reader_gets_dep(self):
+        """Loop-carried tensor return aliases must resolve back to the init root."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for bi, (score_iter,) in pl.range(4, init_values=(score,)):
+                        row: pl.Scalar[pl.INDEX] = bi * 64
+                        score_next, _tid = pl.submit(self.writer, data, row, score_iter)
+                        score_final = pl.yield_(score_next)
+                    result = self.reader(score_final, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert reader_dep_edges == 1
+
+    def test_same_iteration_reader_gets_scalar_writer_dep(self):
+        """A reader after a writer in the same loop iteration uses that tid."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for bi in pl.range(4):
+                        row: pl.Scalar[pl.INDEX] = bi * 64
+                        _score_next, _tid = pl.submit(self.writer, data, row, score)
+                        result = self.reader(score, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert reader_dep_edges == 1
+
+    def test_loop_return_different_root_does_not_alias_init_root(self):
+        """A loop return var must not alias its init root if yield changes root."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                other: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for bi, (score_iter,) in pl.range(4, init_values=(score,)):
+                        row: pl.Scalar[pl.INDEX] = bi * 64
+                        _score_next, _tid = pl.submit(self.writer, data, row, score_iter)
+                        score_final = pl.yield_(other)
+                    result = self.reader(score_final, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert reader_dep_edges == 0
+
+    def test_metadata_alias_full_reader_gets_dep(self):
+        """Metadata-only tensor aliases should not hide a later full read."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                score_alias: pl.Tensor[[256, 64], pl.FP32] = pl.tensor.as_layout(
+                    score, layout=pl.TensorLayout.ND
+                )
+                result: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    _score_next, _tid = pl.submit(self.writer, data, 0, score)
+                    result = self.reader(score_alias, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        reader_dep_edges = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert reader_dep_edges == 1
+
+    def test_window_writer_then_disjoint_window_reader_no_dep(self):
+        """Two windows on the same parent that are provably disjoint must NOT
+        take a barrier dep. The reader reads a different row block from the
+        writer, so no TaskId edges should appear.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[128, 64], pl.FP32] = pl.load(data, [0, 0], [128, 64])
+                result: pl.Tile[[128, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                block: pl.Tensor[[128, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                tile: pl.Tile[[128, 64], pl.FP32] = pl.load(block, [0, 0], [128, 64])
+                ret: pl.Tensor[[128, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result: pl.Tensor[[128, 64], pl.FP32] = pl.create_tensor([128, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    # Writer covers rows [0, 128).
+                    _score_next, _tid = pl.submit(self.writer, data, score)
+                    # Reader covers rows [128, 256) — disjoint row block.
+                    disjoint_block: pl.Tensor[[128, 64], pl.FP32] = pl.slice(score, [128, 64], [128, 0])
+                    result = self.reader(disjoint_block, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+        reader_dep_edges = 0
+        task_dummy_count = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_edges, task_dummy_count
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader__windowed"):
+                    reader_dep_edges += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "system.task_dummy"):
+                    task_dummy_count += 1
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert reader_dep_edges == 0, "disjoint row block must not take writer dep"
+        # The windowed producer still emits its own task_dummy, but for the
+        # reader side, no extra barrier should be inserted.
+        assert task_dummy_count == 0, (
+            f"disjoint window reader must not need a barrier, got {task_dummy_count}"
+        )
+
+    def test_three_root_writes_no_cross_deps(self):
+        """q/k/v proj shape: three writers on three different storage roots
+        must not serialize. Even when one of them is followed by a full
+        reader, the dep must only land on the matching root.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[128, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[128, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                tensor: pl.Tensor[[128, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(tensor, [0, 0], [64, 64])
+                ret: pl.Tensor[[128, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data_q: pl.Tensor[[128, 64], pl.FP32],
+                data_k: pl.Tensor[[128, 64], pl.FP32],
+                data_v: pl.Tensor[[128, 64], pl.FP32],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                q_proj: pl.Tensor[[128, 64], pl.FP32] = pl.create_tensor([128, 64], dtype=pl.FP32)
+                k_proj: pl.Tensor[[128, 64], pl.FP32] = pl.create_tensor([128, 64], dtype=pl.FP32)
+                v_proj: pl.Tensor[[128, 64], pl.FP32] = pl.create_tensor([128, 64], dtype=pl.FP32)
+                result: pl.Tensor[[128, 64], pl.FP32] = pl.create_tensor([128, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    _q_next, _qt = pl.submit(self.writer, data_q, 0, q_proj)
+                    _k_next, _kt = pl.submit(self.writer, data_k, 0, k_proj)
+                    _v_next, _vt = pl.submit(self.writer, data_v, 0, v_proj)
+                    # Full reader consumes only q_proj — only _qt should be a dep.
+                    result = self.reader(q_proj, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+
+        call_names: list[str] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_call(self, op):
+                call_names.append(_call_name(op))
+                super().visit_call(op)
+
+        _Collector().visit_program(After)
+        # No writer of one root appears in another root's reader deps.
+        reader_dep_count = 0
+
+        class _ReaderDepCounter(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_count
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader__windowed"):
+                    reader_dep_count += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                super().visit_assign_stmt(op)
+
+        _ReaderDepCounter().visit_program(After)
+        # Only one writer matches q_proj's root → exactly one dep.
+        assert reader_dep_count == 1, f"q-only reader should take exactly 1 dep, got {reader_dep_count}"
+        # No barrier on k/v writers' roots (their tids are not consumed by q reader).
+        # The single barrier is created with the q writer tid only.
+
+    def test_unknown_alias_does_not_drop_dep(self):
+        """If a reader's arg type is unknown to the region analysis, the planner
+        must still conservatively insert a barrier (no false negative).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile: pl.Tile[[32, 64], pl.FP32] = pl.load(data, [0, 0], [32, 64])
+                result: pl.Tile[[32, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[64, 64], pl.FP32] = pl.store(result, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                src: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[32, 64], pl.FP32]],
+            ) -> pl.Tensor[[32, 64], pl.FP32]:
+                tile: pl.Tile[[32, 64], pl.FP32] = pl.load(src, [0, 0], [32, 64])
+                ret: pl.Tensor[[32, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[32, 64], pl.FP32]:
+                parent: pl.Tensor[[64, 64], pl.FP32] = pl.create_tensor([64, 64], dtype=pl.FP32)
+                result: pl.Tensor[[32, 64], pl.FP32] = pl.create_tensor([32, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    _next, _tid = pl.submit(self.writer, data, parent)
+                    # Reader gets a tensor variable with no alias chain in the
+                    # planner's pass-local view. Resolver returns nullopt and
+                    # planner conservatively inserts the dep.
+                    result = self.reader(parent, result)
+                return result
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        reader_dep_count = 0
+        task_dummy_count = 0
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                nonlocal reader_dep_count, task_dummy_count
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "reader", "reader__windowed"):
+                    reader_dep_count += len((op.value.attrs or {}).get("manual_dep_edges", []))
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "system.task_dummy"):
+                    task_dummy_count += 1
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert reader_dep_count == 1
+        assert task_dummy_count == 1
+
+    def test_full_reader_summarizes_pending_writer_deps_for_later_readers(self):
+        """A full reader compresses same-root pending writer deps into a barrier.
+
+        Without root-level summary, each later full reader would rescan and
+        depend on the whole writer TaskId array again. The first reader should
+        consume the array barrier; the second reader should depend only on the
+        first reader's barrier.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                result: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(result, [row_offset, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def reader(
+                self,
+                score: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(score, [0, 0], [64, 64])
+                ret: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [0, 0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+            ) -> pl.Tensor[[256, 64], pl.FP32]:
+                score: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result_a: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                result_b: pl.Tensor[[256, 64], pl.FP32] = pl.create_tensor([256, 64], dtype=pl.FP32)
+                with pl.manual_scope():
+                    for bi in pl.range(4):
+                        row: pl.Scalar[pl.INDEX] = bi * 64
+                        _score_next, _tid = pl.submit(self.writer, data, row, score)
+                    result_a = self.reader(score, result_a)
+                    result_b = self.reader(score, result_b)
+                return result_b
+
+        After = passes.optimize_orch_tensors()(Before)
+        assert After.get_function("writer__windowed") is not None
+
+        dummy_deps: list[list[str]] = []
+
+        class _Collector(ir.IRVisitor):
+            def visit_assign_stmt(self, op):
+                if isinstance(op.value, ir.Call) and _is_call_named(op.value, "system.task_dummy"):
+                    deps = (op.value.attrs or {}).get("manual_dep_edges", [])
+                    dummy_deps.append([dep.name_hint for dep in deps])
+                super().visit_assign_stmt(op)
+
+        _Collector().visit_program(After)
+        assert len(dummy_deps) == 2
+        assert any("final" in dep for dep in dummy_deps[0]), dummy_deps
+        assert len(dummy_deps[1]) == 1
+        assert "window_barrier_tid" in dummy_deps[1][0], dummy_deps
 
 
 if __name__ == "__main__":
