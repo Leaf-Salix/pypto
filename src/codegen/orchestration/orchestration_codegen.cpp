@@ -618,7 +618,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         // array-carry Var, copy slot-by-slot; otherwise broadcast the scalar
         // init expression to every slot.
         const int64_t N = array_sizes[i];
-        std::string rv_array_name = ReserveSyntheticEmitName(return_var->name_hint_ + "__array");
+        std::string rv_array_name = ReserveArrayCarryEmitName();
         code_ << Indent() << "PTO2TaskId " << rv_array_name << "[" << N << "];\n";
 
         auto outer_init_var = AsVarLike(iter_arg->initValue_);
@@ -696,7 +696,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         if (init_carry) {
           carry_name = init_carry->array_name;
         } else {
-          carry_name = ReserveSyntheticEmitName(return_var->name_hint_ + "__array");
+          carry_name = ReserveArrayCarryEmitName();
           code_ << Indent() << cpp_dtype << " " << carry_name << "[" << N << "];\n";
           code_ << Indent() << "for (int64_t __init_i = 0; __init_i < " << N << "; ++__init_i) " << carry_name
                 << "[__init_i] = " << init_var_name << "[__init_i];\n";
@@ -2777,6 +2777,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return auto_name::ReserveUniqueName(base_name, declared_var_names_);
   }
 
+  std::string ReserveArrayCarryEmitName() {
+    return ReserveSyntheticEmitName("__task_id_array_carry_" + std::to_string(array_carry_counter_++));
+  }
+
   /// Register ``var`` as backed by ``array_name[size]``; also populates the
   /// ``manual_task_id_map_`` with the per-slot expressions so EmitManualDeps
   /// emits one ``add_dep`` per slot when this Var appears as a deps source.
@@ -2924,6 +2928,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     int64_t size;
   };
   std::unordered_map<const Var*, ArrayCarryEntry> array_carry_vars_;
+  int array_carry_counter_ = 0;
   /// Names of mutable Tensor values declared in each generated C++ block.
   /// Tuple-output alias emission must avoid redeclaring names already declared
   /// in the same block, but must not treat outer-block declarations as aliases:
