@@ -618,7 +618,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         // array-carry Var, copy slot-by-slot; otherwise broadcast the scalar
         // init expression to every slot.
         const int64_t N = array_sizes[i];
-        std::string rv_array_name = ReserveSyntheticEmitName(return_var->name_hint_);
+        std::string rv_array_name = ReserveSyntheticEmitName(return_var->name_hint_ + "__array");
         code_ << Indent() << "PTO2TaskId " << rv_array_name << "[" << N << "];\n";
 
         auto outer_init_var = AsVarLike(iter_arg->initValue_);
@@ -696,7 +696,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         if (init_carry) {
           carry_name = init_carry->array_name;
         } else {
-          carry_name = ReserveSyntheticEmitName(return_var->name_hint_);
+          carry_name = ReserveSyntheticEmitName(return_var->name_hint_ + "__array");
           code_ << Indent() << cpp_dtype << " " << carry_name << "[" << N << "];\n";
           code_ << Indent() << "for (int64_t __init_i = 0; __init_i < " << N << "; ++__init_i) " << carry_name
                 << "[__init_i] = " << init_var_name << "[__init_i];\n";
