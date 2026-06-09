@@ -2762,7 +2762,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
 
     auto parsed = auto_name::Parse(var->name_hint_);
-    bool preserve_raw_name = parsed.role.has_value() && *parsed.role == "out";
+    bool preserve_raw_name =
+        As<ArrayType>(var->GetType()) || (parsed.role.has_value() && *parsed.role == "out");
     std::string base_name = GetSSABaseName(var->name_hint_);
     if (preserve_raw_name || declared_var_names_.count(base_name)) {
       base_name = var->name_hint_;
