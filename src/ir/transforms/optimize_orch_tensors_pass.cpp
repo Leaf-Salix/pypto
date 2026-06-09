@@ -2329,7 +2329,7 @@ class OutWindowExternalizer {
         if (slice_it != slices_by_out_index.end()) {
           new_args.push_back(slice_it->second.slice_var);
         } else {
-          new_args.push_back(MaterializeCallArgExpr(call->args_[i]));
+          new_args.push_back(VisitExpr(call->args_[i]));
         }
       }
 
@@ -2693,8 +2693,6 @@ class OutWindowExternalizer {
     ExprPtr MaterializeWindowParentExpr(const ExprPtr& expr) {
       return VisitExpr(ResolveLoopReturnInitExpr(expr));
     }
-
-    ExprPtr MaterializeCallArgExpr(const ExprPtr& expr) { return VisitExpr(ResolveLoopReturnInitExpr(expr)); }
 
     ExprPtr VisitExpr_(const TupleGetItemExprPtr& op) override {
       auto tuple_var = AsVarLike(op->tuple_);
