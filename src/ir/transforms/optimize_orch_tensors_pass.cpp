@@ -2449,7 +2449,7 @@ class StaticOutputWindowPlanner {
       }
 
       auto cloned_gvar = std::make_shared<GlobalVar>(cloned_func->name_);
-      const bool is_submit_call = IsSubmitCall(call);
+      const bool is_submit_call = submit != nullptr || IsSubmitCall(call);
       std::vector<TypePtr> result_types = cloned_func->return_types_;
       if (is_submit_call) {
         auto tuple_ty = As<TupleType>(call->GetType());
@@ -2538,14 +2538,14 @@ class StaticOutputWindowPlanner {
             std::make_shared<Var>(call_assign->var_->name_hint_ + "__tid", tid_type, call_assign->span_);
         stmts.push_back(std::make_shared<AssignStmt>(tid_var, tid_expr, call_assign->span_));
 
-        ForStmtPtr enclosing_sequential_loop;
+        ForStmtPtr enclosing_static_loop;
         ExprPtr window_index_expr;
-        if (!sequential_loops_.empty()) {
-          auto loop = sequential_loops_.back();
+        if (!loop_stack_.empty()) {
+          auto loop = loop_stack_.back();
           auto trip = GetStaticTripCount(loop);
           auto step = GetConstIntValue(loop->step_);
           if (trip.has_value() && *trip > 0 && step.has_value() && *step == 1) {
-            enclosing_sequential_loop = loop;
+            enclosing_static_loop = loop;
             window_index_expr = MakeSub(loop->loop_var_, loop->start_, loop->span_);
             window_index_expr = arith::Analyzer().Simplify(window_index_expr);
           }
@@ -2556,8 +2556,7 @@ class StaticOutputWindowPlanner {
           if (slice_it == slices_by_out_index.end()) continue;
           auto parent_it = group_id_to_parent_.find(slice_it->second.group_id);
           if (parent_it == group_id_to_parent_.end()) continue;
-          VarPtr enclosing_loop_var =
-              enclosing_sequential_loop ? enclosing_sequential_loop->loop_var_ : nullptr;
+          VarPtr enclosing_loop_var = enclosing_static_loop ? enclosing_static_loop->loop_var_ : nullptr;
           CanonicalRegion write_region;
           // Compute canonical write region for this output. Use a no-alias
           // tracker because the parent var is the resolved loop-init / out
@@ -2571,7 +2570,7 @@ class StaticOutputWindowPlanner {
             if (slice_region.has_value()) write_region = *slice_region;
           }
           writer_records_->push_back(WindowWriteRecord{tid_var, slice_it->second.group_id, parent_it->second,
-                                                       enclosing_sequential_loop, enclosing_loop_var,
+                                                       enclosing_static_loop, enclosing_loop_var,
                                                        window_index_expr, write_region});
         }
       }
@@ -3391,7 +3390,7 @@ class StaticOutputWindowPlanner {
         }
 
         auto for_stmt = As<ForStmt>(stmt);
-        if (for_stmt && for_stmt->kind_ != ForKind::Parallel) {
+        if (for_stmt) {
           auto rewritten_for = MaybeTransformForStmt(for_stmt);
           if (rewritten_for.has_value()) {
             changed = true;
