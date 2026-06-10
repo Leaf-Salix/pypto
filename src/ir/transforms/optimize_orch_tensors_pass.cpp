@@ -2653,15 +2653,21 @@ class OutWindowExternalizer {
         }
 
         void VisitStmt_(const ForStmtPtr& op) override {
-          ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&rewriter_->loop_iter_init_subst_,
-                                                              op->iter_args_);
-          IRVisitor::VisitStmt_(op);
+          {
+            ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&rewriter_->loop_iter_init_subst_,
+                                                                op->iter_args_);
+            IRVisitor::VisitStmt_(op);
+          }
+          rewriter_->RecordLoopReturnInitAliases(op);
         }
 
         void VisitStmt_(const WhileStmtPtr& op) override {
-          ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&rewriter_->loop_iter_init_subst_,
-                                                              op->iter_args_);
-          IRVisitor::VisitStmt_(op);
+          {
+            ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&rewriter_->loop_iter_init_subst_,
+                                                                op->iter_args_);
+            IRVisitor::VisitStmt_(op);
+          }
+          rewriter_->RecordLoopReturnInitAliases(op);
         }
 
         void VisitStmt_(const IfStmtPtr& op) override { IRVisitor::VisitStmt_(op); }

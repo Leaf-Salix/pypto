@@ -1298,6 +1298,48 @@ class TestOutWindowExternalizer:
         assert "write_prefix__windowed" not in printed_main
         assert "pl.tensor.slice(out" not in printed_main
 
+    def test_loop_return_alias_full_writer_blocks_prior_windowable_sibling(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def init_row(
+                self,
+                out: pl.Out[pl.Tensor[[4, 16], pl.INT32]],
+                row: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[4, 16], pl.INT32]:
+                invalid: pl.Tile[[1, 16], pl.INT32] = pl.tile.full([1, 16], dtype=pl.INT32, value=-1)
+                result: pl.Tensor[[4, 16], pl.INT32] = pl.tile.store(invalid, [row, 0], out)
+                return result
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def full_overwrite(
+                self,
+                out: pl.Out[pl.Tensor[[4, 16], pl.INT32]],
+            ) -> pl.Tensor[[4, 16], pl.INT32]:
+                value: pl.Tile[[4, 16], pl.INT32] = pl.tile.full([4, 16], dtype=pl.INT32, value=1)
+                result: pl.Tensor[[4, 16], pl.INT32] = pl.tile.store(value, [0, 0], out)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                out: pl.Out[pl.Tensor[[4, 16], pl.INT32]],
+            ) -> pl.Tensor[[4, 16], pl.INT32]:
+                init_next: pl.Tensor[[4, 16], pl.INT32] = self.init_row(out, 0)
+                for _, (out_iter,) in pl.range(1, init_values=(init_next,)):
+                    out_rv = pl.yield_(out_iter)
+                result: pl.Tensor[[4, 16], pl.INT32] = self.full_overwrite(out_rv)
+                return result
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        assert After.get_function("init_row__windowed") is None
+        assert After.get_function("full_overwrite__windowed") is None
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "init_row__windowed" not in printed_main
+        assert "full_overwrite__windowed" not in printed_main
+        assert "pl.tensor.slice(out" not in printed_main
+
     def test_windowable_writer_blocked_by_callsite_output_sibling(self):
         @pl.program
         class Before:
