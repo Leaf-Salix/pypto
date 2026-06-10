@@ -1135,6 +1135,40 @@ class TestOutWindowExternalizer:
         After = _run_to_optimize_orch_tensors(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_final_store_keeps_already_detected_input_window(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def mix_window(
+                self,
+                data: pl.Tensor[[64, 128], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                tile: pl.Tile[[32, 64], pl.FP32] = pl.tile.load(data, [row_offset, 0], [32, 64], [32, 64])
+                result: pl.Tensor[[64, 128], pl.FP32] = pl.tile.store(tile, [row_offset, 0], out)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[64, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                row: pl.Scalar[pl.INDEX] = 32
+                return self.mix_window(data, row, out)
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "mix_window__windowed" in printed_main
+        assert "pl.tensor.slice(data" in printed_main
+        assert "pl.tensor.slice(out" in printed_main
+
+        printed_windowed = ir.python_print(_get_function(After, "mix_window__windowed"))
+        assert "pl.tile.load(data__ssa_v0, [0, 0]" in printed_windowed
+        assert "pl.tile.store(tile__ssa_v0, [0, 0]" in printed_windowed
+
     def test_input_full_read_blocks_input_window_rewrite(self):
         @pl.program
         class Before:
@@ -1620,7 +1654,7 @@ class TestOutWindowExternalizer:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel_stripe__windowed(
                 self,
-                data: pl.Tensor[[256, 64], pl.FP32],
+                data: pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
                 row_offset: pl.Scalar[pl.INDEX],
                 bias: pl.Scalar[pl.FP32],
                 out: pl.Out[
@@ -1628,7 +1662,7 @@ class TestOutWindowExternalizer:
                 ],
             ) -> pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)]:
                 tile: pl.Tile[[64, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    data, [row_offset, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
+                    data, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
                 )
                 result: pl.Tile[[64, 64], pl.FP32, pl.Mem.Vec] = pl.tile.adds(tile, bias)
                 ret: pl.Tensor[
@@ -1642,10 +1676,11 @@ class TestOutWindowExternalizer:
                 data: pl.Tensor[[256, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
+                data__window = pl.tensor.slice(data, [64, 64], [64, 0])
                 out__window = pl.tensor.slice(out, [64, 64], [64, 0])
                 out_next__windowed: pl.Tensor[
                     [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
-                ] = self.kernel_stripe__windowed(data, 64, 1.0, out__window)
+                ] = self.kernel_stripe__windowed(data__window, 64, 1.0, out__window)
                 out_next = pl.tensor.assemble(out, out_next__windowed, [64, 0])
                 return out_next
 
@@ -1696,14 +1731,14 @@ class TestOutWindowExternalizer:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel_stripe__windowed(
                 self,
-                data: pl.Tensor[[256, 64], pl.FP32],
+                data: pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
                 row_offset: pl.Scalar[pl.INDEX],
                 out: pl.Out[
                     pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)]
                 ],
             ) -> pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)]:
                 tile: pl.Tile[[64, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    data, [row_offset, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
+                    data, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
                 )
                 ret: pl.Tensor[
                     [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
@@ -1716,10 +1751,11 @@ class TestOutWindowExternalizer:
                 data: pl.Tensor[[256, 64], pl.FP32],
                 out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> pl.Tensor[[256, 64], pl.FP32]:
+                data__window = pl.tensor.slice(data, [64, 64], [64, 0])
                 out__window = pl.tensor.slice(out, [64, 64], [64, 0])
                 result__windowed: pl.Tensor[
                     [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
-                ] = self.kernel_stripe__windowed(data, 64, out__window)
+                ] = self.kernel_stripe__windowed(data__window, 64, out__window)
                 result = pl.tensor.assemble(out, result__windowed, [64, 0])
                 return result
 
@@ -1964,7 +2000,7 @@ class TestOutWindowExternalizer:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel_stripe__windowed(
                 self,
-                data: pl.Tensor[[1024, 64], pl.FP32],
+                data: pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
                 row_offset: pl.Scalar[pl.INDEX],
                 bias: pl.Scalar[pl.FP32],
                 out: pl.Out[
@@ -1972,7 +2008,7 @@ class TestOutWindowExternalizer:
                 ],
             ) -> pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)]:
                 tile: pl.Tile[[64, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    data, [row_offset, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
+                    data, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
                 )
                 result: pl.Tile[[64, 64], pl.FP32, pl.Mem.Vec] = pl.tile.adds(tile, bias)
                 ret: pl.Tensor[
@@ -1989,10 +2025,11 @@ class TestOutWindowExternalizer:
                 for phase, (out_phase,) in pl.range(4, init_values=(out,)):
                     for branch, (out_branch,) in pl.parallel(4, init_values=(out_phase,)):
                         row: pl.Scalar[pl.INDEX] = (phase * 4 + branch) * 64
+                        data__window = pl.tensor.slice(data, [64, 64], [row, 0])
                         out_branch__window = pl.tensor.slice(out_branch, [64, 64], [row, 0])
                         out_next__windowed: pl.Tensor[
                             [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
-                        ] = self.kernel_stripe__windowed(data, row, 1.0, out_branch__window)
+                        ] = self.kernel_stripe__windowed(data__window, row, 1.0, out_branch__window)
                         out_next = pl.tensor.assemble(out_branch, out_next__windowed, [row, 0])
                         out_branch_next = pl.yield_(out_next)
                     out_phase_next = pl.yield_(out_branch_next)
@@ -2052,7 +2089,7 @@ class TestOutWindowExternalizer:
             @pl.function(type=pl.FunctionType.InCore)
             def kv_stripe__windowed(
                 self,
-                data: pl.Tensor[[256, 64], pl.FP32],
+                data: pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
                 row_offset: pl.Scalar[pl.INDEX],
                 k_out: pl.Out[
                     pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)]
@@ -2065,7 +2102,7 @@ class TestOutWindowExternalizer:
                 pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
             ]:
                 tile: pl.Tile[[64, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    data, [row_offset, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
+                    data, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
                 )
                 k_next: pl.Tensor[
                     [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
@@ -2083,12 +2120,13 @@ class TestOutWindowExternalizer:
                 k_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
                 v_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
             ) -> tuple[pl.Tensor[[256, 64], pl.FP32], pl.Tensor[[256, 64], pl.FP32]]:
+                data__window = pl.tensor.slice(data, [64, 64], [64, 0])
                 k_out__window = pl.tensor.slice(k_out, [64, 64], [64, 0])
                 v_out__window = pl.tensor.slice(v_out, [64, 64], [64, 0])
                 result__windowed: pl.Tuple[
                     pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
                     pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
-                ] = self.kv_stripe__windowed(data, 64, k_out__window, v_out__window)
+                ] = self.kv_stripe__windowed(data__window, 64, k_out__window, v_out__window)
                 result__windowed_0: pl.Tensor[
                     [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
                 ] = result__windowed[0]
@@ -2149,6 +2187,10 @@ class TestOutWindowExternalizer:
         printed_main = ir.python_print(_get_function(After, "main"))
         assert "pl.tensor.slice(k_out" in printed_main
         assert "pl.tensor.slice(v_out" in printed_main
+        assert "k_next__ssa_v0:" in printed_main
+        assert "= result__ssa_v0__assembled_1" in printed_main
+        assert "consume_full(k_next__ssa_v0)" in printed_main
+        assert "consume_full(k_out)" not in printed_main
 
     def test_tensor_full_root_later_parent_read_still_externalizes(self):
         @pl.program
@@ -2186,6 +2228,8 @@ class TestOutWindowExternalizer:
         assert After.get_function("kernel_stripe__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
         assert "pl.tensor.slice(out" in printed_main
+        assert "consume_full(out_next__ssa_v0)" in printed_main
+        assert "consume_full(out)" not in printed_main
 
     def test_loop_returned_output_later_parent_read_still_externalizes(self):
         @pl.program
@@ -2226,6 +2270,8 @@ class TestOutWindowExternalizer:
         assert After.get_function("kernel_rows__windowed") is not None
         printed_main = ir.python_print(_get_function(After, "main"))
         assert "pl.tensor.slice(out" in printed_main
+        assert "consume_full(out_next__ssa_v0)" in printed_main
+        assert "consume_full(out)" not in printed_main
 
     def test_multi_out_final_store_all_or_nothing_stays_baseline(self):
         @pl.program
@@ -3110,14 +3156,14 @@ class TestOutWindowExternalizer:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel_stripe__windowed(
                 self,
-                data: pl.Tensor[[256, 64], pl.FP32],
+                data: pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)],
                 row_offset: pl.Scalar[pl.INDEX],
                 out: pl.Out[
                     pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)]
                 ],
             ) -> pl.Tensor[[64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)]:
                 tile: pl.Tile[[64, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    data, [row_offset, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
+                    data, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec, transpose=False
                 )
                 ret: pl.Tensor[
                     [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
@@ -3136,10 +3182,11 @@ class TestOutWindowExternalizer:
                     pl.cond(row_iter < n)
                     row_next: pl.Scalar[pl.INDEX] = row_iter + 1
                     row_rv, out_rv = pl.yield_(row_next, out_iter)
+                data__window: pl.Tensor[[64, 64], pl.FP32] = pl.tensor.slice(data, [64, 64], [64, 0])
                 out__window: pl.Tensor[[64, 64], pl.FP32] = pl.tensor.slice(out, [64, 64], [64, 0])
                 result__windowed: pl.Tensor[
                     [64, 64], pl.FP32, pl.TensorView(stride=[64, 1], layout=pl.TensorLayout.ND)
-                ] = self.kernel_stripe__windowed(data, 64, out__window)
+                ] = self.kernel_stripe__windowed(data__window, 64, out__window)
                 result: pl.Tensor[[256, 64], pl.FP32] = pl.tensor.assemble(out, result__windowed, [64, 0])
                 return result
 
@@ -3436,7 +3483,10 @@ class TestOutWindowSubmitCall:
         After = passes.optimize_orch_tensors()(Before)
         printed_main = ir.python_print(_get_function(After, "main"))
         assert "kernel_stripe__windowed" in printed_main
+        assert "consume__windowed" not in printed_main
         assert "pl.tensor.slice(out" in printed_main
+        assert "pl.submit(consume, _submit_tmp__assembled_0, sink" in printed_main
+        assert "pl.submit(consume, out, sink" not in printed_main
 
 
 if __name__ == "__main__":

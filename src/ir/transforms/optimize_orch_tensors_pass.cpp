@@ -2176,6 +2176,7 @@ class OutWindowExternalizer {
       bool changed = false;
       auto saved_scalar_defs = scalar_defs_;
       auto saved_tuple_result_subst = tuple_result_subst_;
+      auto saved_window_parent_subst = window_parent_subst_;
       auto saved_sibling_output_alias_roots = sibling_output_alias_roots_;
       auto saved_sibling_unwindowable_output_roots = sibling_unwindowable_output_roots_;
       bool saved_sibling_output_summary_active = sibling_output_summary_active_;
@@ -2201,6 +2202,9 @@ class OutWindowExternalizer {
             }
             new_stmts.push_back(visited);
           }
+          for (const auto& [parent, replacement] : bundle->parent_substs) {
+            window_parent_subst_[parent] = replacement;
+          }
           continue;
         }
 
@@ -2216,6 +2220,7 @@ class OutWindowExternalizer {
 
       scalar_defs_ = std::move(saved_scalar_defs);
       tuple_result_subst_ = std::move(saved_tuple_result_subst);
+      window_parent_subst_ = std::move(saved_window_parent_subst);
       sibling_output_alias_roots_ = std::move(saved_sibling_output_alias_roots);
       sibling_unwindowable_output_roots_ = std::move(saved_sibling_unwindowable_output_roots);
       sibling_output_summary_active_ = saved_sibling_output_summary_active;
@@ -2232,6 +2237,7 @@ class OutWindowExternalizer {
 
     struct RewriteBundle {
       std::vector<StmtPtr> stmts;
+      std::vector<std::pair<const Var*, ExprPtr>> parent_substs;
     };
 
     struct LoopDisjointnessCandidate {
@@ -2314,6 +2320,7 @@ class OutWindowExternalizer {
       auto cloned_func = clone_it->second;
 
       if (analysis.outputs.empty() && analysis.inputs.empty()) return std::nullopt;
+      if (submit && analysis.outputs.empty()) return std::nullopt;
       if (analysis.outputs.empty() &&
           IsCallResultAssembledLater(call_assign->var_, assemble_source_indices, stmt_index)) {
         return std::nullopt;
@@ -2457,12 +2464,16 @@ class OutWindowExternalizer {
 
         RewriteBundle bundle;
         bundle.stmts = std::move(stmts);
+        if (auto parent_var = AsVarLike(slice_bundle.parent_expr)) {
+          bundle.parent_substs.emplace_back(parent_var.get(), call_assign->var_);
+        }
         return bundle;
       }
 
       std::vector<ExprPtr> assembled_result_exprs(result_types.size());
       std::vector<StmtPtr> tail_stmts;
       tail_stmts.reserve(analysis.outputs.size() * 2 + 1);
+      std::vector<std::pair<const Var*, ExprPtr>> bundle_parent_substs;
 
       std::unordered_map<size_t, VarPtr> tuple_items;
       for (const auto& output : analysis.outputs) {
@@ -2483,6 +2494,9 @@ class OutWindowExternalizer {
             call_assign->var_->span_);
         tail_stmts.push_back(std::make_shared<AssignStmt>(assembled_var, assemble_call, call_assign->span_));
         assembled_result_exprs[output.return_index] = assembled_var;
+        if (auto parent_var = AsVarLike(slice_bundle.parent_expr)) {
+          bundle_parent_substs.emplace_back(parent_var.get(), assembled_var);
+        }
       }
 
       for (size_t i = 0; i < assembled_result_exprs.size(); ++i) {
@@ -2504,6 +2518,7 @@ class OutWindowExternalizer {
 
       RewriteBundle bundle;
       bundle.stmts = std::move(stmts);
+      bundle.parent_substs = std::move(bundle_parent_substs);
       return bundle;
     }
 
@@ -2833,6 +2848,12 @@ class OutWindowExternalizer {
       return IRMutator::VisitExpr_(op);
     }
 
+    ExprPtr VisitExpr_(const VarPtr& op) override {
+      auto it = window_parent_subst_.find(op.get());
+      if (it != window_parent_subst_.end()) return VisitExpr(it->second);
+      return IRMutator::VisitExpr_(op);
+    }
+
     ProgramPtr program_;
     const AnalysisMap& analyses_;
     const std::unordered_map<std::string, FunctionPtr>& cloned_funcs_;
@@ -2843,6 +2864,7 @@ class OutWindowExternalizer {
     std::unordered_map<const Var*, ExprPtr> loop_return_init_subst_;
     std::unordered_map<const Var*, ExprPtr> scalar_defs_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
+    std::unordered_map<const Var*, ExprPtr> window_parent_subst_;
     std::unordered_map<const Var*, const Var*> sibling_output_alias_roots_;
     std::unordered_set<const Var*> sibling_unwindowable_output_roots_;
     std::unordered_map<std::string, std::vector<OutParamReturnMapping>> out_param_return_mappings_cache_;
@@ -3627,6 +3649,7 @@ class OutWindowExternalizer {
       }
       if (all_final && !analysis.outputs.empty()) {
         analysis.kind = RewriteKind::FinalStore;
+        analysis.inputs = std::move(input_windows);
         analyses.emplace(func->name_, std::move(analysis));
         continue;
       }

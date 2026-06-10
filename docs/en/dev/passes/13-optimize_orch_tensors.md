@@ -130,6 +130,8 @@ Input-window eligibility:
 - pure input-window shape and callee-local offset expressions may reference only callee params; after call-site substitution, those params may carry outer loop-affine values, and the windowed callee reads relative to `[0, ...]`
 - for `PureInputWindowConsumer`, if the matched window is full shape at zero offset, the pass skips it because slicing would not expose a narrower dependency
 - for `PureInputWindowConsumer`, callees with no data return stay full-tensor because such consumers may be side-effect or fence tasks whose full input intentionally carries a wider dependency
+- input-only `Submit` callsites stay full-tensor; inside `manual_scope`, a full input may intentionally carry a wider dependency even when the callee body reads a local window
+- when a callee also has an eligible output-window rewrite, any already proven pure input windows are preserved and materialized at the same callsite
 - for `AggregateInputWindowLoop`, all references must be inside one static `ForStmt`, at least one offset dimension must vary with that loop, and the aggregate window must equal the input parent shape; partial aggregate reads such as weight sub-windows remain full-tensor
 
 Non-goals and dependence model:
