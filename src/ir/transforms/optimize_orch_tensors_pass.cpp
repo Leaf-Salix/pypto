@@ -154,6 +154,55 @@ bool ExprReferencesOnlyVarsIn(const ExprPtr& expr, const std::unordered_set<cons
   return checker.ok();
 }
 
+std::unordered_set<const Var*> CollectAllowedVars(const std::vector<VarPtr>& vars,
+                                                  const Var* extra_allowed = nullptr) {
+  std::unordered_set<const Var*> allowed;
+  allowed.reserve(vars.size() + (extra_allowed ? 1 : 0));
+  for (const auto& var : vars) {
+    if (var) allowed.insert(var.get());
+  }
+  if (extra_allowed) allowed.insert(extra_allowed);
+  return allowed;
+}
+
+bool ExprsReferenceOnlyVarsIn(const std::vector<ExprPtr>& exprs,
+                              const std::unordered_set<const Var*>& allowed) {
+  for (const auto& expr : exprs) {
+    if (!ExprReferencesOnlyVarsIn(expr, allowed)) return false;
+  }
+  return true;
+}
+
+std::unordered_map<std::string, FunctionPtr> BuildFunctionLookup(const ProgramPtr& program) {
+  std::unordered_map<std::string, FunctionPtr> lookup;
+  if (!program) return lookup;
+  lookup.reserve(program->functions_.size());
+  for (const auto& [gvar, func] : program->functions_) {
+    if (func) lookup.emplace(func->name_, func);
+  }
+  return lookup;
+}
+
+using LoopIterInitSubstMap = std::unordered_map<const Var*, ExprPtr>;
+
+class ScopedLoopIterInitSubst {
+ public:
+  ScopedLoopIterInitSubst(LoopIterInitSubstMap* subst, const std::vector<IterArgPtr>& iter_args)
+      : subst_(subst), saved_(*subst) {
+    for (const auto& iter_arg : iter_args) {
+      if (iter_arg && iter_arg->initValue_) {
+        (*subst_)[iter_arg.get()] = iter_arg->initValue_;
+      }
+    }
+  }
+
+  ~ScopedLoopIterInitSubst() { *subst_ = std::move(saved_); }
+
+ private:
+  LoopIterInitSubstMap* subst_;
+  LoopIterInitSubstMap saved_;
+};
+
 bool IsAllZeroOffsets(const std::vector<ExprPtr>& offsets) {
   for (const auto& offset : offsets) {
     auto ci = As<ConstInt>(offset);
@@ -1811,8 +1860,7 @@ class SliceInputStridesOptimizer {
 // Supported shapes:
 // - FinalStore: single call writes one final local window of an Out param
 // - AggregateWindowLoop: an outlined non-builtin callee writes a loop-carried
-//   aggregate window into one or more Out params, and every rewritten Out can
-//   be proven disjoint across sequential sibling callsites.
+//   aggregate window into one or more Out params.
 //
 // Multi-Out policy is all-or-nothing: either every Out param is rewritten, or
 // the callee stays baseline.
@@ -1824,10 +1872,13 @@ class OutWindowExternalizer {
     auto analyses = Analyze(program);
     if (analyses.empty()) return program;
 
+    auto function_lookup = BuildFunctionLookup(program);
+
     std::unordered_map<std::string, FunctionPtr> cloned_funcs;
     for (const auto& [func_name, analysis] : analyses) {
-      auto callee = program->GetFunction(func_name);
-      if (!callee) continue;
+      auto callee_it = function_lookup.find(func_name);
+      if (callee_it == function_lookup.end()) continue;
+      auto callee = callee_it->second;
       auto cloned = RewriteCallee(program, callee, analysis);
       if (!cloned) continue;
       cloned_funcs.emplace(func_name, cloned);
@@ -1847,7 +1898,7 @@ class OutWindowExternalizer {
     bool changed = false;
     for (auto& func : new_functions) {
       if (!func || func->func_type_ != FunctionType::Orchestration) continue;
-      OrchRewriter rewriter(program, analyses, cloned_funcs);
+      OrchRewriter rewriter(program, analyses, cloned_funcs, function_lookup);
       auto new_body = rewriter.VisitStmt(func->body_);
       if (new_body.get() == func->body_.get()) continue;
       changed = true;
@@ -2048,6 +2099,9 @@ class OutWindowExternalizer {
       if (call->op_->name_ == "tile.load" && call->args_.size() >= 3) {
         offset_arg_index = 1;
       } else if (call->op_->name_ == "tensor.slice" && call->args_.size() >= 3) {
+        // Keep the localizer aligned with AnalyzeInputWindows(): only window
+        // reads that are already proven as a fixed tile.load/tensor.slice are
+        // rewritten, and tensor.slice only localizes the matched offset.
         offset_arg_index = 2;
       } else {
         return assign;
@@ -2075,43 +2129,43 @@ class OutWindowExternalizer {
   class OrchRewriter : public IRMutator {
    public:
     OrchRewriter(ProgramPtr program, const AnalysisMap& analyses,
-                 const std::unordered_map<std::string, FunctionPtr>& cloned_funcs)
-        : program_(std::move(program)), analyses_(analyses), cloned_funcs_(cloned_funcs) {}
+                 const std::unordered_map<std::string, FunctionPtr>& cloned_funcs,
+                 const std::unordered_map<std::string, FunctionPtr>& function_lookup)
+        : program_(std::move(program)),
+          analyses_(analyses),
+          cloned_funcs_(cloned_funcs),
+          function_lookup_(function_lookup) {}
 
    protected:
     StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-      auto saved_loop_iter_init_subst = loop_iter_init_subst_;
-      for (const auto& iter_arg : op->iter_args_) {
-        if (iter_arg && iter_arg->initValue_) loop_iter_init_subst_[iter_arg.get()] = iter_arg->initValue_;
-      }
-
       bool is_sequential = op->kind_ != ForKind::Parallel;
-      if (is_sequential) {
-        sequential_loops_.push_back(op);
-        loop_local_allocs_.emplace_back(CollectLoopLocalTensorAllocs(op));
+      StmtPtr result;
+      {
+        ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&loop_iter_init_subst_, op->iter_args_);
+
+        if (is_sequential) {
+          sequential_loops_.push_back(op);
+          loop_local_allocs_.emplace_back(CollectLoopLocalTensorAllocs(op));
+        }
+        result = IRMutator::VisitStmt_(op);
+        if (is_sequential) {
+          loop_local_allocs_.pop_back();
+          sequential_loops_.pop_back();
+        }
       }
-      auto result = IRMutator::VisitStmt_(op);
-      if (is_sequential) {
-        loop_local_allocs_.pop_back();
-        sequential_loops_.pop_back();
-      }
-      loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
       RecordLoopReturnInitAliases(op);
       return result;
     }
 
     StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
-      auto saved_loop_iter_init_subst = loop_iter_init_subst_;
-      for (const auto& iter_arg : op->iter_args_) {
-        if (iter_arg && iter_arg->initValue_) {
-          loop_iter_init_subst_[iter_arg.get()] = iter_arg->initValue_;
-        }
+      StmtPtr result;
+      {
+        ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&loop_iter_init_subst_, op->iter_args_);
+        ++while_depth_;
+        result = IRMutator::VisitStmt_(op);
+        --while_depth_;
       }
-      ++while_depth_;
-      auto result = IRMutator::VisitStmt_(op);
-      --while_depth_;
       auto visited_loop = As<WhileStmt>(result);
-      loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
       RecordLoopReturnInitAliases(visited_loop ? visited_loop : op);
       return result;
     }
@@ -2122,17 +2176,11 @@ class OutWindowExternalizer {
       bool changed = false;
       auto saved_scalar_defs = scalar_defs_;
       auto saved_tuple_result_subst = tuple_result_subst_;
-      auto saved_sibling_output_parent_counts = sibling_output_parent_counts_;
       auto saved_sibling_output_alias_roots = sibling_output_alias_roots_;
       bool saved_sibling_output_summary_active = sibling_output_summary_active_;
       auto later_assemble_source_indices = CollectAssembleSourceIndices(op->stmts_);
       if (!sibling_output_summary_active_) {
-        auto local_sibling_output_parent_counts = CollectSiblingOutputParentCounts(op->stmts_);
-        sibling_output_parent_counts_ = saved_sibling_output_parent_counts;
-        for (const auto& [root, count] : local_sibling_output_parent_counts) {
-          auto& accumulated = sibling_output_parent_counts_[root];
-          accumulated = std::max(accumulated, count);
-        }
+        CollectSiblingOutputAliases(op->stmts_);
         sibling_output_summary_active_ = true;
       }
 
@@ -2167,7 +2215,6 @@ class OutWindowExternalizer {
 
       scalar_defs_ = std::move(saved_scalar_defs);
       tuple_result_subst_ = std::move(saved_tuple_result_subst);
-      sibling_output_parent_counts_ = std::move(saved_sibling_output_parent_counts);
       sibling_output_alias_roots_ = std::move(saved_sibling_output_alias_roots);
       sibling_output_summary_active_ = saved_sibling_output_summary_active;
       if (!changed) return op;
@@ -2258,7 +2305,7 @@ class OutWindowExternalizer {
       if (analysis_it == analyses_.end()) return std::nullopt;
       auto clone_it = cloned_funcs_.find(callee_name);
       if (clone_it == cloned_funcs_.end()) return std::nullopt;
-      auto original_func = program_ ? program_->GetFunction(callee_name) : nullptr;
+      auto original_func = LookupFunction(callee_name);
       if (!original_func) return std::nullopt;
 
       const auto& analysis = analysis_it->second;
@@ -2275,13 +2322,13 @@ class OutWindowExternalizer {
         callsite_subst[original_func->params_[i].get()] = call->args_[i];
       }
       if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
-      if (!ProveSiblingOutputWindowsDisjoint(call, analysis)) return std::nullopt;
 
       std::unordered_map<size_t, VarPtr> slices_by_in_index;
       std::unordered_map<size_t, SliceBundle> slices_by_out_index;
       std::vector<StmtPtr> stmts;
       stmts.reserve((analysis.inputs.size() + analysis.outputs.size()) * 2 + 2);
 
+      arith::Analyzer input_offset_analyzer;
       for (const auto& input : analysis.inputs) {
         if (input.in_param_index >= call->args_.size()) return std::nullopt;
         auto in_arg = AsVarLike(call->args_[input.in_param_index]);
@@ -2296,10 +2343,9 @@ class OutWindowExternalizer {
 
         std::vector<ExprPtr> offset_exprs;
         offset_exprs.reserve(input.callsite_offsets.size());
-        arith::Analyzer offset_analyzer;
         for (const auto& offset : input.callsite_offsets) {
           offset_exprs.push_back(
-              offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst)));
+              input_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst)));
         }
         auto offset_tuple = std::make_shared<MakeTuple>(offset_exprs, call_assign->span_);
 
@@ -2312,6 +2358,7 @@ class OutWindowExternalizer {
         slices_by_in_index.emplace(input.in_param_index, slice_var);
       }
 
+      arith::Analyzer output_offset_analyzer;
       for (const auto& output : analysis.outputs) {
         if (output.out_param_index >= call->args_.size()) return std::nullopt;
         auto out_arg = AsVarLike(call->args_[output.out_param_index]);
@@ -2326,10 +2373,9 @@ class OutWindowExternalizer {
 
         std::vector<ExprPtr> offset_exprs;
         offset_exprs.reserve(output.callsite_offsets.size());
-        arith::Analyzer offset_analyzer;
         for (const auto& offset : output.callsite_offsets) {
           offset_exprs.push_back(
-              offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst)));
+              output_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst)));
         }
         auto offset_tuple = std::make_shared<MakeTuple>(offset_exprs, call_assign->span_);
 
@@ -2520,18 +2566,14 @@ class OutWindowExternalizer {
       return root;
     }
 
-    std::unordered_map<const Var*, size_t> CollectSiblingOutputParentCounts(
-        const std::vector<StmtPtr>& sibling_stmts) {
+    void CollectSiblingOutputAliases(const std::vector<StmtPtr>& sibling_stmts) {
       std::unordered_map<const Var*, std::vector<const Var*>> sibling_tuple_output_roots;
-      std::vector<const Var*> output_roots;
-      output_roots.reserve(sibling_stmts.size());
 
       class SiblingWriterCollector : public IRVisitor {
        public:
         SiblingWriterCollector(OrchRewriter* rewriter,
-                               std::unordered_map<const Var*, std::vector<const Var*>>* tuple_output_roots,
-                               std::vector<const Var*>* output_roots)
-            : rewriter_(rewriter), tuple_output_roots_(tuple_output_roots), output_roots_(output_roots) {}
+                               std::unordered_map<const Var*, std::vector<const Var*>>* tuple_output_roots)
+            : rewriter_(rewriter), tuple_output_roots_(tuple_output_roots) {}
 
        protected:
         void VisitStmt_(const AssignStmtPtr& op) override {
@@ -2560,7 +2602,7 @@ class OutWindowExternalizer {
             return;
           }
 
-          auto callee = rewriter_->program_ ? rewriter_->program_->GetFunction(call->op_->name_) : nullptr;
+          auto callee = rewriter_->LookupFunction(call->op_->name_);
           if (!callee) {
             IRVisitor::VisitStmt_(op);
             return;
@@ -2574,7 +2616,6 @@ class OutWindowExternalizer {
               continue;
             }
             if (const Var* parent_root = rewriter_->ResolveOutputParentRoot(call, i)) {
-              output_roots_->push_back(parent_root);
               single_output_root = parent_root;
               ++output_root_count;
             }
@@ -2598,61 +2639,28 @@ class OutWindowExternalizer {
         }
 
         void VisitStmt_(const ForStmtPtr& op) override {
-          auto saved_loop_iter_init_subst = rewriter_->loop_iter_init_subst_;
-          for (const auto& iter_arg : op->iter_args_) {
-            if (iter_arg && iter_arg->initValue_) {
-              rewriter_->loop_iter_init_subst_[iter_arg.get()] = iter_arg->initValue_;
-            }
-          }
+          ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&rewriter_->loop_iter_init_subst_,
+                                                              op->iter_args_);
           IRVisitor::VisitStmt_(op);
-          rewriter_->loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
         }
 
         void VisitStmt_(const WhileStmtPtr& op) override {
-          auto saved_loop_iter_init_subst = rewriter_->loop_iter_init_subst_;
-          for (const auto& iter_arg : op->iter_args_) {
-            if (iter_arg && iter_arg->initValue_) {
-              rewriter_->loop_iter_init_subst_[iter_arg.get()] = iter_arg->initValue_;
-            }
-          }
+          ScopedLoopIterInitSubst scoped_loop_iter_init_subst(&rewriter_->loop_iter_init_subst_,
+                                                              op->iter_args_);
           IRVisitor::VisitStmt_(op);
-          rewriter_->loop_iter_init_subst_ = std::move(saved_loop_iter_init_subst);
         }
+
+        void VisitStmt_(const IfStmtPtr& op) override { IRVisitor::VisitStmt_(op); }
 
        private:
         OrchRewriter* rewriter_;
         std::unordered_map<const Var*, std::vector<const Var*>>* tuple_output_roots_;
-        std::vector<const Var*>* output_roots_;
       };
 
-      SiblingWriterCollector collector(this, &sibling_tuple_output_roots, &output_roots);
+      SiblingWriterCollector collector(this, &sibling_tuple_output_roots);
       for (const auto& sibling_stmt : sibling_stmts) {
         collector.VisitStmt(sibling_stmt);
       }
-
-      std::unordered_map<const Var*, size_t> counts;
-      counts.reserve(output_roots.size());
-      for (const auto& output_root : output_roots) {
-        const Var* root = output_root;
-        std::unordered_set<const Var*> seen;
-        while (root && seen.insert(root).second) {
-          auto it = sibling_output_alias_roots_.find(root);
-          if (it == sibling_output_alias_roots_.end()) break;
-          root = it->second;
-        }
-        if (root) ++counts[root];
-      }
-      return counts;
-    }
-
-    bool ProveSiblingOutputWindowsDisjoint(const CallPtr& call, const CalleeRewriteAnalysis& analysis) const {
-      for (const auto& output : analysis.outputs) {
-        const Var* parent_root = ResolveOutputParentRoot(call, output.out_param_index);
-        if (!parent_root) return false;
-        auto count_it = sibling_output_parent_counts_.find(parent_root);
-        if (count_it != sibling_output_parent_counts_.end() && count_it->second > 1) return false;
-      }
-      return true;
     }
 
     bool ProveCallsiteDisjointness(const AssignStmtPtr& call_assign, const CallPtr& call,
@@ -2668,7 +2676,7 @@ class OutWindowExternalizer {
       }
       if (candidate_loops.empty()) return true;
 
-      auto original_func = program_ ? program_->GetFunction(call->op_->name_) : nullptr;
+      auto original_func = LookupFunction(call->op_->name_);
       if (!original_func) return false;
 
       std::unordered_map<const Var*, ExprPtr> callsite_subst;
@@ -2763,6 +2771,12 @@ class OutWindowExternalizer {
       return VisitExpr(ResolveLoopReturnInitExpr(expr));
     }
 
+    FunctionPtr LookupFunction(const std::string& name) const {
+      auto it = function_lookup_.find(name);
+      if (it == function_lookup_.end()) return nullptr;
+      return it->second;
+    }
+
     ExprPtr VisitExpr_(const TupleGetItemExprPtr& op) override {
       auto tuple_var = AsVarLike(op->tuple_);
       if (tuple_var) {
@@ -2778,13 +2792,13 @@ class OutWindowExternalizer {
     ProgramPtr program_;
     const AnalysisMap& analyses_;
     const std::unordered_map<std::string, FunctionPtr>& cloned_funcs_;
+    const std::unordered_map<std::string, FunctionPtr>& function_lookup_;
     std::vector<ForStmtPtr> sequential_loops_;
     std::vector<std::unordered_set<const Var*>> loop_local_allocs_;
     std::unordered_map<const Var*, ExprPtr> loop_iter_init_subst_;
     std::unordered_map<const Var*, ExprPtr> loop_return_init_subst_;
     std::unordered_map<const Var*, ExprPtr> scalar_defs_;
     std::unordered_map<const Var*, std::vector<ExprPtr>> tuple_result_subst_;
-    std::unordered_map<const Var*, size_t> sibling_output_parent_counts_;
     std::unordered_map<const Var*, const Var*> sibling_output_alias_roots_;
     std::unordered_map<std::string, std::vector<OutParamReturnMapping>> out_param_return_mappings_cache_;
     bool sibling_output_summary_active_ = false;
@@ -3092,8 +3106,7 @@ class OutWindowExternalizer {
     if (!func) return inputs;
     if (func->return_types_.empty()) return inputs;
 
-    std::unordered_set<const Var*> allowed_params;
-    for (const auto& param : func->params_) allowed_params.insert(param.get());
+    auto allowed_params = CollectAllowedVars(func->params_);
 
     std::unordered_map<const Var*, size_t> candidate_indices;
     std::vector<std::pair<const Var*, size_t>> ordered_candidates;
@@ -3138,20 +3151,10 @@ class OutWindowExternalizer {
       // Pure input windows must be materializable from call arguments alone.
       // Loop-affine input windows are handled by aggregate-loop analysis, so a
       // nested loop var here intentionally keeps the full input.
-      bool exprs_ok = true;
-      for (const auto& expr : matched->window_shape) {
-        if (!ExprReferencesOnlyVarsIn(expr, allowed_params)) {
-          exprs_ok = false;
-          break;
-        }
+      if (!ExprsReferenceOnlyVarsIn(matched->window_shape, allowed_params) ||
+          !ExprsReferenceOnlyVarsIn(matched->offsets, allowed_params)) {
+        continue;
       }
-      for (const auto& expr : matched->offsets) {
-        if (!ExprReferencesOnlyVarsIn(expr, allowed_params)) {
-          exprs_ok = false;
-          break;
-        }
-      }
-      if (!exprs_ok) continue;
 
       std::vector<ExprPtr> local_zero_offsets;
       local_zero_offsets.reserve(matched->offsets.size());
@@ -3197,9 +3200,7 @@ class OutWindowExternalizer {
     for (const auto& use : uses) matched_refs += use.param_refs_in_stmt;
     if (uses.empty() || matched_refs != total_refs) return std::nullopt;
 
-    std::unordered_set<const Var*> allowed;
-    for (const auto& func_param : func->params_) allowed.insert(func_param.get());
-    allowed.insert(loop->loop_var_.get());
+    auto allowed = CollectAllowedVars(func->params_, loop->loop_var_.get());
 
     std::optional<InputRewriteInfo> result;
     for (const auto& use : uses) {
@@ -3254,13 +3255,10 @@ class OutWindowExternalizer {
       }
     }
 
-    std::unordered_set<const Var*> allowed_params;
-    for (const auto& func_param : func->params_) allowed_params.insert(func_param.get());
-    for (const auto& expr : result->window_shape) {
-      if (!ExprReferencesOnlyVarsIn(expr, allowed_params)) return std::nullopt;
-    }
-    for (const auto& expr : result->callsite_offsets) {
-      if (!ExprReferencesOnlyVarsIn(expr, allowed_params)) return std::nullopt;
+    auto allowed_params = CollectAllowedVars(func->params_);
+    if (!ExprsReferenceOnlyVarsIn(result->window_shape, allowed_params) ||
+        !ExprsReferenceOnlyVarsIn(result->callsite_offsets, allowed_params)) {
+      return std::nullopt;
     }
     return result;
   }
@@ -3452,9 +3450,7 @@ class OutWindowExternalizer {
 
     if (!yield_stmt || updates_by_iter_arg_index.size() != loop_matches.size()) return std::nullopt;
 
-    std::unordered_set<const Var*> allowed;
-    for (const auto& param : func->params_) allowed.insert(param.get());
-    allowed.insert(loop->loop_var_.get());
+    auto allowed = CollectAllowedVars(func->params_, loop->loop_var_.get());
 
     CalleeRewriteAnalysis analysis;
     analysis.kind = RewriteKind::AggregateWindowLoop;
@@ -3568,22 +3564,9 @@ class OutWindowExternalizer {
           break;
         }
 
-        std::unordered_set<const Var*> allowed_params;
-        for (const auto& param : func->params_) allowed_params.insert(param.get());
-        bool exprs_ok = true;
-        for (const auto& expr : info->window_shape) {
-          if (!ExprReferencesOnlyVarsIn(expr, allowed_params)) {
-            exprs_ok = false;
-            break;
-          }
-        }
-        for (const auto& expr : info->offsets) {
-          if (!ExprReferencesOnlyVarsIn(expr, allowed_params)) {
-            exprs_ok = false;
-            break;
-          }
-        }
-        if (!exprs_ok) {
+        auto allowed_params = CollectAllowedVars(func->params_);
+        if (!ExprsReferenceOnlyVarsIn(info->window_shape, allowed_params) ||
+            !ExprsReferenceOnlyVarsIn(info->offsets, allowed_params)) {
           all_final = false;
           break;
         }

@@ -575,7 +575,10 @@ class TestFlattenTileNdTo2DDynamicValid:
 
         after_func = after.get_function("cast_incore")
         assert after_func is not None
-        loads = [c for c in _tile_calls(after_func.body) if c.op.name == "tile.load"]
+        tile_calls = _tile_calls(after_func.body)
+        assert tile_calls, "expected flattened tile ops in the rewritten body"
+        assert all(len(cast(ir.TileType, call.type).shape) == 2 for call in tile_calls)
+        loads = [c for c in tile_calls if c.op.name == "tile.load"]
         assert loads, "expected a tile.load in the flattened body"
         load_type = cast(ir.TileType, loads[0].type)
         # Physical shape flattened to 2D and is fully static.

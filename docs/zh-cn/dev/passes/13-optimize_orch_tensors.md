@@ -91,9 +91,10 @@ in_window = pl.tensor.slice(inp, shape, offset)
 result = self.consumer__windowed(in_window, ...)
 ```
 
-如果待物化 slice 的 parent 是循环返回 alias，pass 会把这个 parent 改写为该循环
-codegen 可见的 init tensor，避免生成的 orchestration C++ 在作用域外引用 loop-return
-SSA 名字。循环体内部的 loop-carried iter-arg 不会被这样折叠。
+如果待物化 slice 的 parent 是循环返回 alias，pass 会对 `ForStmt` 和 `WhileStmt`
+都把这个 parent 改写为该循环 codegen 可见的 init tensor，避免生成的
+orchestration C++ 在作用域外引用 loop-return SSA 名字。循环体内部的
+loop-carried iter-arg 不会被这样折叠。
 
 本 pass 有意保持保守的 window eligibility。它不会按 `topk` 等算子名字做特判；只有 callee 函数体能证明满足下面的访问模式时，才会 window 化。
 
@@ -111,7 +112,8 @@ SSA 名字。循环体内部的 loop-carried iter-arg 不会被这样折叠。
 - offset 必须是该 pass 可接受的外层循环变量仿射表达式
 - multi-`Out` 改写采用全有或全无策略
 - 顺序循环 sibling 只有在每个被改写 `Out` 都能证明跨 sibling iteration 不重叠时才改写
-- 同一 scope 内写入同一 parent 或 alias parent tensor 的 sibling writer，只有在 pass 能证明输出 window 彼此独立时才 eligible；否则这些 call 保持 baseline/full-tensor
+- 同一 scope 内写入同一 parent 或 alias parent tensor 的 sibling writer，只要每个 writer 自身满足静态 output-window eligibility，仍然可以 externalize；写写/写读顺序交给 runtime TensorMap 对实际 submit 的 window descriptor 做 overlap 建边
+- sibling-writer alias 收集会递归进入嵌套 `SeqStmts`、`ForStmt`、`WhileStmt` 和 `IfStmt` body，因此 loop return、tuple projection 这类 tensor alias 会先折叠到 codegen 可见的 parent，再生成 call-site slice
 - 后续 full-parent read 不会关闭输出 window；callsite 暴露真实窗口张量之后，正确性依赖 runtime TensorMap overlap dependence
 
 输入窗口 eligibility：
@@ -123,6 +125,7 @@ SSA 名字。循环体内部的 loop-carried iter-arg 不会被这样折叠。
 - `tile.load` 的 read shape 必须等于候选 window shape
 - 所有匹配引用必须具有相同 window shape 和 offset
 - 如果存在任何 unsupported ref，则整个输入参数保持 full-tensor
+- pure input-window 的 shape 和 callee-local offset 表达式只能引用 callee 参数；callsite 替换后这些参数可以携带外层 loop-affine 值，windowed callee 内部再相对 `[0, ...]` 读取
 - 对 `PureInputWindowConsumer`，如果匹配出的窗口其实是 zero offset 的 full shape，则跳过，因为 slice 不能暴露更窄依赖
 - 对 `PureInputWindowConsumer`，如果 callee 没有数据返回，则保持 full-tensor；这类 consumer 可能是 side-effect 或 fence task，full input 本身用于表达更宽的依赖
 - 对 `AggregateInputWindowLoop`，所有引用必须位于同一个静态 `ForStmt` 内，至少一个 offset 维度必须随该 loop 变化，并且聚合窗口必须等于输入 parent shape；权重子窗口这类 partial aggregate read 仍保持 full-tensor
