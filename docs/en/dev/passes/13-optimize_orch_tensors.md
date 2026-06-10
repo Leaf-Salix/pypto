@@ -112,6 +112,7 @@ Output-window eligibility:
 - window shape and offset must be statically known enough to materialize a `tensor.slice`
 - offsets must be affine in the surrounding loop variables accepted by the pass
 - multi-`Out` rewrites are all-or-nothing
+- if multiple externalized `Out` params at the same callsite resolve to the same parent tensor, that callsite stays full-tensor; Pattern 5 does not chain multiple `tensor.assemble` updates into one parent state
 - sequential-loop siblings are rewritten only when every rewritten `Out` can be proven disjoint across sibling iterations
 - same-scope sibling writers to the same parent or aliased parent tensor may still be externalized when each individual writer satisfies the static output-window eligibility rules; however, if that parent also has a sibling full writer (`Out` or `InOut`) that cannot be externalized as an output window, other writers to the same parent stay full-tensor so the non-window writer does not hide partially initialized regions
 - write/write and write/read ordering for the remaining windowed writers is delegated to runtime TensorMap overlap on the actually submitted window descriptors

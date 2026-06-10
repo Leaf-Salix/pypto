@@ -2144,6 +2144,42 @@ class TestOutWindowExternalizer:
         After = _run_to_optimize_orch_tensors(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_multi_out_same_callsite_parent_stays_baseline(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kv_stripe(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                row_offset: pl.Scalar[pl.INDEX],
+                k_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+                v_out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> tuple[pl.Tensor[[256, 64], pl.FP32], pl.Tensor[[256, 64], pl.FP32]]:
+                tile: pl.Tile[[64, 64], pl.FP32] = pl.load(data, [row_offset, 0], [64, 64])
+                k_next: pl.Tensor[[256, 64], pl.FP32] = pl.store(tile, [row_offset, 0], k_out)
+                v_tile: pl.Tile[[64, 64], pl.FP32] = pl.add(tile, tile)
+                v_next: pl.Tensor[[256, 64], pl.FP32] = pl.store(v_tile, [row_offset, 0], v_out)
+                return k_next, v_next
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                data: pl.Tensor[[256, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 64], pl.FP32]],
+            ) -> tuple[pl.Tensor[[256, 64], pl.FP32], pl.Tensor[[256, 64], pl.FP32]]:
+                row: pl.Scalar[pl.INDEX] = 64
+                result: tuple[pl.Tensor[[256, 64], pl.FP32], pl.Tensor[[256, 64], pl.FP32]] = self.kv_stripe(
+                    data, row, out, out
+                )
+                return result
+
+        After = _run_to_optimize_orch_tensors(Before)
+
+        printed_main = ir.python_print(_get_function(After, "main"))
+        assert "kv_stripe__windowed" not in printed_main
+        assert "pl.tensor.slice(out" not in printed_main
+        assert "pl.tensor.assemble(out" not in printed_main
+
     def test_return_reordered_multi_out_later_parent_read_still_externalizes(self):
         @pl.program
         class Before:

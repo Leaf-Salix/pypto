@@ -2332,6 +2332,7 @@ class OutWindowExternalizer {
       }
       if (!ProveCallsiteDisjointness(call_assign, call, analysis)) return std::nullopt;
       if (HasUnwindowableSiblingOutputWriter(call, analysis)) return std::nullopt;
+      if (HasDuplicateExternalizedOutputParent(call, analysis)) return std::nullopt;
 
       std::unordered_map<size_t, VarPtr> slices_by_in_index;
       std::unordered_map<size_t, SliceBundle> slices_by_out_index;
@@ -2718,6 +2719,17 @@ class OutWindowExternalizer {
         const Var* parent_root = ResolveOutputParentRoot(call, output.out_param_index);
         if (!parent_root) return true;
         if (sibling_unwindowable_output_roots_.count(parent_root)) return true;
+      }
+      return false;
+    }
+
+    bool HasDuplicateExternalizedOutputParent(const CallPtr& call,
+                                              const CalleeRewriteAnalysis& analysis) const {
+      std::unordered_set<const Var*> seen_roots;
+      for (const auto& output : analysis.outputs) {
+        const Var* parent_root = ResolveOutputParentRoot(call, output.out_param_index);
+        if (!parent_root) return true;
+        if (!seen_roots.insert(parent_root).second) return true;
       }
       return false;
     }
