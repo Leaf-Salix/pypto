@@ -3538,7 +3538,7 @@ class OutWindowExternalizer {
       auto stop = analyzer->Simplify(transform_utils::Substitute(dynamic.loop_stop, callsite_subst));
       auto step = analyzer->Simplify(transform_utils::Substitute(dynamic.loop_step, callsite_subst));
       stmts->push_back(std::make_shared<AssignStmt>(
-          scan_min_init, std::make_shared<ConstInt>(2147483647, DataType::INDEX, call_assign->span_),
+          scan_min_init, std::make_shared<ConstInt>(INT64_MAX, DataType::INDEX, call_assign->span_),
           call_assign->span_));
       stmts->push_back(std::make_shared<AssignStmt>(
           scan_max_init, std::make_shared<ConstInt>(0, DataType::INDEX, call_assign->span_),
@@ -3708,7 +3708,7 @@ class OutWindowExternalizer {
       };
 
       stmts->push_back(std::make_shared<AssignStmt>(
-          scan_min_init, std::make_shared<ConstInt>(2147483647, DataType::INDEX, span), span));
+          scan_min_init, std::make_shared<ConstInt>(INT64_MAX, DataType::INDEX, span), span));
       stmts->push_back(std::make_shared<AssignStmt>(
           scan_max_init, std::make_shared<ConstInt>(0, DataType::INDEX, span), span));
 

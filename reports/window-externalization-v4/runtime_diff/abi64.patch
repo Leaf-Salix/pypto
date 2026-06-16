@@ -1,3 +1,13 @@
+# NOTE: This patch documents the runtime-side changes needed to support
+# 64-tensor dispatch (up from 16). Known issues from review:
+#   - orch_error_detail memory ordering: detail fields (tensor_count/
+#     scalar_count/func/message) are plain stores, not atomic, and may not
+#     be visible to the host on weakly-ordered architectures (ARM) when the
+#     host reads orch_error_code via acquire. Consider using std::atomic<>
+#     for tensor/scalar counts or adding std::atomic_thread_fence(release)
+#     after the detail writes.
+#   - runtime_compiler.py subprocess encoding fix is an unrelated scope-creep
+#     change that should be split into its own commit.
 diff --git a/docs/aicore-kernel-programming.md b/docs/aicore-kernel-programming.md
 index bca0d970..24db9f29 100644
 --- a/docs/aicore-kernel-programming.md

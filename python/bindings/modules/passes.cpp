@@ -427,12 +427,15 @@ void BindPass(nb::module_& m) {
   passes.def("optimize_orch_tensors", &pass::OptimizeOrchTensors,
              nb::arg("output_window_policy") = "coalesce_pieces", nb::arg("window_rewrite_policy") = "auto",
              "Create a pass that optimizes tensor buffer usage in orchestration and InCore functions\n\n"
-             "Applies five patterns: iter-arg reuse (merge Out->InOut), assemble parent\n"
-             "strides (attach TensorView to Out params), and assemble-loop rewrite\n"
-             "(convert tile.assemble loops to tile.store loops). "
+             "Applies five patterns:\n"
+             "  1. iter-arg reuse (merge Out->InOut)\n"
+             "  2. assemble parent strides (attach TensorView to Out params)\n"
+             "  3. assemble-loop rewrite (convert tile.assemble loops to tile.store loops)\n"
+             "  4. slice input strides (attach TensorView to In params)\n"
+             "  5. static window externalization (rewrite proven local windows to call-site slices)\n"
              "output_window_policy may be 'exact_pieces' or 'coalesce_pieces'. "
              "window_rewrite_policy may be 'auto', 'all', 'inputs_only', 'outputs_only', "
-             "'no_inputs', 'no_outputs', 'no_multi_piece_outputs', or 'none'.");
+             "'no_inputs', 'no_outputs', 'no_multi_piece_outputs', 'none', or 'disabled'.");
   passes.def("flatten_tile_nd_to_2d", &pass::FlattenTileNdTo2D,
              "Create a pass that flattens ND tile ops to 2D in InCore functions\n\n"
              "Merges all dimensions except the last into a single dimension.\n"

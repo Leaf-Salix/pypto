@@ -436,7 +436,13 @@ def optimize_orch_tensors(
     output_window_policy: str = "coalesce_pieces",
     window_rewrite_policy: str = "auto",
 ) -> Pass:
-    """Create a pass that optimizes tensor buffer usage in orchestration and InCore functions."""
+    """Create a pass that optimizes tensor buffer usage in orchestration and InCore functions.
+
+    Args:
+        output_window_policy: 'exact_pieces' or 'coalesce_pieces'
+        window_rewrite_policy: 'auto', 'all', 'inputs_only', 'outputs_only',
+            'no_inputs', 'no_outputs', 'no_multi_piece_outputs', 'none', or 'disabled'
+    """
 
 def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""

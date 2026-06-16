@@ -22,6 +22,11 @@ from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 def _run_to_optimize_orch_tensors(
     program,
     *,
+    # NOTE: These defaults differ from the production defaults
+    # (coalesce_pieces / auto) intentionally — the test helper aims for
+    # maximal coverage by enabling all eligible rewrites by default.
+    # Tests that specifically verify production behavior pass
+    # window_rewrite_policy="auto" explicitly.
     output_window_policy: str = "exact_pieces",
     window_rewrite_policy: str = "all",
 ):
@@ -1049,6 +1054,15 @@ class TestOutWindowExternalizer:
 
         NonePolicy = _run_to_optimize_orch_tensors(Before, window_rewrite_policy="none")
         assert NonePolicy.get_function("consume__windowed") is None
+
+        DisabledPolicy = _run_to_optimize_orch_tensors(Before, window_rewrite_policy="disabled")
+        assert DisabledPolicy.get_function("consume__windowed") is None
+
+        NoInputs = _run_to_optimize_orch_tensors(Before, window_rewrite_policy="no_inputs")
+        assert NoInputs.get_function("consume__windowed") is not None
+
+        NoOutputs = _run_to_optimize_orch_tensors(Before, window_rewrite_policy="no_outputs")
+        assert NoOutputs.get_function("consume__windowed") is None
 
     def test_topk_name_does_not_block_eligible_input_window(self):
         @pl.program
