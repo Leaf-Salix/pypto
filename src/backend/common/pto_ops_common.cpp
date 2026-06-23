@@ -3828,17 +3828,6 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     codegen.Emit(oss.str());
     return std::string("");
   });
-  reg("tile.transpose_view", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
-    // Zero-copy fractal-layout reinterpretation (NZ<->ZN). The result var owns a
-    // pre-declared pto.alloc_tile carrying the transposed (ZN) type, aliased to
-    // the source buffer's address through the shared MemRef. The two alloc_tile
-    // declarations at the same addr ARE the whole mechanism — there is no
-    // data-movement instruction to emit (issue #1776).
-    CHECK(op->args_.size() == 1) << "Operation:[tile.transpose_view] requires 1 argument (tile), but got "
-                                 << op->args_.size();
-    (void)codegen_base;
-    return std::string("");
-  });
   reg("tile.set_validshape", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
     CHECK(op->args_.size() == 3)
