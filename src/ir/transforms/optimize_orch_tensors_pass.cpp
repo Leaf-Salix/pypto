@@ -2994,9 +2994,12 @@ class OutWindowExternalizer {
       arith::Analyzer analyzer;
       std::vector<ExprPtr> local_offsets;
       local_offsets.reserve(offsets->elements_.size());
+      std::vector<StmtPtr> prelude_stmts;
       for (size_t i = 0; i < offsets->elements_.size(); ++i) {
-        local_offsets.push_back(analyzer.Simplify(
-            MakeSub(offsets->elements_[i], info->callsite_offsets[i], offsets->elements_[i]->span_)));
+        auto local_offset = analyzer.Simplify(
+            MakeSub(offsets->elements_[i], info->callsite_offsets[i], offsets->elements_[i]->span_));
+        local_offsets.push_back(FlattenGeneratedScalarExpr(local_offset, assign->var_->name_hint_,
+                                                           assign->span_, &prelude_stmts));
       }
       auto new_offset_tuple = std::make_shared<MakeTuple>(std::move(local_offsets), offsets->span_);
       std::vector<ExprPtr> new_args = call->args_;
@@ -3014,6 +3017,10 @@ class OutWindowExternalizer {
       result_var_output_info_[new_result_var.get()] = info;
       assign->var_ = new_result_var;
       assign->value_ = new_call;
+      if (!prelude_stmts.empty()) {
+        prelude_stmts.push_back(assign);
+        return SeqStmts::Flatten(std::move(prelude_stmts), assign->span_);
+      }
       return assign;
     }
 
@@ -3089,6 +3096,114 @@ class OutWindowExternalizer {
     }
 
    private:
+    static ExprPtr FlattenGeneratedScalarExpr(const ExprPtr& expr, const std::string& name_prefix,
+                                              const Span& span, std::vector<StmtPtr>* stmts) {
+      class LocalFlattener : public IRMutator {
+       public:
+        LocalFlattener(std::string name_prefix, size_t* counter, std::vector<StmtPtr>* stmts, Span span)
+            : name_prefix_(std::move(name_prefix)),
+              counter_(counter),
+              stmts_(stmts),
+              span_(std::move(span)) {}
+
+        ExprPtr Flatten(const ExprPtr& expr) {
+          auto visited = VisitExpr(expr);
+          if (As<Call>(visited) || As<Submit>(visited)) return ExtractCallToTemp(visited);
+          return visited;
+        }
+
+       protected:
+        ExprPtr VisitExpr_(const CallPtr& op) override {
+          std::vector<ExprPtr> new_args;
+          new_args.reserve(op->args_.size());
+          bool changed = false;
+          for (const auto& arg : op->args_) {
+            auto visited = VisitExpr(arg);
+            if (As<Call>(visited) || As<Submit>(visited)) {
+              visited = ExtractCallToTemp(visited);
+              changed = true;
+            } else if (visited.get() != arg.get()) {
+              changed = true;
+            }
+            new_args.push_back(visited);
+          }
+          if (!changed) return op;
+          return std::make_shared<Call>(op->op_, new_args, op->kwargs_, op->attrs_, op->GetType(), op->span_);
+        }
+
+        ExprPtr VisitExpr_(const SubmitPtr& op) override {
+          std::vector<ExprPtr> new_args;
+          new_args.reserve(op->args_.size());
+          bool changed = false;
+          for (const auto& arg : op->args_) {
+            auto visited = VisitExpr(arg);
+            if (As<Call>(visited) || As<Submit>(visited)) {
+              visited = ExtractCallToTemp(visited);
+              changed = true;
+            } else if (visited.get() != arg.get()) {
+              changed = true;
+            }
+            new_args.push_back(visited);
+          }
+          if (!changed) return op;
+          return std::make_shared<Submit>(op->op_, new_args, op->deps_, op->kwargs_, op->attrs_,
+                                          op->GetType(), op->span_, op->core_num_, op->sync_start_);
+        }
+
+#define PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(OpName)                                   \
+  ExprPtr VisitExpr_(const OpName##Ptr& op) override {                                           \
+    auto new_left = VisitExpr(op->left_);                                                        \
+    auto new_right = VisitExpr(op->right_);                                                      \
+    if (As<Call>(new_left) || As<Submit>(new_left)) new_left = ExtractCallToTemp(new_left);      \
+    if (As<Call>(new_right) || As<Submit>(new_right)) new_right = ExtractCallToTemp(new_right);  \
+    if (new_left.get() == op->left_.get() && new_right.get() == op->right_.get()) return op;     \
+    auto scalar_type = As<ScalarType>(op->GetType());                                            \
+    INTERNAL_CHECK_SPAN(scalar_type, op->span_) << "Generated scalar expression must be scalar"; \
+    return std::make_shared<const OpName>(new_left, new_right, scalar_type->dtype_, op->span_);  \
+  }
+
+        PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(Add)
+        PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(Sub)
+        PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(Mul)
+        PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(FloorDiv)
+        PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(FloorMod)
+        PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(Min)
+        PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD(Max)
+#undef PYPTO_WINDOW_LOCALIZER_PROCESS_BINARY_OVERLOAD
+
+#define PYPTO_WINDOW_LOCALIZER_PROCESS_UNARY_OVERLOAD(OpName)                                           \
+  ExprPtr VisitExpr_(const OpName##Ptr& op) override {                                                  \
+    auto new_operand = VisitExpr(op->operand_);                                                         \
+    if (As<Call>(new_operand) || As<Submit>(new_operand)) new_operand = ExtractCallToTemp(new_operand); \
+    if (new_operand.get() == op->operand_.get()) return op;                                             \
+    auto scalar_type = As<ScalarType>(op->GetType());                                                   \
+    INTERNAL_CHECK_SPAN(scalar_type, op->span_) << "Generated scalar expression must be scalar";        \
+    return std::make_shared<const OpName>(new_operand, scalar_type->dtype_, op->span_);                 \
+  }
+
+        PYPTO_WINDOW_LOCALIZER_PROCESS_UNARY_OVERLOAD(Cast)
+        PYPTO_WINDOW_LOCALIZER_PROCESS_UNARY_OVERLOAD(Neg)
+#undef PYPTO_WINDOW_LOCALIZER_PROCESS_UNARY_OVERLOAD
+
+       private:
+        ExprPtr ExtractCallToTemp(const ExprPtr& expr) {
+          auto temp_var = std::make_shared<Var>(name_prefix_ + "__expr_tmp_" + std::to_string((*counter_)++),
+                                                expr->GetType(), span_);
+          stmts_->push_back(std::make_shared<AssignStmt>(temp_var, expr, temp_var->span_));
+          return temp_var;
+        }
+
+        std::string name_prefix_;
+        size_t* counter_;
+        std::vector<StmtPtr>* stmts_;
+        Span span_;
+      };
+
+      if (!expr || !stmts) return expr;
+      LocalFlattener flattener(name_prefix, &generated_scalar_temp_counter_, stmts, span);
+      return flattener.Flatten(expr);
+    }
+
     WindowWriteLocalizer(const std::unordered_map<const Var*, OutputRewriteInfo>& out_info_by_var,
                          const std::unordered_map<const Var*, ExprPtr>& new_out_vars,
                          std::unordered_map<const Var*, VarPtr> result_var_remap,
@@ -3102,6 +3217,7 @@ class OutWindowExternalizer {
     const std::unordered_map<const Var*, ExprPtr>& new_out_vars_;
     std::unordered_map<const Var*, VarPtr> result_var_remap_;
     std::unordered_map<const Var*, const OutputRewriteInfo*> result_var_output_info_;
+    static inline size_t generated_scalar_temp_counter_ = 0;
   };
 
   class WindowReadLocalizer : public IRMutator {
@@ -3141,6 +3257,7 @@ class OutWindowExternalizer {
       arith::Analyzer analyzer;
       std::vector<ExprPtr> local_offsets;
       local_offsets.reserve(old_offsets->elements_.size());
+      std::vector<StmtPtr> prelude_stmts;
       for (size_t i = 0; i < old_offsets->elements_.size(); ++i) {
         ExprPtr base_offset = info_it->second.callsite_offsets[i];
         if (info_it->second.dynamic_indexed_window.has_value() &&
@@ -3149,19 +3266,134 @@ class OutWindowExternalizer {
               << "Dynamic input window must have a materialized base parameter before read localization";
           base_offset = info_it->second.dynamic_base_param;
         }
-        local_offsets.push_back(analyzer.Simplify(
-            MakeSub(old_offsets->elements_[i], base_offset, old_offsets->elements_[i]->span_)));
+        auto local_offset = analyzer.Simplify(
+            MakeSub(old_offsets->elements_[i], base_offset, old_offsets->elements_[i]->span_));
+        local_offsets.push_back(FlattenGeneratedScalarExpr(local_offset, assign->var_->name_hint_,
+                                                           assign->span_, &prelude_stmts));
       }
 
       std::vector<ExprPtr> new_args = call->args_;
       new_args[offset_arg_index] = std::make_shared<MakeTuple>(std::move(local_offsets), old_offsets->span_);
       assign->value_ = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->attrs_,
                                               call->GetType(), call->span_);
+      if (!prelude_stmts.empty()) {
+        prelude_stmts.push_back(assign);
+        return SeqStmts::Flatten(std::move(prelude_stmts), assign->span_);
+      }
       return assign;
     }
 
    private:
+    static ExprPtr FlattenGeneratedScalarExpr(const ExprPtr& expr, const std::string& name_prefix,
+                                              const Span& span, std::vector<StmtPtr>* stmts) {
+      class LocalFlattener : public IRMutator {
+       public:
+        LocalFlattener(std::string name_prefix, size_t* counter, std::vector<StmtPtr>* stmts, Span span)
+            : name_prefix_(std::move(name_prefix)),
+              counter_(counter),
+              stmts_(stmts),
+              span_(std::move(span)) {}
+
+        ExprPtr Flatten(const ExprPtr& expr) {
+          auto visited = VisitExpr(expr);
+          if (As<Call>(visited) || As<Submit>(visited)) return ExtractCallToTemp(visited);
+          return visited;
+        }
+
+       protected:
+        ExprPtr VisitExpr_(const CallPtr& op) override {
+          std::vector<ExprPtr> new_args;
+          new_args.reserve(op->args_.size());
+          bool changed = false;
+          for (const auto& arg : op->args_) {
+            auto visited = VisitExpr(arg);
+            if (As<Call>(visited) || As<Submit>(visited)) {
+              visited = ExtractCallToTemp(visited);
+              changed = true;
+            } else if (visited.get() != arg.get()) {
+              changed = true;
+            }
+            new_args.push_back(visited);
+          }
+          if (!changed) return op;
+          return std::make_shared<Call>(op->op_, new_args, op->kwargs_, op->attrs_, op->GetType(), op->span_);
+        }
+
+        ExprPtr VisitExpr_(const SubmitPtr& op) override {
+          std::vector<ExprPtr> new_args;
+          new_args.reserve(op->args_.size());
+          bool changed = false;
+          for (const auto& arg : op->args_) {
+            auto visited = VisitExpr(arg);
+            if (As<Call>(visited) || As<Submit>(visited)) {
+              visited = ExtractCallToTemp(visited);
+              changed = true;
+            } else if (visited.get() != arg.get()) {
+              changed = true;
+            }
+            new_args.push_back(visited);
+          }
+          if (!changed) return op;
+          return std::make_shared<Submit>(op->op_, new_args, op->deps_, op->kwargs_, op->attrs_,
+                                          op->GetType(), op->span_, op->core_num_, op->sync_start_);
+        }
+
+#define PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(OpName)                              \
+  ExprPtr VisitExpr_(const OpName##Ptr& op) override {                                           \
+    auto new_left = VisitExpr(op->left_);                                                        \
+    auto new_right = VisitExpr(op->right_);                                                      \
+    if (As<Call>(new_left) || As<Submit>(new_left)) new_left = ExtractCallToTemp(new_left);      \
+    if (As<Call>(new_right) || As<Submit>(new_right)) new_right = ExtractCallToTemp(new_right);  \
+    if (new_left.get() == op->left_.get() && new_right.get() == op->right_.get()) return op;     \
+    auto scalar_type = As<ScalarType>(op->GetType());                                            \
+    INTERNAL_CHECK_SPAN(scalar_type, op->span_) << "Generated scalar expression must be scalar"; \
+    return std::make_shared<const OpName>(new_left, new_right, scalar_type->dtype_, op->span_);  \
+  }
+
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(Add)
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(Sub)
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(Mul)
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(FloorDiv)
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(FloorMod)
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(Min)
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD(Max)
+#undef PYPTO_WINDOW_READ_LOCALIZER_PROCESS_BINARY_OVERLOAD
+
+#define PYPTO_WINDOW_READ_LOCALIZER_PROCESS_UNARY_OVERLOAD(OpName)                                      \
+  ExprPtr VisitExpr_(const OpName##Ptr& op) override {                                                  \
+    auto new_operand = VisitExpr(op->operand_);                                                         \
+    if (As<Call>(new_operand) || As<Submit>(new_operand)) new_operand = ExtractCallToTemp(new_operand); \
+    if (new_operand.get() == op->operand_.get()) return op;                                             \
+    auto scalar_type = As<ScalarType>(op->GetType());                                                   \
+    INTERNAL_CHECK_SPAN(scalar_type, op->span_) << "Generated scalar expression must be scalar";        \
+    return std::make_shared<const OpName>(new_operand, scalar_type->dtype_, op->span_);                 \
+  }
+
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_UNARY_OVERLOAD(Cast)
+        PYPTO_WINDOW_READ_LOCALIZER_PROCESS_UNARY_OVERLOAD(Neg)
+#undef PYPTO_WINDOW_READ_LOCALIZER_PROCESS_UNARY_OVERLOAD
+
+       private:
+        ExprPtr ExtractCallToTemp(const ExprPtr& expr) {
+          auto temp_var = std::make_shared<Var>(name_prefix_ + "__expr_tmp_" + std::to_string((*counter_)++),
+                                                expr->GetType(), span_);
+          stmts_->push_back(std::make_shared<AssignStmt>(temp_var, expr, temp_var->span_));
+          return temp_var;
+        }
+
+        std::string name_prefix_;
+        size_t* counter_;
+        std::vector<StmtPtr>* stmts_;
+        Span span_;
+      };
+
+      if (!expr || !stmts) return expr;
+      LocalFlattener flattener(name_prefix, &generated_scalar_temp_counter_, stmts, span);
+      return flattener.Flatten(expr);
+    }
+
     const std::unordered_map<const Var*, InputRewriteInfo>& in_info_by_var_;
+    static inline size_t generated_scalar_temp_counter_ = 0;
   };
 
   class OrchRewriter : public IRMutator {
@@ -3525,6 +3757,12 @@ class OutWindowExternalizer {
               stmts_(stmts),
               span_(std::move(span)) {}
 
+        ExprPtr Flatten(const ExprPtr& expr) {
+          auto visited = VisitExpr(expr);
+          if (As<Call>(visited) || As<Submit>(visited)) return ExtractCallToTemp(visited);
+          return visited;
+        }
+
        protected:
         ExprPtr VisitExpr_(const CallPtr& op) override {
           std::vector<ExprPtr> new_args;
@@ -3665,7 +3903,7 @@ class OutWindowExternalizer {
 
       if (!expr || !stmts) return expr;
       LocalFlattener flattener(name_prefix, &generated_scalar_temp_counter_, stmts, span);
-      return flattener.VisitExpr(expr);
+      return flattener.Flatten(expr);
     }
 
     static std::optional<std::vector<ExprPtr>> SubstituteSingletonLoopStarts(
@@ -4385,14 +4623,18 @@ class OutWindowExternalizer {
           shape_exprs.reserve(piece.window_shape.size());
           for (size_t dim_i = 0; dim_i < piece.window_shape.size(); ++dim_i) {
             const auto& dim = piece.window_shape[dim_i];
-            shape_exprs.push_back(transform_utils::Substitute(dim, callsite_subst));
+            auto shape_expr = transform_utils::Substitute(dim, callsite_subst);
+            shape_exprs.push_back(
+                FlattenGeneratedScalarExpr(shape_expr, in_arg->name_hint_, call_assign->span_, &stmts));
           }
           std::vector<ExprPtr> offset_exprs;
           offset_exprs.reserve(piece.callsite_offsets.size());
           for (size_t offset_i = 0; offset_i < piece.callsite_offsets.size(); ++offset_i) {
             const auto& offset = piece.callsite_offsets[offset_i];
+            auto offset_expr =
+                input_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst));
             offset_exprs.push_back(
-                input_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst)));
+                FlattenGeneratedScalarExpr(offset_expr, in_arg->name_hint_, call_assign->span_, &stmts));
           }
           auto shape_tuple = std::make_shared<MakeTuple>(shape_exprs, call_assign->span_);
           auto offset_tuple = std::make_shared<MakeTuple>(offset_exprs, call_assign->span_);
@@ -4429,14 +4671,18 @@ class OutWindowExternalizer {
           std::vector<ExprPtr> shape_exprs;
           shape_exprs.reserve(piece.window_shape.size());
           for (const auto& dim : piece.window_shape) {
-            shape_exprs.push_back(transform_utils::Substitute(dim, callsite_subst));
+            auto shape_expr = transform_utils::Substitute(dim, callsite_subst);
+            shape_exprs.push_back(
+                FlattenGeneratedScalarExpr(shape_expr, out_arg->name_hint_, call_assign->span_, &stmts));
           }
 
           std::vector<ExprPtr> offset_exprs;
           offset_exprs.reserve(piece.callsite_offsets.size());
           for (const auto& offset : piece.callsite_offsets) {
+            auto offset_expr =
+                output_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst));
             offset_exprs.push_back(
-                output_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst)));
+                FlattenGeneratedScalarExpr(offset_expr, out_arg->name_hint_, call_assign->span_, &stmts));
           }
           if (carrier_use.has_value() && carrier_use->carrier && carrier_use->carrier->has_dynamic_reader) {
             const size_t dynamic_dim = carrier_use->carrier->dynamic_dim;
@@ -4547,10 +4793,12 @@ class OutWindowExternalizer {
                                                call_assign->span_);
               extent_arg = std::make_shared<Var>(out_arg->name_hint_ + "__window_extent_arg", index_type,
                                                  call_assign->span_);
-              stmts.push_back(std::make_shared<AssignStmt>(base_arg, offset_exprs[output_dynamic_dim],
-                                                           call_assign->span_));
-              stmts.push_back(std::make_shared<AssignStmt>(extent_arg, shape_exprs[output_dynamic_dim],
-                                                           call_assign->span_));
+              auto base_value = FlattenGeneratedScalarExpr(offset_exprs[output_dynamic_dim],
+                                                           out_arg->name_hint_, call_assign->span_, &stmts);
+              auto extent_value = FlattenGeneratedScalarExpr(shape_exprs[output_dynamic_dim],
+                                                             out_arg->name_hint_, call_assign->span_, &stmts);
+              stmts.push_back(std::make_shared<AssignStmt>(base_arg, base_value, call_assign->span_));
+              stmts.push_back(std::make_shared<AssignStmt>(extent_arg, extent_value, call_assign->span_));
             }
             offset_exprs[output_dynamic_dim] = base_arg;
             shape_exprs[output_dynamic_dim] = extent_arg;
@@ -4819,7 +5067,9 @@ class OutWindowExternalizer {
             std::vector<ExprPtr> fine_shape_exprs;
             fine_shape_exprs.reserve(assemble_piece.window_shape.size());
             for (const auto& dim : assemble_piece.window_shape) {
-              fine_shape_exprs.push_back(transform_utils::Substitute(dim, callsite_subst));
+              auto fine_shape = transform_utils::Substitute(dim, callsite_subst);
+              fine_shape_exprs.push_back(FlattenGeneratedScalarExpr(fine_shape, call_assign->var_->name_hint_,
+                                                                    call_assign->span_, &tail_stmts));
             }
             auto fine_shape_tuple = std::make_shared<MakeTuple>(fine_shape_exprs, call_assign->span_);
 
@@ -4829,8 +5079,10 @@ class OutWindowExternalizer {
               auto fine_offset = fine_offset_analyzer.Simplify(
                   transform_utils::Substitute(assemble_piece.callsite_offsets[dim], callsite_subst));
               auto carrier_offset = slice_bundle.offset_tuple->elements_[dim];
-              fine_local_offsets.push_back(
-                  fine_offset_analyzer.Simplify(MakeSub(fine_offset, carrier_offset, call_assign->span_)));
+              auto fine_local_offset =
+                  fine_offset_analyzer.Simplify(MakeSub(fine_offset, carrier_offset, call_assign->span_));
+              fine_local_offsets.push_back(FlattenGeneratedScalarExpr(
+                  fine_local_offset, call_assign->var_->name_hint_, call_assign->span_, &tail_stmts));
             }
             auto fine_local_offset_tuple =
                 std::make_shared<MakeTuple>(fine_local_offsets, call_assign->span_);
@@ -4847,8 +5099,10 @@ class OutWindowExternalizer {
             std::vector<ExprPtr> fine_global_offsets;
             fine_global_offsets.reserve(assemble_piece.callsite_offsets.size());
             for (const auto& offset : assemble_piece.callsite_offsets) {
-              fine_global_offsets.push_back(
-                  fine_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst)));
+              auto fine_global_offset =
+                  fine_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst));
+              fine_global_offsets.push_back(FlattenGeneratedScalarExpr(
+                  fine_global_offset, call_assign->var_->name_hint_, call_assign->span_, &tail_stmts));
             }
             assemble_offset_tuple = std::make_shared<MakeTuple>(fine_global_offsets, call_assign->span_);
           }
