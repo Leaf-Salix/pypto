@@ -347,6 +347,16 @@ def _persistent_dynamic_digest(static: str, values: tuple[tuple[int, str, str], 
     return digest_record(("source", static, values))
 
 
+@functools.lru_cache(maxsize=512)
+def _dynamic_source_hash(static: str, records: tuple[tuple[Any, ...], ...]) -> str:
+    """Reuse serialization only after current folded values have been read.
+
+    Keep the existing source-key encoding: tuples serialize just like lists.
+    This cache owns immutable text, never globals, closure cells or tensors.
+    """
+    return compute_source_hash([static, json.dumps(records, separators=(",", ":"))])
+
+
 class _DepGraph(NamedTuple):
     """Dependency graph published as one state and treated as read-only."""
 
@@ -373,6 +383,7 @@ class _CachedDepGraph:
     layout_dependencies: tuple[tuple[Any, tuple[str, ...]], ...]
     layouts: _CachedLayouts | None = None
     persistent_source_hash: str | None = None
+    no_constexpr_plan: _call_binding.VariantPlan | None = None
 
 
 @functools.lru_cache(maxsize=512)
@@ -676,7 +687,7 @@ class JITFunction:
                     records.append(
                         (index, func.__module__, func.__qualname__, f"<annotation:{name}>", source)
                     )
-        return compute_source_hash([source_hash, json.dumps(records, separators=(",", ":"))])
+        return _dynamic_source_hash(source_hash, tuple(records))
 
     def _resolve_constexpr_bindings(self, entry_constexpr: Mapping[str, str]) -> _call_binding.VariantPlan:
         """Expand this request's call graph into one function per constexpr binding.
@@ -692,8 +703,31 @@ class JITFunction:
         Returns:
             The request's :class:`VariantPlan`
         """
-        deps_topo, callers_by_id, _, _ = self._get_dep_graph()
-        return _call_binding.expand_constexpr_variants(self, deps_topo, callers_by_id, entry_constexpr)
+        state = self._get_dep_graph_state()
+        deps_topo, callers_by_id, _, _ = state.graph
+        # Always read current declarations, including postponed annotations.
+        # Caching only graph identity would miss a parameter becoming constexpr.
+        signatures: dict[int, tuple[list[str], list[str]]] = {}
+        reusable = not entry_constexpr
+        if reusable:
+            for index in range(len(deps_topo) - 1, -1, -1):
+                dep = deps_topo[index]
+                signature = (_arguments.constexpr_params(dep._func), dep._param_names())
+                signatures[index] = signature
+                if signature[0]:
+                    # Stop before later annotations: constexpr expressions may
+                    # affect their evaluation. The ordinary walk resumes here.
+                    reusable = False
+                    break
+        if reusable and state.no_constexpr_plan is not None:
+            return state.no_constexpr_plan
+        plan = _call_binding.expand_constexpr_variants(
+            self, deps_topo, callers_by_id, entry_constexpr, signatures=signatures
+        )
+        if reusable:
+            # Construct completely before publication; readers never mutate plans.
+            state.no_constexpr_plan = plan
+        return plan
 
     def _constexpr_identity_records(self, plan: _call_binding.VariantPlan) -> list[tuple[Any, ...]]:
         """Flatten a variant plan into deterministic cache-identity records.

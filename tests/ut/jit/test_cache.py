@@ -107,6 +107,131 @@ def test_request_signature_released_after_failure():
     assert function_signature(implementation).parameters["scale"].default == 3
 
 
+def test_structural_source_cache_observes_current_constants(monkeypatch):
+    from pypto.jit import _ast_analysis  # noqa: PLC0415
+
+    value: Any = object()
+
+    @pl.jit
+    def entry(x: pl.Tensor):
+        return pl.add(x, value)
+
+    names = _ast_analysis.constant_dependency_names(entry._func)
+    assert "value" in names
+    original = entry._get_source_hash()
+    value = 3
+    folded = entry._get_source_hash()
+    assert folded != original
+    # A cached list of names must not retain either the binding or its contents.
+    value = [1, 2]
+    before = entry._get_source_hash()
+    value.append(3)
+    assert entry._get_source_hash() != before
+    value = 3
+    assert entry._get_source_hash() == folded
+    monkeypatch.setattr(ast, "walk", lambda _: pytest.fail("rescanned immutable names"))
+    assert _ast_analysis.constant_dependency_names(entry._func) == names
+
+
+def test_source_record_cache_preserves_hash_encoding():
+    from pypto.jit.decorator import _dynamic_source_hash  # noqa: PLC0415
+
+    records = ((0, "module", "entry", "value", "[1, 2]"),)
+    assert _dynamic_source_hash("static", records) == compute_source_hash(
+        ["static", '[[0,"module","entry","value","[1, 2]"]]']
+    )
+
+
+def test_no_constexpr_plan_rechecks_declarations_and_helper(monkeypatch):
+    from pypto.jit import _call_binding  # noqa: PLC0415
+
+    @pl.jit.inline
+    def helper(x: pl.Tensor, n: pl.Scalar[pl.INT32]):
+        return x
+
+    @pl.jit
+    def entry(x: pl.Tensor):
+        return helper(x, 16)
+
+    calls = []
+    expand = _call_binding.expand_constexpr_variants
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return expand(*args, **kwargs)
+
+    monkeypatch.setattr(_call_binding, "expand_constexpr_variants", counted)
+
+    def resolve():
+        with capture_namespaces():
+            return entry._resolve_constexpr_bindings({})
+
+    first = resolve()
+    second = resolve()
+    assert len(calls) == 1
+    assert second.call_targets == first.call_targets
+    helper._func.__annotations__["n"] = pl.constexpr
+    plan = resolve()
+    assert len(calls) == 2
+    assert plan.binding[(id(helper._func), (("n", "16"),))] == {"n": "16"}
+    helper._func.__annotations__["n"] = pl.Scalar[pl.INT32]
+    assert resolve().call_targets == first.call_targets
+
+    @pl.jit.inline
+    def helper(x: pl.Tensor, n: pl.Scalar[pl.INT32]):
+        return pl.add(x, x)
+
+    rebound = resolve()
+    assert len(calls) == 3
+    assert helper in rebound.jit_func.values()
+    assert rebound.call_targets != first.call_targets
+
+
+def test_constexpr_plan_keeps_annotation_and_expression_order(monkeypatch):
+    from pypto.jit import _call_binding  # noqa: PLC0415
+
+    @pl.jit.inline
+    def leaf(x: pl.Tensor, n: pl.constexpr):
+        return x
+
+    @pl.jit.inline
+    def middle(x: pl.Tensor, n: pl.constexpr):
+        return leaf(x, n)
+
+    @pl.jit.inline
+    def wrapper(x: pl.Tensor):
+        return middle(x, 16)
+
+    @pl.jit
+    def entry(x: pl.Tensor):
+        return wrapper(x)
+
+    events = []
+    classify = _arguments.constexpr_params
+    fold = _call_binding.resolve_call_site_constexpr
+
+    def classified(func):
+        events.append(("annotation", func.__name__))
+        return classify(func)
+
+    def folded(dep_name, *args, **kwargs):
+        events.append(("expression", dep_name))
+        return fold(dep_name, *args, **kwargs)
+
+    monkeypatch.setattr(_arguments, "constexpr_params", classified)
+    monkeypatch.setattr(_call_binding, "resolve_call_site_constexpr", folded)
+    with capture_namespaces():
+        plan = entry._resolve_constexpr_bindings({})
+    assert events == [
+        ("annotation", "wrapper"),
+        ("annotation", "middle"),
+        ("expression", "middle"),
+        ("annotation", "leaf"),
+        ("expression", "leaf"),
+    ]
+    assert plan.binding[(id(leaf._func), (("n", "16"),))] == {"n": "16"}
+
+
 class TestComputeSourceHash:
     def test_deterministic(self):
         h1 = compute_source_hash(["def f(): pass"])

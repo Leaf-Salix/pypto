@@ -185,6 +185,7 @@ def body_local_names(func: Any) -> set[str]:
     return local_names
 
 
+@functools.lru_cache(maxsize=512)
 def constant_dependency_names(func: Any) -> tuple[str, ...]:
     """Find names that can supply folded constants, excluding body locals.
 
