@@ -84,7 +84,7 @@ from pypto.pypto_core import passes as _passes
 from pypto.pypto_core.passes import runtime_kind_to_name
 
 from . import _arguments, _ast_analysis, _call_binding, _tensor_meta
-from ._source import cache_in_snapshot, capture_namespaces
+from ._source import cache_in_snapshot, capture_namespaces, function_signature
 from .cache import CacheKey, compute_source_hash, make_cache_key
 from .specializer import (
     DynDim,
@@ -379,7 +379,7 @@ class _CachedDepGraph:
 def _layout_dependency_names(func: Any) -> tuple[str, ...]:
     """Capture roots read by postponed parameter annotations once per function."""
     names: set[str] = set()
-    for name, param in inspect.signature(func).parameters.items():
+    for name, param in function_signature(func).parameters.items():
         if name == "self" or not isinstance(param.annotation, str):
             continue
         try:
@@ -790,7 +790,7 @@ class JITFunction:
     # ------------------------------------------------------------------
 
     def _param_names(self) -> list[str]:
-        return [p for p in inspect.signature(self._func).parameters if p != "self"]
+        return [p for p in function_signature(self._func).parameters if p != "self"]
 
     def _bind_args(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -824,7 +824,7 @@ class JITFunction:
         each dep's effective map without recomputing.
         """
         param_names = self._param_names()
-        sig = inspect.signature(self._func)
+        sig = function_signature(self._func)
         try:
             bound = sig.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -935,7 +935,7 @@ class JITFunction:
         from pypto.language.typing.tensor import Tensor  # noqa: PLC0415
 
         param_names = self._param_names()
-        sig = inspect.signature(self._func)
+        sig = function_signature(self._func)
 
         # Namespace for resolving string annotations (``from __future__ import
         # annotations``): the function's globals merged with its closure free-vars,

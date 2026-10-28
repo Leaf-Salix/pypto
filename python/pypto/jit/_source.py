@@ -9,6 +9,7 @@
 
 """Per-call namespace snapshots shared by JIT key construction and specialization."""
 
+import inspect
 from collections import ChainMap
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -65,6 +66,17 @@ def cache_in_snapshot(func: Callable[[T], R]) -> Callable[[T], R]:
         return cast(R, snapshot.values[key])
 
     return wrapped
+
+
+@cache_in_snapshot
+def function_signature(func: Any) -> inspect.Signature:
+    """Share introspection within a request, never across mutable function bindings.
+
+    Binding, layout and scalar classification inspect the same function. Keep
+    their signature consistent without retaining defaults or annotations beyond
+    the existing request snapshot; the next request must observe rebinding.
+    """
+    return inspect.signature(func)
 
 
 def function_namespace(func: Any) -> Mapping[str, Any]:

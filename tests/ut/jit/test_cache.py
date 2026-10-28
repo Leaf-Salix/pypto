@@ -21,7 +21,8 @@ from typing import Any
 import pypto.language as pl
 import pytest
 from pypto.ir import DistributedConfig, OptimizationStrategy
-from pypto.jit._source import capture_namespaces, function_namespace
+from pypto.jit import _arguments
+from pypto.jit._source import capture_namespaces, function_namespace, function_signature
 from pypto.jit.cache import (
     SCALAR_SEMANTICS,
     compute_source_hash,
@@ -37,6 +38,73 @@ from pypto.language.parser.diagnostics.exceptions import ParserSyntaxError
 from pypto.pypto_core import DataType, ir, passes
 from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime import RunConfig
+
+
+def test_request_signature_shared_by_parameter_readers(monkeypatch):
+    def implementation(x: pl.Tensor, scale: pl.constexpr = 1):
+        return x
+
+    kernel = pl.jit(implementation)
+    original = inspect.signature
+    calls = []
+
+    def counted(func, *args, **kwargs):
+        if func is implementation:
+            calls.append(func)
+        return original(func, *args, **kwargs)
+
+    monkeypatch.setattr(inspect, "signature", counted)
+    with capture_namespaces():
+        assert kernel._param_names() == ["x", "scale"]
+        assert function_signature(implementation).bind(1).arguments == {"x": 1}
+        assert _arguments.param_layouts(implementation, "implementation") == {}
+        assert _arguments.param_dtypes(implementation) == {}
+        assert _arguments.constexpr_params(implementation) == ["scale"]
+    assert len(calls) == 1
+
+    # Do not make this a permanent function-identity cache: defaults and
+    # annotations can change while the Python function itself stays the same.
+    implementation.__defaults__ = (2,)
+    implementation.__annotations__["scale"] = int
+    with capture_namespaces():
+        bound = function_signature(implementation).bind(1)
+        bound.apply_defaults()
+        assert bound.arguments == {"x": 1, "scale": 2}
+        assert _arguments.constexpr_params(implementation) == []
+    assert len(calls) == 2
+
+
+def test_compiled_lookup_binds_current_runtime_default(monkeypatch):
+    torch = pytest.importorskip("torch")
+    default_scale: Any = 1
+
+    @pl.jit
+    def entry(x: pl.Tensor[[1], pl.FP32], scale: pl.Scalar[pl.INT32] = default_scale):
+        return x
+
+    # Exercise the real request/binding/cache path without requiring a device
+    # compiler. Runtime scalar defaults change arguments, not specialization.
+    artifact = object()
+    monkeypatch.setattr(entry, "_compile", lambda *args, **kwargs: artifact)
+    sample = torch.zeros(1)
+    first, args, _ = entry._resolve_compiled((sample,), {})
+    assert first is artifact and args[1] == 1
+    entry._func.__defaults__ = (2,)
+    second, args, _ = entry._resolve_compiled((sample,), {})
+    assert second is first and args[1] == 2
+
+
+def test_request_signature_released_after_failure():
+    def implementation(*, scale=1):
+        return scale
+
+    with pytest.raises(RuntimeError, match="request failed"), capture_namespaces():
+        assert function_signature(implementation).parameters["scale"].default == 1
+        raise RuntimeError("request failed")
+    implementation.__kwdefaults__ = {"scale": 2}
+    assert function_signature(implementation).parameters["scale"].default == 2
+    implementation.__kwdefaults__ = {"scale": 3}
+    assert function_signature(implementation).parameters["scale"].default == 3
 
 
 class TestComputeSourceHash:
