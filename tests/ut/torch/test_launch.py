@@ -121,6 +121,112 @@ def test_repeated_retirement_releases_worker_imports(eager_env, prepared):
     env.state.close()
 
 
+@pytest.mark.parametrize("queued", [False, True])
+def test_completed_calls_handoff_sources_but_drain_releases(eager_env, prepared, queued):
+    env = eager_env
+    env.queued = queued
+    x, out = env.tensor(), env.tensor()
+    for _ in range(4):
+        _invoke(env, prepared, x=x, out=out)
+        env.run_queue()
+        env.runs[-1].complete = True
+        assert len(env.buffers) == 2
+        assert not any(buffer.closed for buffer in env.buffers)
+        assert all(source.uses == 1 for source in env.state._worker.sources._sources.values())
+    env.state.drain()
+    assert all(run.retired for run in env.runs)
+    assert all(buffer.closed for buffer in env.buffers)
+    assert not env.state._worker.sources._sources and not env.workers[0].imports
+    _invoke(env, prepared, x=x, out=out)
+    assert len(env.buffers) == 4  # No idle cache survives drain.
+    env.state.close()
+
+
+@pytest.mark.parametrize("change", ["resize", "set"])
+def test_source_handoff_observes_storage_replacement(eager_env, prepared, change):
+    env = eager_env
+    x, out = env.tensor(), env.tensor()
+    _invoke(env, prepared, x=x, out=out)
+    env.run_queue()
+    env.runs[-1].complete = True
+    old_buffer = env.buffers[0]
+    if change == "resize":
+        x.untyped_storage().resize_(x.untyped_storage().nbytes() * 2)
+    else:
+        x.set_(env.tensor())
+    _invoke(env, prepared, x=x, out=out)
+    assert old_buffer.closed and len(env.buffers) == 3
+    assert env.buffers[-1].address == x.untyped_storage().data_ptr()
+    assert env.buffers[-1].nbytes == x.untyped_storage().nbytes()
+    env.state.close()
+
+
+def test_handoff_is_unwound_when_preparation_fails(eager_env, prepared, monkeypatch):
+    env = eager_env
+    x, out = env.tensor(), env.tensor()
+    _invoke(env, prepared, x=x, out=out)
+    env.run_queue()
+    env.runs[-1].complete = True
+
+    def fail_packing(*args, **kwargs):
+        raise ValueError("packing failed")
+
+    monkeypatch.setattr(env.api.TaskArgs, "add_tensor", fail_packing)
+    with pytest.raises(ValueError, match="packing failed"):
+        _invoke(env, prepared, x=x, out=out)
+    assert len(env.runs) == 1 and env.runs[0].retired
+    assert all(buffer.closed for buffer in env.buffers)
+    assert not env.state._worker.sources._sources
+    env.state.close()
+
+
+def test_handoff_keeps_primary_failure_and_retryable_sources(eager_env, prepared):
+    env = eager_env
+    first, second = env.tensor(), env.tensor()
+    _invoke(env, prepared, x=first, out=first)
+    _invoke(env, prepared, x=second, out=second)
+    env.run_queue()
+    for run in env.runs:
+        run.complete = True
+    env.runs[1].wait_error = RuntimeError("retirement failed")
+    env.buffers[0].close_error = RuntimeError("handoff release failed")
+    # The first ticket retires, the second fails, and undoing the first hold
+    # now has to perform a real release. Keep both failure and allocation owner.
+    with pytest.raises(RuntimeError, match="earlier asynchronous launch error") as error:
+        _invoke(env, prepared, x=first, out=second)
+    assert str(error.value.__cause__) == "handoff release failed"
+    assert env.state.state is KernelState.FAILED
+    assert env.state._failure is env.runs[1].wait_error
+    assert len(env.runs) == len(env.buffers) == 2 and not env.queue
+    assert all(not buffer.closed for buffer in env.buffers)
+    env.runs[1].wait_error = None
+    env.buffers[0].close_error = None
+    env.state.close()
+    assert all(buffer.closed for buffer in env.buffers)
+
+
+def test_handoff_enqueue_failure_retains_only_ticket_leases(eager_env, prepared, monkeypatch):
+    env = eager_env
+    x, out = env.tensor(), env.tensor()
+    _invoke(env, prepared, x=x, out=out)
+    env.run_queue()
+    env.runs[0].complete = True
+    enqueue = env.native.enqueue
+
+    def enqueue_then_fail(*args):
+        enqueue(*args)
+        raise RuntimeError("enqueue failed after admission")
+
+    monkeypatch.setattr(env.native, "enqueue", enqueue_then_fail)
+    with pytest.raises(RuntimeError, match="enqueue failed after admission"):
+        _invoke(env, prepared, x=x, out=out)
+    assert len(env.buffers) == 2 and env.runs[0].retired
+    assert all(source.uses == 1 for source in env.state._worker.sources._sources.values())
+    assert all(not buffer.closed for buffer in env.buffers)
+    env.state.close()
+    assert len(env.runs) == 2 and all(buffer.closed for buffer in env.buffers)
+
+
 def test_owners_live_until_retirement_and_closures_are_released(eager_env, prepared):
     env = eager_env
     frame = _invoke(env, prepared)

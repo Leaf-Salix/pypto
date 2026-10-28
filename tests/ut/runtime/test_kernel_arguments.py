@@ -10,6 +10,7 @@
 """Kernel argument packing stays independent of the program tensor adapter."""
 
 import ctypes
+from dataclasses import replace
 
 import pytest
 from pypto.ir.param_info import ParamInfo
@@ -70,6 +71,28 @@ def test_external_storage_leases_span_multiple_calls(eager_env):
     assert not env.buffers[0].closed
     second.release()
     assert env.buffers[0].closed
+    env.state.close()
+
+
+def test_handoff_requires_same_owner_and_deduplicates_views(eager_env):
+    env = eager_env
+    env.init()
+    session = env.state.bound_worker(env.state.require_config())
+    base = env.tensor((32, 16))
+    frame = _frame([base, base[16:]])
+    pool = session.sources
+    arguments = BorrowedArguments(frame, pool, session.device_location)
+    source = next(iter(pool._sources.values()))
+    release = pool.hold_existing(frame.tensors)
+    assert source.uses == 2  # One hold for the allocation, not each view.
+    release()
+    assert source.uses == 1
+    # Matching addresses alone cannot authorize an owner handoff.
+    release = pool.hold_existing((replace(frame.tensors[0], storage=object()),))
+    assert source.uses == 1
+    release()
+    arguments.release()
+    assert not pool._sources and env.buffers[0].closed
     env.state.close()
 
 

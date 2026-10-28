@@ -147,6 +147,53 @@ def function_signature(func: Any) -> inspect.Signature:
     return signature
 
 
+@dataclass(frozen=True)
+class ParameterStructure:
+    """Structure of an immutable ordinary Signature, without annotation results."""
+
+    names: tuple[str, ...]
+    declarations: tuple[tuple[str, inspect.Parameter], ...]
+    all_positional: bool
+
+
+_PARAMETER_STRUCTURES: dict[Any, tuple[inspect.Signature, ParameterStructure]] = {}
+
+
+def function_parameters(func: Any, signature: inspect.Signature) -> ParameterStructure | None:
+    """Reuse parameter traversal without caching annotation evaluation or fields.
+
+    The caller supplies its already-read, guarded signature: reading it again
+    could change a custom callable's dynamic __signature__ outside a request.
+    Ordinary Parameters are immutable; their annotation objects
+    need not be. Keep Parameter references but reread annotation classification,
+    evaluation and layout/dtype fields at each original use. Custom signatures
+    and parameters retain their old properties and bind methods.
+    """
+    if type(signature) is not inspect.Signature:
+        return None
+    cached = _PARAMETER_STRUCTURES.get(func)
+    if cached is not None and cached[0] is signature:
+        return cached[1]
+    parameters = tuple(signature.parameters.items())
+    if any(type(parameter) is not inspect.Parameter for _, parameter in parameters):
+        return None
+    declarations = tuple((name, parameter) for name, parameter in parameters if name != "self")
+    structure = ParameterStructure(
+        tuple(name for name, _ in parameters),
+        declarations,
+        all(
+            parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for _, parameter in parameters
+        ),
+    )
+    # Publish the immutable signature and structure together. Eviction only
+    # repeats construction; strong references prevent recycled-id matches.
+    if len(_PARAMETER_STRUCTURES) >= 512:
+        _PARAMETER_STRUCTURES.clear()
+    _PARAMETER_STRUCTURES[func] = (signature, structure)
+    return structure
+
+
 def function_namespace(func: Any) -> Mapping[str, Any]:
     """Return captured module globals with closure bindings taking precedence."""
     snapshot = _ACTIVE_NAMESPACES.get()

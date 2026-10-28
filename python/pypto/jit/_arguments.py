@@ -14,13 +14,13 @@ read captured namespaces through the existing specializer services."""
 
 import inspect
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
 
-from ._source import function_signature
+from ._source import function_parameters, function_signature
 from .specializer import (
     DynDim,
     ShapeDim,
@@ -192,11 +192,31 @@ def resolve_annotation(annotation: Any, ann_ns: Mapping[str, Any] | None) -> Any
         return annotation
 
 
-def _annotation_namespace(func: Any, sig: inspect.Signature) -> Mapping[str, Any] | None:
-    """Namespace for resolving ``func``'s string annotations, or None if unneeded."""
-    if any(isinstance(p.annotation, str) for n, p in sig.parameters.items() if n != "self"):
-        return func_name_lookup(func)
-    return None
+def _parameter_declarations(
+    func: Any,
+    sig: inspect.Signature,
+) -> tuple[Iterable[tuple[str, inspect.Parameter]], Mapping[str, Any] | None]:
+    """Share immutable parameter structure, while resolving annotations at each use."""
+    structure = function_parameters(func, sig)
+    if structure is not None:
+        parameters = structure.declarations
+        # Even isinstance can consult a mutable annotation's __class__.
+        # Reuse only parameter structure, never this classification result.
+        has_strings = any(isinstance(parameter.annotation, str) for _, parameter in parameters)
+    else:
+        # Preserve the original two property reads and their order: a custom
+        # Signature may expose different parameters after namespace discovery.
+        has_strings = any(
+            isinstance(parameter.annotation, str)
+            for name, parameter in sig.parameters.items()
+            if name != "self"
+        )
+        namespace = func_name_lookup(func) if has_strings else None
+        return (
+            ((name, parameter) for name, parameter in sig.parameters.items() if name != "self"),
+            namespace,
+        )
+    return parameters, func_name_lookup(func) if has_strings else None
 
 
 def _annotation_layout(annotation: Any, param_name: str, func_name: str) -> _ir.TensorLayout | None:
@@ -254,12 +274,10 @@ def param_layouts(func: Any, func_name: str) -> dict[str, _ir.TensorLayout]:
         sig = function_signature(func)
     except (TypeError, ValueError):
         return {}
-    ann_ns = _annotation_namespace(func, sig)
+    parameters, ann_ns = _parameter_declarations(func, sig)
 
     layouts: dict[str, _ir.TensorLayout] = {}
-    for name, param in sig.parameters.items():
-        if name == "self":
-            continue
+    for name, param in parameters:
         layout = _annotation_layout(resolve_annotation(param.annotation, ann_ns), name, func_name)
         if layout is not None:
             layouts[name] = layout
@@ -277,12 +295,10 @@ def param_dtypes(func: Any) -> dict[str, DataType]:
         sig = function_signature(func)
     except (TypeError, ValueError):
         return {}
-    ann_ns = _annotation_namespace(func, sig)
+    parameters, ann_ns = _parameter_declarations(func, sig)
 
     dtypes: dict[str, DataType] = {}
-    for name, param in sig.parameters.items():
-        if name == "self":
-            continue
+    for name, param in parameters:
         annotation = resolve_annotation(param.annotation, ann_ns)
         dtype = getattr(annotation, "dtype", None)
         if isinstance(dtype, DataType) and dtype in (DataType.FP4E2M1X2, DataType.FP4E1M2X2):
@@ -313,12 +329,12 @@ def constexpr_params(func: Any) -> list[str]:
         sig = function_signature(func)
     except (TypeError, ValueError):
         return []
-    ann_ns = _annotation_namespace(func, sig)
+    parameters, ann_ns = _parameter_declarations(func, sig)
 
     return [
         name
-        for name, param in sig.parameters.items()
-        if name != "self" and isinstance(resolve_annotation(param.annotation, ann_ns), ConstexprMarker)
+        for name, param in parameters
+        if isinstance(resolve_annotation(param.annotation, ann_ns), ConstexprMarker)
     ]
 
 

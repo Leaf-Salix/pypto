@@ -84,7 +84,7 @@ from pypto.pypto_core import passes as _passes
 from pypto.pypto_core.passes import runtime_kind_to_name
 
 from . import _arguments, _ast_analysis, _call_binding, _tensor_meta
-from ._source import cache_in_snapshot, capture_namespaces, function_signature
+from ._source import cache_in_snapshot, capture_namespaces, function_parameters, function_signature
 from .cache import CacheKey, compute_source_hash, make_cache_key
 from .specializer import (
     DynDim,
@@ -824,7 +824,11 @@ class JITFunction:
     # ------------------------------------------------------------------
 
     def _param_names(self) -> list[str]:
-        return [p for p in function_signature(self._func).parameters if p != "self"]
+        sig = function_signature(self._func)
+        structure = function_parameters(self._func, sig)
+        if structure is not None:
+            return [name for name, _ in structure.declarations]
+        return [p for p in sig.parameters if p != "self"]
 
     def _bind_args(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -859,13 +863,24 @@ class JITFunction:
         """
         param_names = self._param_names()
         sig = function_signature(self._func)
-        try:
-            bound = sig.bind(*args, **kwargs)
-            bound.apply_defaults()
-        except TypeError as e:
-            raise TypeError(f"@pl.jit function '{self.__name__}': {e}") from e
-
-        arguments = dict(bound.arguments)
+        structure = function_parameters(self._func, sig)
+        if (
+            structure is not None
+            and structure.all_positional
+            and not kwargs
+            and len(args) == len(structure.names)
+        ):
+            # Every declared slot is supplied exactly once. No defaults or
+            # keyword/variadic rules remain to resolve; retain inspect.bind for
+            # all other forms and for its existing error diagnostics.
+            arguments = dict(zip(structure.names, args, strict=True))
+        else:
+            try:
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+            except TypeError as e:
+                raise TypeError(f"@pl.jit function '{self.__name__}': {e}") from e
+            arguments = dict(bound.arguments)
 
         deps, callers_by_id, _, call_args_cache = self._get_dep_graph()
         per_func_dyn_maps = _call_binding.compute_per_func_dyndim_maps(

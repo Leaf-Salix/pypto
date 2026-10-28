@@ -32,11 +32,15 @@ naming a new CSV. Never enable the launch probe for formal bench measurements.
 
 import argparse
 import cProfile
+import hashlib
 import importlib
+import importlib.util
 import json
 import os
 import statistics
+import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -378,16 +382,144 @@ def measure_session_resources(probe: FixedProbe, output: Path, samples: int, bat
             session._api.arguments = interface
 
 
+def measure_source_handoff(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
+    """Isolate admission handoff with the same complete JIT and fresh frames."""
+    pool = probe.session.sources
+    hold = pool.hold_existing
+    prepare = probe.prepare
+
+    def prepare_variant(stage: str) -> None:
+        pool.hold_existing = (lambda arguments: lambda: None) if stage == "baseline" else hold
+        prepare("aclnn" if stage == "aclnn" else "jit")
+
+    probe.prepare = prepare_variant
+    try:
+        measure(probe, output, samples, batches, ("baseline", "candidate", "aclnn"))
+    finally:
+        try:
+            probe.finish()
+        finally:
+            probe.prepare = prepare
+            pool.hold_existing = hold
+
+
+def count_source_lifecycle(probe: FixedProbe, output: Path, samples: int) -> None:
+    """Count separately from timings, including final lazy registry revocation."""
+    pool = probe.session.sources
+    worker = probe.worker
+    acquire, release = pool.acquire, pool.release
+    hold = pool.hold_existing
+    record, drop = worker._record_device_alloc, worker._drop_device_alloc
+    result = {}
+    for variant in ("baseline", "candidate"):
+        probe.finish()
+        counts = dict.fromkeys(("acquire", "miss", "release", "last_release", "record", "drop"), 0)
+
+        def count_acquire(argument: Any, location: Any, api: Any) -> Any:
+            counts["acquire"] += 1
+            key = (argument.metadata.storage_ptr, argument.metadata.storage_nbytes)
+            counts["miss"] += int(key not in pool._sources)
+            return acquire(argument, location, api)
+
+        def count_release(key: Any) -> None:
+            counts["release"] += 1
+            counts["last_release"] += int(pool._sources[key].uses == 1)
+            release(key)
+
+        def count_record(*args: Any, **kwargs: Any) -> Any:
+            counts["record"] += 1
+            return record(*args, **kwargs)
+
+        def count_drop(*args: Any, **kwargs: Any) -> Any:
+            counts["drop"] += 1
+            return drop(*args, **kwargs)
+
+        pool.acquire, pool.release = count_acquire, count_release
+        worker._record_device_alloc, worker._drop_device_alloc = count_record, count_drop
+        pool.hold_existing = (lambda arguments: lambda: None) if variant == "baseline" else hold
+        try:
+            probe.prepare("jit")
+            for _ in range(samples):
+                assert probe.call() is probe.out
+                npu.synchronize()
+            probe.check()
+            probe.finish()
+            expected = 3 * samples if variant == "baseline" else 3
+            assert counts["miss"] == counts["last_release"] == counts["record"] == counts["drop"] == expected
+            result[variant] = counts.copy()
+        finally:
+            pool.acquire, pool.release, pool.hold_existing = acquire, release, hold
+            worker._record_device_alloc, worker._drop_device_alloc = record, drop
+            probe.finish()
+    (output / "source-counts.json").write_text(json.dumps(result, indent=2))
+
+
+def measure_frame_snapshot(
+    probe: FixedProbe, output: Path, baseline: Path, samples: int, batches: int
+) -> None:
+    """Compare old frame/packer code with the same resolver and source handoff."""
+    from pypto.jit import _kernel  # noqa: PLC0415
+    from pypto.runtime.kernel import arguments  # noqa: PLC0415
+
+    def load(name: str, path: Path) -> Any:
+        spec = importlib.util.spec_from_file_location(name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    (output / "frame-baseline.json").write_text(
+        json.dumps(
+            {
+                name: hashlib.sha256((baseline / name).read_bytes()).hexdigest()
+                for name in ("python/pypto/torch/interop.py", "python/pypto/runtime/kernel/arguments.py")
+            },
+            indent=2,
+        )
+    )
+    old_frame = load("_hbg_baseline_interop", baseline / "python/pypto/torch/interop.py")
+    old_args = load("_hbg_baseline_arguments", baseline / "python/pypto/runtime/kernel/arguments.py")
+
+    @lru_cache(maxsize=128)
+    def old_signature(parameters: tuple[Any, ...], aliases: tuple[int, ...], platform: str) -> Any:
+        return old_frame.CallSignature(parameters, return_aliases=aliases, platform=platform)
+
+    signature, packer, prepare = _kernel._kernel_signature, arguments.BorrowedArguments, probe.prepare
+
+    def prepare_variant(stage: str) -> None:
+        _kernel._kernel_signature = old_signature if stage == "baseline" else signature
+        arguments.BorrowedArguments = old_args.BorrowedArguments if stage == "baseline" else packer
+        prepare("aclnn" if stage == "aclnn" else "jit")
+
+    probe.prepare = prepare_variant
+    try:
+        measure(probe, output, samples, batches, ("baseline", "candidate", "aclnn"))
+    finally:
+        try:
+            probe.finish()
+        finally:
+            probe.prepare = prepare
+            _kernel._kernel_signature, arguments.BorrowedArguments = signature, packer
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("smoke", "bench", "phases", "profile", "paired"), default="smoke")
+    parser.add_argument(
+        "--mode",
+        choices=("smoke", "bench", "phases", "profile", "paired", "handoff", "counts", "frame-paired"),
+        default="smoke",
+    )
     parser.add_argument("--samples", type=int, default=500)
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--stages", nargs="+", choices=STAGES, default=STAGES)
+    parser.add_argument("--baseline-root", type=Path)
     args = parser.parse_args()
-    if args.mode in ("bench", "paired") and (
+    if args.mode == "frame-paired" and args.baseline_root is None:
+        parser.error("frame-paired requires --baseline-root containing the old frame and argument source")
+    if args.mode in ("bench", "paired", "handoff", "frame-paired") and (
         os.environ.get("LD_PRELOAD") or os.environ.get("PYPTO_LAUNCH_PROBE_OUTPUT")
     ):
         parser.error("formal bench requires a fresh process without LD_PRELOAD or launch probes")
@@ -426,6 +558,7 @@ def main() -> None:
             torch.testing.assert_close(successor.cpu(), probe.expected * 2, rtol=0, atol=0)
             probe.finish()
         identity = {
+            "mode": args.mode,
             "pypto": pypto.__file__,
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
@@ -433,6 +566,7 @@ def main() -> None:
             "queue": os.environ.get("TASK_QUEUE_ENABLE"),
             "contract": "fixed storage/shape/dtype/offset/stream/scalars; no mutation or concurrency",
             "direct": "bypasses Torch task queue; not a queue-preserving optimization",
+            "paired_control": "paired/handoff/frame-paired restore selected old work, not an old install",
         }
         (args.output / "identity.json").write_text(json.dumps(identity, indent=2))
         if args.mode == "bench":
@@ -443,6 +577,12 @@ def main() -> None:
             profile_calls(probe, args.output, args.samples)
         elif args.mode == "paired":
             measure_session_resources(probe, args.output, args.samples, args.batches)
+        elif args.mode == "handoff":
+            measure_source_handoff(probe, args.output, args.samples, args.batches)
+        elif args.mode == "counts":
+            count_source_lifecycle(probe, args.output, args.samples)
+        elif args.mode == "frame-paired":
+            measure_frame_snapshot(probe, args.output, args.baseline_root, args.samples, args.batches)
     finally:
         probe.finish()
         probe.state.close()

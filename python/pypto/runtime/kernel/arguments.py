@@ -87,6 +87,33 @@ class SourcePool:
             else:
                 source.uses -= 1
 
+    def hold_existing(self, arguments: tuple[Any, ...]) -> Callable[[], None]:
+        """Bridge existing leases to this admission, without registering new storage.
+
+        The incoming frame already owns its current storage. Only identical
+        owners and ranges may bridge retirement of the preceding calls. There
+        is no idle cache: the admission releases this temporary hold even when
+        retirement or preparation fails, and drain still releases real sources.
+        """
+        with self._lock:
+            matches: dict[tuple[int, int], _Source] = {}
+            for argument in arguments:
+                meta = argument.metadata
+                key = (meta.storage_ptr, meta.storage_nbytes)
+                source = self._sources.get(key)
+                if source is not None and source.storage is argument.storage:
+                    matches[key] = source
+            keys = list(matches)
+            for key in keys:
+                matches[key].uses += 1
+
+        def release() -> None:
+            while keys:
+                self.release(keys[-1])
+                keys.pop()
+
+        return release
+
     def close(self) -> None:
         """Revoke remaining preparation-only sources after pending runs retire."""
         with self._lock:

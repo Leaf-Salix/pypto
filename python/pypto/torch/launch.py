@@ -119,7 +119,9 @@ def invoke(artifact: Any, frame: Any, config: Any) -> Any:
             owners=(session, arguments, call_config, frame),
         )
 
-    state.submit(registration, prepare)
+    state.submit(
+        registration, prepare, hold_sources=lambda session: session.sources.hold_existing(frame.tensors)
+    )
     return frame.alias_result()
 
 
