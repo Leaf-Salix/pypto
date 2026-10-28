@@ -88,7 +88,9 @@ def invoke(artifact: Any, frame: Any, config: Any) -> Any:
     def prepare(session: Any) -> PendingTicket:
         call_config = make_call_config(config, session._api.CallConfig)
         tensors = [arg.tensor for arg in frame.tensors]
-        arguments = BorrowedArguments(frame, session.sources, session.device_location)
+        arguments = BorrowedArguments(
+            frame, session.sources, session.device_location, api=session._api.arguments
+        )
 
         def enqueue(ticket: PendingTicket) -> None:
             def submit(caller_stream: int) -> None:

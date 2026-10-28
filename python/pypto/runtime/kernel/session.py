@@ -122,7 +122,7 @@ def require_runtime() -> Any:
             _require_method(owner, method, label)
     if not callable(getattr(interface, "Tensor", None)):
         raise NotImplementedError("Torch kernel runtime requires Tensor views")
-    return SimpleNamespace(Worker=worker, CallConfig=interface.CallConfig)
+    return SimpleNamespace(Worker=worker, CallConfig=interface.CallConfig, arguments=interface)
 
 
 def make_call_config(config: KernelConfig, factory: Any) -> Any:
@@ -158,6 +158,7 @@ class _BorrowedWorkerSession:
         self._device_id = config.device_id
         self._generation = state.generation
         self.worker: Any = None
+        self._device_location: Any = None
         self._owner = _OwnerThread()
 
     def check_context(self) -> None:
@@ -188,6 +189,11 @@ class _BorrowedWorkerSession:
             **options,
         )
         self.worker.init(prewarm_config=cfg, borrowed_context_generation=self._generation)
+        # BufferLocation retains the Worker's source/incarnation, not a mutable
+        # current-device query. Buffer.wrap and submit still validate its context.
+        # This session never replaces its Worker, so no cross-session cache or
+        # additional invalidation protocol is needed.
+        self._device_location = self.worker.device_location
 
     def prepare(self, callable_: Any) -> Any:
         def register() -> Any:
@@ -198,7 +204,7 @@ class _BorrowedWorkerSession:
 
     @property
     def device_location(self) -> Any:
-        return self.worker.device_location
+        return self._device_location
 
     def wait(self, ticket: Any) -> None:
         def retire() -> None:

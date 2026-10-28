@@ -31,6 +31,7 @@ naming a new CSV. Never enable the launch probe for formal bench measurements.
 """
 
 import argparse
+import cProfile
 import importlib
 import json
 import os
@@ -219,10 +220,10 @@ class FixedProbe:
         torch.testing.assert_close(self.aclnn_out.cpu(), self.expected, rtol=0, atol=0)
 
 
-def measure(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
+def measure(probe: FixedProbe, output: Path, samples: int, batches: int, stages: tuple[str, ...]) -> None:
     host, lifecycle = [], []
     for batch in range(batches):
-        order = STAGES[batch % len(STAGES) :] + STAGES[: batch % len(STAGES)]
+        order = stages[batch % len(stages) :] + stages[: batch % len(stages)]
         if batch % 2:
             order = order[::-1]
         for stage in order:
@@ -255,7 +256,7 @@ def measure(probe: FixedProbe, output: Path, samples: int, batches: int) -> None
             print("HOST", batch, stage, flush=True)
         (output / "host.json").write_text(json.dumps(host))
     for batch in range(12):
-        order = STAGES if batch % 2 == 0 else STAGES[::-1]
+        order = stages if batch % 2 == 0 else stages[::-1]
         for stage in order:
             probe.finish()
             start = time.perf_counter_ns()
@@ -283,7 +284,7 @@ def measure(probe: FixedProbe, output: Path, samples: int, batches: int) -> None
             "host_us": statistics.median(x["host_us"] for x in host if x["stage"] == stage),
             "lifecycle_cpu_us": statistics.median(x["cpu_us"] for x in lifecycle if x["stage"] == stage),
         }
-        for stage in STAGES
+        for stage in stages
     }
     (output / "summary.json").write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary), flush=True)
@@ -319,15 +320,76 @@ def phases(probe: FixedProbe, output: Path, samples: int) -> None:
     (output / "intervals.json").write_text(json.dumps(intervals))
 
 
+def profile_calls(probe: FixedProbe, output: Path, samples: int) -> None:
+    """Profile the caller thread separately from uninstrumented timings.
+
+    Use queue=0 to include the synchronous callback. With queue=1 this excludes
+    background submission; it is never a whole-process lifecycle CPU measure.
+    """
+    for stage in ("jit", "artifact", "frame", "arguments"):
+        probe.prepare(stage)
+        try:
+            for _ in range(20):
+                probe.call()
+                npu.synchronize()
+            profile = cProfile.Profile()
+            for _ in range(samples):
+                npu.synchronize()
+                profile.runcall(probe.call)
+                npu.synchronize()
+            profile.dump_stats(str(output / f"{stage}.prof"))
+            probe.check()
+        finally:
+            probe.finish()
+
+
+def measure_session_resources(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
+    """Alternate old session-resource work and reuse within one process.
+
+    This is a counterfactual hot-path control, not a second installed version:
+    restore the old location getter and the argument packer's existing API-load
+    fallback. Both variants execute the complete JIT path with the same session.
+    Run only in this single-caller diagnostic; finish all work before switching.
+    """
+    session = probe.session
+    session_type = type(session)
+    location = session_type.device_location
+    interface = session._api.arguments
+    prepare = probe.prepare
+
+    def prepare_variant(stage: str) -> None:
+        if stage == "baseline":
+            session_type.device_location = property(lambda owner: owner.worker.device_location)
+            session._api.arguments = None
+        else:
+            session_type.device_location = location
+            session._api.arguments = interface
+        prepare("aclnn" if stage == "aclnn" else "jit")
+
+    probe.prepare = prepare_variant
+    try:
+        measure(probe, output, samples, batches, ("baseline", "candidate", "aclnn"))
+    finally:
+        try:
+            probe.finish()
+        finally:
+            probe.prepare = prepare
+            session_type.device_location = location
+            session._api.arguments = interface
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("smoke", "bench", "phases"), default="smoke")
+    parser.add_argument("--mode", choices=("smoke", "bench", "phases", "profile", "paired"), default="smoke")
     parser.add_argument("--samples", type=int, default=500)
     parser.add_argument("--batches", type=int, default=8)
+    parser.add_argument("--stages", nargs="+", choices=STAGES, default=STAGES)
     args = parser.parse_args()
-    if args.mode == "bench" and (os.environ.get("LD_PRELOAD") or os.environ.get("PYPTO_LAUNCH_PROBE_OUTPUT")):
+    if args.mode in ("bench", "paired") and (
+        os.environ.get("LD_PRELOAD") or os.environ.get("PYPTO_LAUNCH_PROBE_OUTPUT")
+    ):
         parser.error("formal bench requires a fresh process without LD_PRELOAD or launch probes")
     args.output.mkdir(parents=True, exist_ok=True)
     # The parent already loaded the interposer. Do not preload it into compiler
@@ -374,9 +436,13 @@ def main() -> None:
         }
         (args.output / "identity.json").write_text(json.dumps(identity, indent=2))
         if args.mode == "bench":
-            measure(probe, args.output, args.samples, args.batches)
+            measure(probe, args.output, args.samples, args.batches, tuple(args.stages))
         elif args.mode == "phases":
             phases(probe, args.output, args.samples)
+        elif args.mode == "profile":
+            profile_calls(probe, args.output, args.samples)
+        elif args.mode == "paired":
+            measure_session_resources(probe, args.output, args.samples, args.batches)
     finally:
         probe.finish()
         probe.state.close()

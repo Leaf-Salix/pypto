@@ -73,6 +73,71 @@ def test_external_storage_leases_span_multiple_calls(eager_env):
     env.state.close()
 
 
+@pytest.mark.parametrize("reuse_interface", [False, True])
+def test_argument_interface_reuse_keeps_pin_guard(eager_env, monkeypatch, reuse_interface):
+    from pypto.runtime.kernel import arguments as module  # noqa: PLC0415
+
+    env = eager_env
+    env.init()
+    session = env.state.bound_worker(env.state.require_config())
+    assert session._api.arguments is env.api
+    frame = _frame([env.tensor()])
+    options = {"api": session._api.arguments} if reuse_interface else {}
+    checks = []
+    monkeypatch.setattr(module, "check_runtime_pin", lambda: checks.append(True))
+    for _ in range(2):
+        args = BorrowedArguments(frame, session.sources, session.device_location, **options)
+        args.release()
+    assert checks == [True, True]
+
+    # A changed pin policy must fail before constructing any new native args or
+    # sources, even when the interface was successfully checked at initialization.
+    def reject_pin():
+        raise ImportError("changed runtime pin policy")
+
+    monkeypatch.setattr(module, "check_runtime_pin", reject_pin)
+    monkeypatch.setattr(env.api, "TaskArgs", lambda: pytest.fail("packed before pin check"))
+    with pytest.raises(ImportError, match="changed runtime pin policy"):
+        BorrowedArguments(frame, session.sources, session.device_location, **options)
+    assert len(env.buffers) == 2 and all(buffer.closed for buffer in env.buffers)
+    env.state.close()
+
+
+def test_session_retains_location_but_wrap_still_checks_validity(eager_env, monkeypatch):
+    env = eager_env
+    locations = []
+
+    def location(worker):
+        assert "init" in env.events
+        locations.append(worker.location)
+        return worker.location
+
+    monkeypatch.setattr(env.api.Worker, "device_location", property(location))
+    env.init()
+    session = env.state.bound_worker(env.state.require_config())
+    frame = _frame([env.tensor()])
+    original_wrap = env.api.Buffer.wrap
+    live = True
+
+    def checked_wrap(**kwargs):
+        assert kwargs["location"] is locations[0]
+        if not live:
+            raise ValueError("source context expired")
+        return original_wrap(**kwargs)
+
+    # Model BufferLocation's public contract: retaining the capability does not
+    # make it valid after its source context expires. Every new wrap checks it.
+    monkeypatch.setattr(env.api.Buffer, "wrap", checked_wrap)
+    for _ in range(2):
+        args = BorrowedArguments(frame, session.sources, session.device_location, api=session._api.arguments)
+        args.release()
+    live = False
+    with pytest.raises(ValueError, match="source context expired"):
+        BorrowedArguments(frame, session.sources, session.device_location, api=session._api.arguments)
+    assert len(locations) == 1 and not session.sources._sources
+    env.state.close()
+
+
 @pytest.mark.parametrize("close_fails", [False, True])
 def test_partial_argument_construction_rolls_back_or_retains_storage(eager_env, monkeypatch, close_fails):
     env = eager_env

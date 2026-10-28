@@ -230,6 +230,22 @@ def test_close_can_finish_queued_callback_without_admission_lock_deadlock(eager_
     assert env.state.state is KernelState.CLOSED
 
 
+def test_previous_failure_prevents_preparation_with_reused_session_resources(eager_env, prepared):
+    env = eager_env
+    _invoke(env, prepared)
+    env.run_queue()
+    run = env.runs[0]
+    run.complete = True
+    run.wait_error = RuntimeError("earlier run failed")
+    buffers = len(env.buffers)
+    with pytest.raises(RuntimeError, match="earlier asynchronous launch error"):
+        _invoke(env, prepared)
+    assert len(env.buffers) == buffers and len(env.runs) == 1 and not env.queue
+    assert not any(buffer.closed for buffer in env.buffers)
+    run.wait_error = None
+    env.state.close()
+
+
 def test_close_synchronizes_the_retained_stream(eager_env, prepared):
     env = eager_env
     _invoke(env, prepared)

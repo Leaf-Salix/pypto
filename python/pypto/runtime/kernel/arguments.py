@@ -98,10 +98,15 @@ class SourcePool:
 class BorrowedArguments:
     """A call's TaskArgs and retryable leases; release only after run retirement."""
 
-    def __init__(self, frame: Any, pool: SourcePool, location: Any) -> None:
+    def __init__(self, frame: Any, pool: SourcePool, location: Any, *, api: Any = None) -> None:
         self._pool = pool
         self._keys: list[tuple[int, int]] = []
-        api = _load_api()
+        if api is None:
+            api = _load_api()
+        else:
+            # The session already loaded the interface, but the shared pin
+            # guard (including its dynamic skip policy) still runs per call.
+            check_runtime_pin()
         self.task_args = api.TaskArgs()
         sources: dict[tuple[int, int], Any] = {}
         tags = {
