@@ -21,6 +21,7 @@
 #include <torch_npu/csrc/framework/OpCommand.h>
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 
@@ -62,6 +63,26 @@ c10_npu::NPUStream CallStream(int64_t stream_id, int32_t device_id) {
   return stream;
 }
 
+// Official torch_npu wheels do not export g_used_aclop. Run one real ACL-op
+// through the exported OpCommand API so the framework enables its own GIL-safe
+// queue drains before receiving a Python callback. Do not replace this with a
+// local flag: stream.query(), empty_cache() and full-queue waits read the
+// framework's flag. This cold-start compatibility work is not repeated per call.
+// The caller must release the GIL before waiting on call_once or the stream.
+void PreparePythonCallbacks(const c10_npu::NPUStream& stream) {
+  static std::once_flag ready;
+  std::call_once(ready, [&stream] {
+    auto options = at::TensorOptions().device(stream.device()).dtype(at::kFloat);
+    auto input = at::zeros({1}, options);
+    auto output = at::empty({1}, options);
+    at_npu::native::OpCommand command;
+    command.Name("Identity").Input(input).Output(output).Run();
+    // Keep the bootstrap tensors alive until their operation completes, and
+    // propagate initialization errors before admitting the first callback.
+    stream.synchronize();
+  });
+}
+
 // PendingTicket owns callback and all Tensor/Storage references before this
 // function is called. The queue captures only the native stream and a borrowed
 // callback pointer; no Python reference is destroyed on an arbitrary queue thread.
@@ -80,15 +101,11 @@ void Enqueue(nb::list objects, int64_t stream_id, int32_t device_id, uintptr_t c
       c10_npu::NPUCachingAllocator::recordStream(storage.data_ptr(), stream);
     }
   }
-  // torch_npu 2.6/2.10 queue drains release the caller GIL only after this
-  // process-wide flag is set. Our Python callback has the same requirement as
-  // ACL-op compilation, including later stream.query() and empty_cache() calls.
-  // Set it before admission and never reset it while queued work may exist.
-  g_used_aclop = true;
   PyObject* borrowed_callback = callback.ptr();
   // Queue admission may block. Release the caller GIL so the queue can enter
   // Python, both when callbacks execute inline and when taskQueue is enabled.
   nb::gil_scoped_release release;
+  PreparePythonCallbacks(stream);
   at_npu::native::OpCommand::RunOpApiV2("PyPTOKernel", [stream, borrowed_callback]() -> int {
     std::string error;
     {

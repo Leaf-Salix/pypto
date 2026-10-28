@@ -10,6 +10,7 @@
 """Validate call frames against actual torch_npu storage and stream contexts."""
 
 import ctypes
+import importlib.util
 import os
 import subprocess
 import sys
@@ -89,13 +90,17 @@ def test_real_npu_rejects_transposed_input(npu_context):
         signature.describe_call((value,))
 
 
-@pytest.mark.parametrize("drain", ["query", "empty_cache"])
+@pytest.mark.parametrize("drain", ["query", "empty_cache", "full_queue"])
 def test_python_queue_callback_survives_gil_held_drain(npu_context, test_config, drain):
-    """A fresh OpApi-only process must release the GIL while draining callbacks."""
-    pytest.importorskip("pypto._torch_npu")
+    """Queue drains work in a fresh process without external ACL-op warmup."""
+    if importlib.util.find_spec("pypto._torch_npu") is None:
+        pytest.skip("optional native adapter was not built")
+    # An installed but unloadable adapter is a regression, not an optional skip.
+    importlib.import_module("pypto._torch_npu")
     script = textwrap.dedent("""
         import sys
         import threading
+        import time
         import torch
         import torch_npu
         from pypto import _torch_npu
@@ -104,6 +109,7 @@ def test_python_queue_callback_survives_gil_held_drain(npu_context, test_config,
         torch.npu.set_device(device)
         stream = torch.npu.current_stream()
         context = _torch_npu.borrow_context(device)
+        events = [torch.npu.Event() for _ in range(8192)] if sys.argv[2] == "full_queue" else []
         # The first enqueue drains the INIT queue synchronously. Complete a
         # nonblocking OpApi callback before testing a later GIL-held drain.
         warmed = threading.Event()
@@ -122,16 +128,40 @@ def test_python_queue_callback_survives_gil_held_drain(npu_context, test_config,
             assert unblock.wait(10)
             finished.set()
 
-        # No ACL-op runs first: only the adapter can enable GIL-safe queue drains.
+        # The process has no external ACL-op warmup: the adapter must arrange
+        # GIL-safe queue drains before admitting any Python callback.
         _torch_npu.enqueue([], stream.stream_id, device, context, callback)
         assert started.wait(10)
-        timer = threading.Timer(0.1, unblock.set)
+        filled, progress, failures = threading.Event(), [0], []
+
+        def release_full_queue():
+            # Do not release the consumer merely because a fixed timer fired:
+            # first prove the producer reached capacity and then stopped there.
+            if not filled.wait(10):
+                failures.append("producer did not reach queue capacity")
+            else:
+                time.sleep(0.2)
+                if not 4090 <= progress[0] < 8192:
+                    failures.append(f"producer did not block at capacity: {progress[0]}")
+            unblock.set()
+
+        timer = (threading.Thread(target=release_full_queue) if events
+                 else threading.Timer(0.1, unblock.set))
         timer.start()
         if sys.argv[2] == "query":
             stream.query()
-        else:
+        elif sys.argv[2] == "empty_cache":
             torch.npu.empty_cache()
+        else:
+            # Exceed the framework's 4096-entry queue while the consumer is
+            # blocked in a Python callback. Event.record enters with the GIL.
+            for index, event in enumerate(events):
+                event.record(stream)
+                progress[0] = index + 1
+                if progress[0] == 4090:
+                    filled.set()
         timer.join()
+        assert not failures, failures
         assert finished.wait(10)
         stream.synchronize()
     """)
