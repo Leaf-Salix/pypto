@@ -398,6 +398,9 @@ def live_checks(probe: Any, prepare: Any, finish: Any, output: Path) -> None:
         assert len(set(counts.values())) == 1 and counts["baseline"] > 0
         # Keep the real compile/cache insertion path. Reshaping creates a new
         # specialization; no compile sentinel and no cache dictionary edits.
+        # Registration of a new artifact requires finalized native runs, not
+        # just device synchronization. Keep the diagnostic resolver installed.
+        probe.state.drain()
         before = len(add_kernel._cache)
         shaped = tuple(tensor.reshape(64, 64) for tensor in probe.inputs)
         assert add_kernel(*shaped) is shaped[2]
