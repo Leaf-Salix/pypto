@@ -159,18 +159,17 @@ def key_statements(call: ast.Call) -> list[ast.stmt]:
         "tensor_layouts",
     ]
     expressions = {kw.arg: kw.value for kw in call.keywords}
-    assert ast.unparse(expressions["tensor_shapes"]) == (
-        "{n: m.static_shape() for n, m in specialization.tensor_meta.items()}"
-    )
-    assert ast.unparse(expressions["tensor_dtypes"]) == (
-        "{n: m.dtype for n, m in specialization.tensor_meta.items()}"
-    )
-    assert ast.unparse(expressions["tensor_layouts"]) == (
-        "{n: m.layout for n, m in specialization.tensor_meta.items()}"
-    )
-    assert ast.unparse(expressions["dynamic_dims"]) == (
-        "{(n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()}"
-    )
+    expected = {
+        "tensor_shapes": "{n: m.static_shape() for n, m in specialization.tensor_meta.items()}",
+        "tensor_dtypes": "{n: m.dtype for n, m in specialization.tensor_meta.items()}",
+        "tensor_layouts": "{n: m.layout for n, m in specialization.tensor_meta.items()}",
+        "dynamic_dims": (
+            "{(n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()}"
+        ),
+    }
+    # unparse formatting differs across supported Python versions.
+    for name, expression in expected.items():
+        assert ast.dump(expressions[name]) == ast.dump(ast.parse(expression, mode="eval").body), name
     original = copy.deepcopy(call)
     original.keywords[0].value = ast.Name(id="_diag_source", ctx=ast.Load())
     original.keywords[1].value = ast.Name(id="_diag_names", ctx=ast.Load())
