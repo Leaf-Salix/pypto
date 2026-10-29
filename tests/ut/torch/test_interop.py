@@ -11,6 +11,7 @@
 
 import ctypes
 import gc
+import sys
 import weakref
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
@@ -350,15 +351,7 @@ def test_invalid_scalars_fail_before_framework_queries(npu, dtype, value, error)
 
 def test_optional_torch_npu_dependency_error(monkeypatch):
     """Missing framework support gives a targeted error only when it is needed."""
-    original = interop.importlib.import_module
-
-    def import_module(name):
-        """Hide torch_npu while preserving every unrelated module import."""
-        if name == "torch_npu":
-            raise ModuleNotFoundError("torch_npu missing")
-        return original(name)
-
-    monkeypatch.setattr(interop.importlib, "import_module", import_module)
+    monkeypatch.setitem(sys.modules, "torch_npu", None)
     with pytest.raises(RuntimeError, match="requires a compatible torch_npu"):
         interop.CallSignature([_param("n", None, DataType.INT32)]).describe_call((1,))
 

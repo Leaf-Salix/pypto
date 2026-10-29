@@ -102,7 +102,7 @@ class CallFrame:
 def _load_torch_npu() -> Any:
     """Load the optional framework extension only for a real call description."""
     try:
-        return importlib.import_module("torch_npu")
+        return __import__("torch_npu")
     except ImportError as exc:
         raise RuntimeError("Describing NPU calls requires a compatible torch_npu installation") from exc
 

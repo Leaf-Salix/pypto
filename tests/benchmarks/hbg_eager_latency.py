@@ -689,6 +689,54 @@ def measure_adapter_layers(probe: FixedProbe, output: Path, samples: int, batche
             probe.prepare = prepare
 
 
+def measure_imports(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
+    """Compare the installed loaders with their original dynamic-import work."""
+    from pypto.torch import interop  # noqa: PLC0415
+
+    def dynamic_native() -> Any:
+        try:
+            native = importlib.import_module("pypto._torch_npu")
+        except ModuleNotFoundError as exc:
+            if exc.name != "pypto._torch_npu":
+                raise
+            raise RuntimeError(
+                "Torch kernel initialization requires the optional pypto._torch_npu adapter; "
+                "build with PYPTO_BUILD_TORCH_NPU=ON and matching torch/torch_npu/CANN"
+            ) from exc
+        for name in ("check_call", "borrow_context", "bind_context", "framework_alive", "retain_until_exit"):
+            if not callable(getattr(native, name, None)):
+                raise NotImplementedError(f"Torch lifecycle adapter requires {name}; rebuild the adapter")
+        return native
+
+    def dynamic_torch_npu() -> Any:
+        try:
+            return importlib.import_module("torch_npu")
+        except ImportError as exc:
+            raise RuntimeError("Describing NPU calls requires a compatible torch_npu installation") from exc
+
+    patches = _DiagnosticPatches()
+    prepare = probe.prepare
+
+    def prepare_variant(stage: str) -> None:
+        patches.restore()
+        prepare("aclnn" if stage == "aclnn" else "jit")
+        (probe.aclnn_out if stage == "aclnn" else probe.out).fill_(float("nan"))
+        npu.synchronize()
+        if stage == "dynamic_imports":
+            patches.set(launch, "_load_native", dynamic_native)
+            patches.set(interop, "_load_torch_npu", dynamic_torch_npu)
+
+    probe.prepare = prepare_variant
+    try:
+        measure(probe, output, samples, batches, ("dynamic_imports", "local_imports", "aclnn"))
+    finally:
+        try:
+            probe.finish()
+        finally:
+            patches.restore()
+            probe.prepare = prepare
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, required=True)
@@ -706,6 +754,7 @@ def main() -> None:
             "frame-paired",
             "resolver-layers",
             "adapter-layers",
+            "import-paired",
         ),
         default="smoke",
     )
@@ -716,9 +765,15 @@ def main() -> None:
     args = parser.parse_args()
     if args.mode == "frame-paired" and args.baseline_root is None:
         parser.error("frame-paired requires --baseline-root containing the old frame and argument source")
-    if args.mode in ("bench", "paired", "handoff", "frame-paired", "resolver-layers", "adapter-layers") and (
-        os.environ.get("LD_PRELOAD") or os.environ.get("PYPTO_LAUNCH_PROBE_OUTPUT")
-    ):
+    if args.mode in (
+        "bench",
+        "paired",
+        "handoff",
+        "frame-paired",
+        "resolver-layers",
+        "adapter-layers",
+        "import-paired",
+    ) and (os.environ.get("LD_PRELOAD") or os.environ.get("PYPTO_LAUNCH_PROBE_OUTPUT")):
         parser.error("formal bench requires a fresh process without LD_PRELOAD or launch probes")
     args.output.mkdir(parents=True, exist_ok=True)
     # The parent already loaded the interposer. Do not preload it into compiler
@@ -772,12 +827,13 @@ def main() -> None:
             phases(probe, args.output, args.samples)
         elif args.mode == "profile":
             profile_calls(probe, args.output, args.samples)
-        elif args.mode in ("paired", "handoff", "resolver-layers", "adapter-layers"):
+        elif args.mode in ("paired", "handoff", "resolver-layers", "adapter-layers", "import-paired"):
             {
                 "paired": measure_session_resources,
                 "handoff": measure_source_handoff,
                 "resolver-layers": measure_resolver_layers,
                 "adapter-layers": measure_adapter_layers,
+                "import-paired": measure_imports,
             }[args.mode](probe, args.output, args.samples, args.batches)
         elif args.mode == "counts":
             count_source_lifecycle(probe, args.output, args.samples)

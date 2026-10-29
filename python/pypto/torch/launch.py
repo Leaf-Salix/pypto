@@ -9,13 +9,13 @@
 
 """Submit eager kernels at the Torch host-queue boundary using public Worker APIs."""
 
-import importlib
 from typing import Any
 
 
 def _load_native() -> Any:
     try:
-        native = importlib.import_module("pypto._torch_npu")
+        # A nonempty fromlist returns the submodule, not its parent attribute.
+        native = __import__("pypto._torch_npu", fromlist=("__name__",))
     except ModuleNotFoundError as exc:
         if exc.name != "pypto._torch_npu":
             raise
