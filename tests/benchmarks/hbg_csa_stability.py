@@ -15,6 +15,7 @@ No graph is captured. Each queue setting/seed must run in a fresh process.
 """
 
 import argparse
+import ast
 import hashlib
 import importlib
 import importlib.abc
@@ -28,6 +29,50 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+class TileAblations:
+    """Restore only the two annotation preparation functions between blocks."""
+
+    def __init__(self, baseline: Path) -> None:
+        from hbg_eager_latency import _DiagnosticPatches  # noqa: PLC0415
+
+        self.patches = _DiagnosticPatches()
+        self.specializer = importlib.import_module("pypto.jit.specializer")
+        self.decorator = importlib.import_module("pypto.jit.decorator")
+        names = ("_eager_tile_annotation_data", "tile_annotation_fingerprints")
+        source = baseline.read_text()
+        tree = ast.parse(source, filename=str(baseline))
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        assert sorted(node.name for node in nodes) == sorted(names), (baseline, names)
+        self.functions: dict[str, Any] = {}
+        statements: list[ast.stmt] = list(nodes)
+        # Function globals remain the live module, so the restored fingerprint
+        # function sees the restored eager helper and current request snapshots.
+        exec(
+            compile(ast.Module(body=statements, type_ignores=[]), str(baseline), "exec"),
+            vars(self.specializer),
+            self.functions,
+        )
+        self.hashes = {str(baseline): hashlib.sha256(source.encode()).hexdigest()}
+        for module in (self.specializer, self.decorator):
+            assert module.__file__ is not None
+            path = Path(module.__file__)
+            self.hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def install(self, stage: str) -> None:
+        assert not self.patches.saved
+        assert stage in ("current_a", "current_b", "off_tile"), stage
+        if stage == "off_tile":
+            for name, function in self.functions.items():
+                self.patches.set(self.specializer, name, function)
+            # decorator imports this function by value rather than module lookup.
+            self.patches.set(
+                self.decorator, "tile_annotation_fingerprints", self.functions["tile_annotation_fingerprints"]
+            )
+
+    def restore(self) -> None:
+        self.patches.restore()
 
 
 def bind_csa(source: Path, native: Path) -> Any:
@@ -184,13 +229,22 @@ def diagnose_sources(
     return result | {"us_p50": float("nan")}
 
 
+def select_ablations(args: Any) -> tuple[Any, tuple[str, ...]]:
+    from hbg_stability_audit import STAGES, Ablations  # noqa: PLC0415
+
+    if args.mode == "smoke":
+        return None, ("current_a", "current_b")
+    if args.suite == "tile":
+        return TileAblations(args.tile_baseline), ("current_a", "current_b", "off_tile")
+    return Ablations(args.baselines), tuple(stage for stage in STAGES if stage != "aclnn")
+
+
 def install_measurement(case: Any, root: Any, args: Any) -> None:
-    from hbg_stability_audit import STAGES, Ablations, npu  # noqa: PLC0415
+    from hbg_stability_audit import npu  # noqa: PLC0415
     from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
     from pypto.runtime.kernel.context import get_process_kernel_state  # noqa: PLC0415
 
-    ablations = Ablations(args.baselines) if args.mode != "smoke" else None
-    stages = tuple(stage for stage in STAGES if stage != "aclnn") if ablations else ("current_a", "current_b")
+    ablations, stages = select_ablations(args)
     rng = random.Random(args.seed)
     calls = 0
     cold_compile = []
@@ -373,7 +427,7 @@ def write_identity(args: Any) -> None:
         "simpler_log_level": logging.getLogger("simpler").getEffectiveLevel(),
         "measurement": {
             name: getattr(args, name)
-            for name in ("mode", "seed", "blocks", "samples", "warmup", "cpu_samples", "history")
+            for name in ("mode", "suite", "seed", "blocks", "samples", "warmup", "cpu_samples", "history")
         },
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "environment": {
@@ -397,6 +451,8 @@ def main() -> None:
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--baselines", type=Path)
+    parser.add_argument("--suite", choices=("all", "tile"), default="all")
+    parser.add_argument("--tile-baseline", type=Path, help="Pre-optimization specializer.py for --suite tile")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mode", choices=("smoke", "bench", "diagnostic"), default="smoke")
     parser.add_argument("--device", type=int, default=0)
@@ -407,8 +463,11 @@ def main() -> None:
     parser.add_argument("--cpu-samples", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
-    if args.mode != "smoke" and args.baselines is None:
-        parser.error("--mode bench/diagnostic requires --baselines")
+    if args.mode != "smoke":
+        if args.suite == "all" and args.baselines is None:
+            parser.error("--suite all with --mode bench/diagnostic requires --baselines")
+        if args.suite == "tile" and args.tile_baseline is None:
+            parser.error("--suite tile with --mode bench/diagnostic requires --tile-baseline")
     if min(args.blocks, args.samples, args.warmup, args.cpu_samples) < 1:
         parser.error("All measurement counts must be positive")
     if args.mode == "smoke":
