@@ -23,14 +23,7 @@ def _load_native() -> Any:
             "Torch kernel initialization requires the optional pypto._torch_npu adapter; "
             "build with PYPTO_BUILD_TORCH_NPU=ON and matching torch/torch_npu/CANN"
         ) from exc
-    for name in (
-        "check_call",
-        "check_current_call",
-        "borrow_context",
-        "bind_context",
-        "framework_alive",
-        "retain_until_exit",
-    ):
+    for name in ("check_call", "borrow_context", "bind_context", "framework_alive", "retain_until_exit"):
         if not callable(getattr(native, name, None)):
             raise NotImplementedError(f"Torch lifecycle adapter requires {name}; rebuild the adapter")
     return native
@@ -42,11 +35,8 @@ def _capture_supported() -> bool:
     return False
 
 
-def _check_capture(stream_id: int | None, device: int) -> bool:
-    native = _load_native()
-    capturing = bool(
-        native.check_current_call(device) if stream_id is None else native.check_call(stream_id, device)
-    )
+def _check_capture(stream_id: int, device: int) -> bool:
+    capturing = bool(_load_native().check_call(stream_id, device))
     if capturing and not _capture_supported():
         raise NotImplementedError("Torch kernel graph capture/replay is not supported, even after warmup")
     return capturing
@@ -60,9 +50,8 @@ def check_eager_call(config: Any) -> bool:
     device = npu.current_device()
     if device != config.device_id:
         raise ValueError(f"Kernel call device {device} differs from initialized NPU {config.device_id}")
-    # This gate needs only capture status, not a Python Stream owner. The frame
-    # still reads its own current stream after resolution and retains it for wait.
-    return _check_capture(None, device)
+    stream = npu.current_stream(device)
+    return _check_capture(stream.stream_id, device)
 
 
 def check_frame(frame: Any, config: Any) -> bool:

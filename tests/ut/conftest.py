@@ -575,7 +575,6 @@ def eager_env(monkeypatch):
     native = SimpleNamespace(
         enqueue=enqueue,
         check_call=lambda stream, device: env.capture,
-        check_current_call=lambda device: env.capture,
         borrow_context=lambda device: env.context,
         bind_context=lambda context: None,
         framework_alive=lambda: True,

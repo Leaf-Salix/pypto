@@ -187,7 +187,6 @@ def test_native_loader_uses_current_module_not_stale_package_attribute(monkeypat
     monkeypatch.setattr(pypto, "_torch_npu", SimpleNamespace(), raising=False)
     native = SimpleNamespace(
         check_call=lambda: None,
-        check_current_call=lambda: None,
         borrow_context=lambda: None,
         bind_context=lambda: None,
         framework_alive=lambda: None,
@@ -198,15 +197,7 @@ def test_native_loader_uses_current_module_not_stale_package_attribute(monkeypat
 
 
 @pytest.mark.parametrize(
-    "capability",
-    [
-        "check_call",
-        "check_current_call",
-        "borrow_context",
-        "bind_context",
-        "framework_alive",
-        "retain_until_exit",
-    ],
+    "capability", ["check_call", "borrow_context", "bind_context", "framework_alive", "retain_until_exit"]
 )
 def test_native_loader_rechecks_capabilities_on_warm_calls(monkeypatch, capability):
     native = SimpleNamespace(
@@ -214,7 +205,6 @@ def test_native_loader_rechecks_capabilities_on_warm_calls(monkeypatch, capabili
             name: lambda: None
             for name in (
                 "check_call",
-                "check_current_call",
                 "borrow_context",
                 "bind_context",
                 "framework_alive",
