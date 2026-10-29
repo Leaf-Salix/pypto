@@ -18,19 +18,22 @@ before/after runs quantify instrumentation inflation, not optimization benefit.
 """
 
 import argparse
+import ast
 import importlib
+import inspect
 import itertools
 import json
 import os
 import statistics
+import textwrap
 import threading
 import time
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from hbg_eager_latency import FixedProbe, configure_logging, npu, pypto, torch, torch_npu
-from pypto.jit import decorator
+from pypto.jit import _arguments, _call_binding, decorator
 from pypto.runtime.kernel.arguments import BorrowedArguments
 from pypto.runtime.kernel.pending import PendingTicket
 from pypto.torch import interop, launch
@@ -86,7 +89,63 @@ class Spans:
         self._restore.append((owner, name, original, own_attribute))
         setattr(owner, name, wrapped)
 
-    def install(self, probe: FixedProbe) -> None:
+    def install_sections(self) -> None:
+        """Timestamp coarse resolver sections without nested helper wrappers."""
+        original = decorator.JITFunction._resolve_compiled
+        node = ast.parse(textwrap.dedent(inspect.getsource(original))).body[0]
+        assert isinstance(node, ast.FunctionDef)
+        checkpoints = {
+            "specialization, run_config": "binding",
+            "compile_kwargs, bypass_cache": "policy",
+            "cache_config": "cache_policy",
+            "ordered_args": "dispatch_setup",
+            "constexpr_bindings": "constexpr",
+            "key": "key_inputs",
+        }
+        body = []
+        labels = []
+        for statement in node.body:
+            label = None
+            if isinstance(statement, ast.Assign):
+                label = checkpoints.get(ast.unparse(statement.targets[0]).strip("()"))
+            elif isinstance(statement, ast.If) and ast.unparse(statement.test) == "_contract is not None":
+                label = "contract"
+            elif isinstance(statement, ast.With):
+                label = "lookup"
+            elif isinstance(statement, ast.Return):
+                label = "returned"
+            if label is not None:
+                labels.append(label)
+                body.append(ast.parse(f"_hbg_resolver_mark({label!r})").body[0])
+            body.append(statement)
+        assert labels == [*checkpoints.values(), "contract", "lookup", "returned"], labels
+        node.body = body
+        namespace = cast(dict[str, Any], vars(decorator))
+        name = "_hbg_resolver_mark"
+        assert name not in namespace
+        self._restore.append((decorator, name, None, False))
+
+        def mark(label: str) -> None:
+            if self.sample is not None:
+                self.events.append(
+                    {"sample": self.sample, "section": label, "time_ns": time.perf_counter_ns()}
+                )
+
+        setattr(decorator, name, mark)
+        local: dict[str, Any] = {}
+        exec(
+            compile(
+                ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+                "<hbg-resolver-sections>",
+                "exec",
+            ),
+            namespace,
+            local,
+        )
+        self._restore.append((decorator.JITFunction, "_resolve_compiled", original, True))
+        decorator.JITFunction._resolve_compiled = local[node.name]
+
+    def install(self, probe: FixedProbe, resolver_only: bool = False) -> None:
         for name in (
             "_resolve_compiled",
             "_resolve_specialization",
@@ -98,6 +157,29 @@ class Spans:
             self.patch(decorator.JITFunction, name, f"jit.{name}")
         for name in ("_resolve_compile_request", "_request_source_hash", "make_cache_key"):
             self.patch(decorator, name, f"jit.{name}")
+        if resolver_only:
+            for name in (
+                "_param_names",
+                "_get_dep_graph",
+                "_get_dep_graph_state",
+                "_constexpr_identity_records",
+            ):
+                self.patch(decorator.JITFunction, name, f"jit.{name}")
+            for name in (
+                "capture_cache_config",
+                "_platform_string",
+                "_resolve_runtime",
+                "_eager_platform",
+                "_parse_platform",
+                "_eager_runtime",
+                "record_stats",
+                "_discover_dep_bindings",
+            ):
+                self.patch(decorator, name, f"jit.{name}")
+            for name in ("param_layouts", "param_dtypes", "constexpr_params", "extract_tensor_meta"):
+                self.patch(_arguments, name, f"binding.{name}")
+            self.patch(_call_binding, "compute_per_func_dyndim_maps", "binding.dynamic_maps")
+            return
         self.patch(interop.CallSignature, "describe_call", "frame.describe_call")
         self.patch(interop, "_load_torch_npu", "interop._load_torch_npu")
         for name in ("check_eager_call", "check_frame", "_load_native"):
@@ -184,6 +266,8 @@ def main() -> None:
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=200)
+    parser.add_argument("--resolver-only", action="store_true")
+    parser.add_argument("--resolver-sections", action="store_true")
     args = parser.parse_args()
     if args.samples <= 0:
         parser.error("samples must be positive")
@@ -199,7 +283,10 @@ def main() -> None:
     try:
         before = measure(probe, args.samples)
         try:
-            spans.install(probe)
+            if args.resolver_sections:
+                spans.install_sections()
+            else:
+                spans.install(probe, args.resolver_only)
             instrumented = measure(probe, args.samples, spans)
         finally:
             spans.restore()
@@ -216,7 +303,7 @@ def main() -> None:
             "inflation_ratio": {
                 label: medians["instrumented"] / medians[label] for label in ("before", "after")
             },
-            "inclusive_spans": summarize(spans.events, args.samples),
+            "inclusive_spans": {} if args.resolver_sections else summarize(spans.events, args.samples),
             "warning": "Inclusive spans overlap; never add parent/child or caller/background totals to Host.",
         }
         identity = {
@@ -227,6 +314,8 @@ def main() -> None:
             "device": args.device,
             "queue": os.environ.get("TASK_QUEUE_ENABLE"),
             "samples": args.samples,
+            "resolver_only": args.resolver_only,
+            "resolver_sections": args.resolver_sections,
             "caller_thread_id": spans.caller,
             "contract": "fixed retained storage and stream; fresh full JIT calls; single caller",
         }
