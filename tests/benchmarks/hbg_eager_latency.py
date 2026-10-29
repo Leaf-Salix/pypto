@@ -42,6 +42,7 @@ import sys
 import time
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pypto
@@ -503,13 +504,209 @@ def measure_frame_snapshot(
             _kernel._kernel_signature, arguments.BorrowedArguments = signature, packer
 
 
+class _DiagnosticPatches:
+    """Restore process-local counterfactuals after every drained measurement block."""
+
+    def __init__(self) -> None:
+        self.saved: list[tuple[Any, str, bool, Any]] = []
+
+    def set(self, owner: Any, name: str, value: Any) -> None:
+        self.saved.append((owner, name, name in vars(owner), getattr(owner, name)))
+        setattr(owner, name, value)
+
+    def restore(self) -> None:
+        while self.saved:
+            owner, name, local, value = self.saved.pop()
+            if local:
+                setattr(owner, name, value)
+            else:
+                delattr(owner, name)
+
+
+def measure_resolver_layers(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
+    """Cumulative fixed-contract bounds; deliberately freeze dynamic invalidation.
+
+    The complete JIT entry and unchanged Torch/Simpler submission still execute.
+    Later layers include earlier freezes; their differences are not independent
+    opportunities. Frozen values are valid only for this single-caller fixture.
+    """
+    from pypto.jit import decorator  # noqa: PLC0415
+
+    groups = (
+        ((add_kernel, "_resolve_specialization"),),
+        ((add_kernel, "_get_dep_graph_state"),),
+        tuple(
+            (add_kernel, name)
+            for name in (
+                "_get_source_hash",
+                "_dep_declared_layouts",
+                "_resolve_constexpr_bindings",
+                "_constexpr_identity_records",
+            )
+        ),
+        tuple(
+            (decorator, name)
+            for name in (
+                "_resolve_compile_request",
+                "capture_cache_config",
+                "_platform_string",
+                "_resolve_runtime",
+                "_eager_platform",
+                "_parse_platform",
+                "_eager_runtime",
+                "_resolve_memory_planner",
+                "_resolve_enable_pypto_l0c_double_buffer",
+                "_resolve_enable_buffer_ir",
+            )
+        ),
+        ((decorator, "make_cache_key"),),
+        ((add_kernel, "_resolve_compiled"),),
+    )
+    stages = ("baseline", "specialization", "dependencies", "identity", "policy", "key", "resolved", "aclnn")
+    patches = _DiagnosticPatches()
+    captured: dict[str, Any] = {}
+
+    def capture(name: str, original: Any) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            # The resolver writes target/runtime into this mapping after return.
+            captured[name] = (dict(result[0]), result[1]) if name == "_resolve_compile_request" else result
+            return result
+
+        return call
+
+    try:
+        for group in groups:
+            for owner, name in group:
+                patches.set(owner, name, capture(name, getattr(owner, name)))
+        probe.prepare("jit")
+        probe.call()
+        probe.check()
+    finally:
+        try:
+            probe.finish()
+        finally:
+            patches.restore()
+    assert all(name in captured for group in groups for _, name in group)
+
+    def frozen(name: str) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            value = captured[name]
+            return (dict(value[0]), value[1]) if name == "_resolve_compile_request" else value
+
+        return call
+
+    prepare = probe.prepare
+
+    def prepare_variant(stage: str) -> None:
+        patches.restore()
+        prepare("aclnn" if stage == "aclnn" else "jit")
+        (probe.aclnn_out if stage == "aclnn" else probe.out).fill_(float("nan"))
+        npu.synchronize()
+        if stage != "aclnn":
+            for group in groups[: stages.index(stage)]:
+                for owner, name in group:
+                    patches.set(owner, name, frozen(name))
+
+    (output / "layers.json").write_text(
+        json.dumps(
+            {
+                stage: [name for group in groups[:i] for _, name in group]
+                for i, stage in enumerate(stages[:-1])
+            },
+            indent=2,
+        )
+    )
+    probe.prepare = prepare_variant
+    try:
+        measure(probe, output, samples, batches, stages)
+    finally:
+        try:
+            probe.finish()
+        finally:
+            patches.restore()
+            probe.prepare = prepare
+
+
+def measure_adapter_layers(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
+    """Cumulative adapter bounds with the real resolver, tickets and Worker.submit.
+
+    Only imports is a warm-path implementation alternative. Later stages freeze
+    config/frame/TaskArgs or omit the early gate under this fixed contract; they
+    are upper bounds, not permission to remove guards in a product path.
+    """
+    from pypto.runtime.kernel import arguments, session  # noqa: PLC0415
+    from pypto.torch import interop  # noqa: PLC0415
+
+    def native_import() -> Any:
+        from pypto import _torch_npu as native  # noqa: PLC0415
+
+        for name in ("check_call", "borrow_context", "bind_context", "framework_alive", "retain_until_exit"):
+            if not callable(getattr(native, name, None)):
+                raise NotImplementedError(f"Torch lifecycle adapter requires {name}; rebuild the adapter")
+        return native
+
+    stages = ("baseline", "imports", "config", "frame", "task_args", "early_gate", "aclnn")
+    metadata = probe.artifact.metadata
+    assert probe.signature is _kernel_signature(metadata.parameters, metadata.return_aliases, "a2a3")
+    patches = _DiagnosticPatches()
+    prepare = probe.prepare
+
+    def prepare_variant(stage: str) -> None:
+        patches.restore()
+        prepare("aclnn" if stage == "aclnn" else "jit")
+        (probe.aclnn_out if stage == "aclnn" else probe.out).fill_(float("nan"))
+        npu.synchronize()
+        if stage in ("baseline", "aclnn"):
+            return
+        level = stages.index(stage)
+        patches.set(launch, "_load_native", native_import)
+        patches.set(interop, "_load_torch_npu", lambda: __import__("torch_npu"))
+        if level >= 2:
+            patches.set(session, "make_call_config", lambda *args: probe.call_config)
+        if level >= 3:
+            patches.set(probe.signature, "describe_call", lambda *args, **kwargs: probe.frame)
+        if level >= 4:
+            # One real lease owns the fixed inputs through every callback/run.
+            # Tickets still retire normally; finish performs the actual release.
+            probe.arguments = BorrowedArguments(
+                probe.frame, probe.session.sources, probe.session.device_location, api=probe.source_api
+            )
+            retained = SimpleNamespace(task_args=probe.arguments.task_args, release=lambda: None)
+            patches.set(arguments, "BorrowedArguments", lambda *args, **kwargs: retained)
+        if level >= 5:
+            # Only a bound: keep the final frame capture gate and all later checks.
+            patches.set(launch, "check_eager_call", lambda *args: False)
+
+    probe.prepare = prepare_variant
+    try:
+        measure(probe, output, samples, batches, stages)
+    finally:
+        try:
+            probe.finish()
+        finally:
+            patches.restore()
+            probe.prepare = prepare
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--mode",
-        choices=("smoke", "bench", "phases", "profile", "paired", "handoff", "counts", "frame-paired"),
+        choices=(
+            "smoke",
+            "bench",
+            "phases",
+            "profile",
+            "paired",
+            "handoff",
+            "counts",
+            "frame-paired",
+            "resolver-layers",
+            "adapter-layers",
+        ),
         default="smoke",
     )
     parser.add_argument("--samples", type=int, default=500)
@@ -519,7 +716,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.mode == "frame-paired" and args.baseline_root is None:
         parser.error("frame-paired requires --baseline-root containing the old frame and argument source")
-    if args.mode in ("bench", "paired", "handoff", "frame-paired") and (
+    if args.mode in ("bench", "paired", "handoff", "frame-paired", "resolver-layers", "adapter-layers") and (
         os.environ.get("LD_PRELOAD") or os.environ.get("PYPTO_LAUNCH_PROBE_OUTPUT")
     ):
         parser.error("formal bench requires a fresh process without LD_PRELOAD or launch probes")
@@ -575,10 +772,13 @@ def main() -> None:
             phases(probe, args.output, args.samples)
         elif args.mode == "profile":
             profile_calls(probe, args.output, args.samples)
-        elif args.mode == "paired":
-            measure_session_resources(probe, args.output, args.samples, args.batches)
-        elif args.mode == "handoff":
-            measure_source_handoff(probe, args.output, args.samples, args.batches)
+        elif args.mode in ("paired", "handoff", "resolver-layers", "adapter-layers"):
+            {
+                "paired": measure_session_resources,
+                "handoff": measure_source_handoff,
+                "resolver-layers": measure_resolver_layers,
+                "adapter-layers": measure_adapter_layers,
+            }[args.mode](probe, args.output, args.samples, args.batches)
         elif args.mode == "counts":
             count_source_lifecycle(probe, args.output, args.samples)
         elif args.mode == "frame-paired":
