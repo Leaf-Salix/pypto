@@ -63,6 +63,15 @@ c10_npu::NPUStream CallStream(int64_t stream_id, int32_t device_id) {
   return stream;
 }
 
+bool CheckCapture(const c10_npu::NPUStream& stream) {
+  aclmdlRICaptureStatus status{};
+  aclmdlRI model = nullptr;
+  CheckAcl(aclmdlRICaptureGetInfo(stream.stream(false), &status, &model), "aclmdlRICaptureGetInfo");
+  Require(status == ACL_MODEL_RI_CAPTURE_STATUS_NONE || status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE,
+          "Kernel initialization encountered an invalidated graph capture");
+  return status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+}
+
 // Official torch_npu wheels do not export g_used_aclop. Run one real ACL-op
 // through the exported OpCommand API so the framework enables its own GIL-safe
 // queue drains before receiving a Python callback. Do not replace this with a
@@ -133,13 +142,12 @@ NB_MODULE(_torch_npu, m) {
   m.def("retain_until_exit", [](nb::object owner) { Py_INCREF(owner.ptr()); });
   m.def("check_call", [](int64_t stream_id, int32_t device_id) {
     auto stream = CallStream(stream_id, device_id);
-    aclmdlRICaptureStatus status{};
-    aclmdlRI model = nullptr;
-    CheckAcl(aclmdlRICaptureGetInfo(stream.stream(false), &status, &model), "aclmdlRICaptureGetInfo");
-    Require(status == ACL_MODEL_RI_CAPTURE_STATUS_NONE || status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE,
-            "Kernel initialization encountered an invalidated graph capture");
-    return status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+    return CheckCapture(stream);
   });
+  // Early admission needs a fresh capture check, but no Python Stream wrapper.
+  // Frame validation and enqueue still check their separately captured stream ID.
+  m.def("check_current_call",
+        [](int32_t device_id) { return CheckCapture(c10_npu::getCurrentNPUStream(device_id)); });
   m.def("storage_shape", [](nb::handle object) {
     Require(THPVariable_Check(object.ptr()), "Storage shape requires a torch tensor");
     const at::Tensor& tensor = THPVariable_Unpack(object.ptr());

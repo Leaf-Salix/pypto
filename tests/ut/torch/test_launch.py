@@ -397,5 +397,43 @@ def test_empty_frame_and_changed_device_rejected(eager_env, prepared):
     env.state.close()
 
 
+def test_early_gate_reads_native_stream_without_python_wrapper(eager_env, monkeypatch):
+    env = eager_env
+    env.init()
+    config = env.state.require_config()
+    reads = []
+
+    def check_current(device):
+        reads.append((device, env.stream_id))
+        return env.capture
+
+    monkeypatch.setattr(env.native, "check_current_call", check_current)
+    monkeypatch.setattr(env.framework.npu, "current_stream", lambda device: pytest.fail("unused Stream"))
+    assert launch.check_eager_call(config) is False
+    env.stream_id = 8
+    assert launch.check_eager_call(config) is False
+    assert reads == [(config.device_id, 7), (config.device_id, 8)]
+    env.capture = True
+    with pytest.raises(NotImplementedError, match="capture"):
+        launch.check_eager_call(config)
+    env.capture = False
+    env.device += 1
+    with pytest.raises(ValueError, match="differs from initialized"):
+        launch.check_eager_call(config)
+    assert len(reads) == 3
+    env.device -= 1
+
+    error = RuntimeError("invalidated capture")
+
+    def fail(device):
+        raise error
+
+    monkeypatch.setattr(env.native, "check_current_call", fail)
+    with pytest.raises(RuntimeError) as caught:
+        launch.check_eager_call(config)
+    assert caught.value is error
+    env.state.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

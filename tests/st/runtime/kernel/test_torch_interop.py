@@ -176,5 +176,24 @@ def test_python_queue_callback_survives_gil_held_drain(npu_context, test_config,
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_native_current_capture_check_tracks_stream_changes(npu_context):
+    if importlib.util.find_spec("pypto._torch_npu") is None:
+        pytest.skip("optional native adapter was not built")
+    # Keep loading after npu_context: the ST collector may evaluate assignments.
+    import pypto._torch_npu as native  # noqa: PLC0415
+
+    npu = npu_context.npu
+    device = npu.current_device()
+    original = npu.current_stream(device)
+    assert native.check_current_call(device) == native.check_call(original.stream_id, device)
+    alternate = npu.Stream(device=device)
+    with npu.stream(alternate):
+        assert native.check_current_call(device) is False
+        assert native.check_call(alternate.stream_id, device) is False
+        with pytest.raises(ValueError, match="not on the current NPU stream"):
+            native.check_call(original.stream_id, device)
+    assert native.check_current_call(device) == native.check_call(original.stream_id, device)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
