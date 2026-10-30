@@ -34,7 +34,8 @@ from typing import Any
 
 def eligible(value: Any) -> bool:
     """Avoid subclasses, floats and digit-limit-sensitive large integers."""
-    return type(value) in (type(None), bool, str) or (type(value) is int and value.bit_length() <= 64)
+    kind = type(value)
+    return value is None or kind is bool or kind is str or (kind is int and value.bit_length() <= 64)
 
 
 class Candidates:
@@ -261,6 +262,9 @@ def main() -> None:
                     {
                         "mode": mode,
                         "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                        "experiment_sha256": hashlib.sha256(
+                            Path(inspect.getfile(Candidates)).read_bytes()
+                        ).hexdigest(),
                         "stages": Candidates.stages if mode == "bench" else ("current_a", "current_b"),
                         "policy": "diagnostic only; preserve current reads/eval; fixed normal call stack",
                         "recursion_limit": sys.getrecursionlimit(),
