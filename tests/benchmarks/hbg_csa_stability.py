@@ -62,17 +62,79 @@ class TileAblations:
 
     def install(self, stage: str) -> None:
         assert not self.patches.saved
-        assert stage in ("current_a", "current_b", "off_tile"), stage
-        if stage == "off_tile":
-            for name, function in self.functions.items():
-                self.patches.set(self.specializer, name, function)
+        assert stage in ("current_a", "current_b", "off_tile", "off_tile_eager", "off_tile_strings"), stage
+        if stage in ("off_tile", "off_tile_eager"):
+            name = "_eager_tile_annotation_data"
+            self.patches.set(self.specializer, name, self.functions[name])
+        if stage in ("off_tile", "off_tile_strings"):
+            name = "tile_annotation_fingerprints"
+            self.patches.set(self.specializer, name, self.functions[name])
             # decorator imports this function by value rather than module lookup.
-            self.patches.set(
-                self.decorator, "tile_annotation_fingerprints", self.functions["tile_annotation_fingerprints"]
-            )
+            self.patches.set(self.decorator, name, self.functions[name])
 
     def restore(self) -> None:
         self.patches.restore()
+
+
+class FineAblations:
+    """Separate existing groups without bypassing checks or request snapshots."""
+
+    stages = (
+        "current_a",
+        "current_b",
+        "off_constant_ast",
+        "off_source_serialization",
+        "off_variant_plan",
+        "off_call_nodes",
+        "off_signature",
+        "off_tile_eager",
+        "off_tile_strings",
+        "off_session",
+        "off_resolver",
+        "off_initial_frame",
+        "off_import",
+        "off_source",
+    )
+
+    def __init__(self, baseline_root: Path, tile_baseline: Path) -> None:
+        from hbg_stability_audit import Ablations  # noqa: PLC0415
+
+        self.base = Ablations(baseline_root)
+        self.tile = TileAblations(tile_baseline)
+        # The plan builder and its caller changed their interface together.
+        # Restore that pair together, keeping call-node analysis independent.
+        groups = {
+            "off_constant_ast": {"constant_dependency_names"},
+            "off_source_serialization": {"_get_source_hash"},
+            "off_variant_plan": {"_resolve_constexpr_bindings", "expand_constexpr_variants"},
+            "off_call_nodes": {"_dep_call_nodes"},
+        }
+        for stage, names in groups.items():
+            self.base.plans[stage] = [plan for plan in self.base.plans["off_structure"] if plan[1] in names]
+            assert {plan[1] for plan in self.base.plans[stage]} == names, stage
+        source = importlib.import_module("pypto.jit._source")
+        self.base.modules[source.__name__] = source
+        assert source.__file__ is not None
+        path = Path(source.__file__)
+        self.base.hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.base.plans["off_signature"] = []
+        self.base.add("off_signature", "fc8248b^", source.__name__, "function_signature")
+        self.hashes = self.base.hashes | self.tile.hashes
+
+    def install(self, stage: str) -> None:
+        assert stage in self.stages, stage
+        if stage in ("off_tile_eager", "off_tile_strings"):
+            self.tile.install(stage)
+        else:
+            self.base.install(stage)
+            if stage == "off_signature":
+                signature = self.base.modules["pypto.jit._source"].function_signature
+                for name in ("pypto.jit._arguments", "pypto.jit.decorator"):
+                    self.base.set(self.base.modules[name], "function_signature", signature)
+
+    def restore(self) -> None:
+        self.tile.restore()
+        self.base.restore()
 
 
 def bind_csa(source: Path, native: Path) -> Any:
@@ -236,6 +298,8 @@ def select_ablations(args: Any) -> tuple[Any, tuple[str, ...]]:
         return None, ("current_a", "current_b")
     if args.suite == "tile":
         return TileAblations(args.tile_baseline), ("current_a", "current_b", "off_tile")
+    if args.suite == "fine":
+        return FineAblations(args.baselines, args.tile_baseline), FineAblations.stages
     return Ablations(args.baselines), tuple(stage for stage in STAGES if stage != "aclnn")
 
 
@@ -451,8 +515,8 @@ def main() -> None:
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--baselines", type=Path)
-    parser.add_argument("--suite", choices=("all", "tile"), default="all")
-    parser.add_argument("--tile-baseline", type=Path, help="Pre-optimization specializer.py for --suite tile")
+    parser.add_argument("--suite", choices=("all", "tile", "fine"), default="all")
+    parser.add_argument("--tile-baseline", type=Path, help="Pre-optimization specializer.py for tile/fine")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mode", choices=("smoke", "bench", "diagnostic"), default="smoke")
     parser.add_argument("--device", type=int, default=0)
@@ -464,10 +528,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
     if args.mode != "smoke":
-        if args.suite == "all" and args.baselines is None:
-            parser.error("--suite all with --mode bench/diagnostic requires --baselines")
-        if args.suite == "tile" and args.tile_baseline is None:
-            parser.error("--suite tile with --mode bench/diagnostic requires --tile-baseline")
+        if args.suite in ("all", "fine") and args.baselines is None:
+            parser.error("--suite all/fine with --mode bench/diagnostic requires --baselines")
+        if args.suite in ("tile", "fine") and args.tile_baseline is None:
+            parser.error("--suite tile/fine with --mode bench/diagnostic requires --tile-baseline")
     if min(args.blocks, args.samples, args.warmup, args.cpu_samples) < 1:
         parser.error("All measurement counts must be positive")
     if args.mode == "smoke":
