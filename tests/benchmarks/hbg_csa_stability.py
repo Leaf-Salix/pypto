@@ -99,6 +99,8 @@ def measure_cpu(args: Any, stages: Any, reset: Any, run: Any, drain: Any, verify
         orders.append(order)
         for stage in order:
             drain()
+            if experiment := getattr(args, "_experiment", None):
+                experiment.install(stage)
             cpu_ns = 0
             for _ in range(args.cpu_samples):
                 reset()
@@ -184,7 +186,8 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
     from pypto.runtime.kernel.arguments import _load_api  # noqa: PLC0415
     from pypto.runtime.kernel.context import get_process_kernel_state  # noqa: PLC0415
 
-    stages = ("current_a", "current_b")
+    experiment = getattr(args, "_experiment", None)
+    stages = experiment.stages if experiment is not None else ("current_a", "current_b")
     rng = random.Random(args.seed)
     calls = 0
     cold_compile = []
@@ -276,6 +279,8 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
                 orders.append(order)
                 for stage in order:
                     drain()
+                    if is_pto and experiment is not None:
+                        experiment.install(stage)
                     for _ in range(warmup):
                         reset()
                         run()
@@ -313,6 +318,8 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
             finally:
                 if is_pto:
                     del root._compile
+                    if experiment is not None:
+                        experiment.restore()
         result = {
             "method": "eager_host_entry_to_return",
             "scope": (
@@ -503,7 +510,17 @@ def write_identity(args: Any) -> None:
         "simpler_log_level": logging.getLogger("simpler").getEffectiveLevel(),
         "measurement": {
             name: getattr(args, name)
-            for name in ("mode", "suite", "seed", "blocks", "samples", "warmup", "cpu_samples", "history")
+            for name in (
+                "mode",
+                "suite",
+                "seed",
+                "blocks",
+                "samples",
+                "warmup",
+                "cpu_samples",
+                "history",
+                "metadata",
+            )
         },
         "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "environment": {
@@ -533,6 +550,7 @@ def main() -> None:
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--history", type=int, default=8192)
+    parser.add_argument("--metadata", choices=("reuse", "produce"), default="reuse")
     parser.add_argument("--blocks", type=int, default=8)
     parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=10)
@@ -589,7 +607,7 @@ def main() -> None:
         "--timing-warmup",
         str(args.warmup),
         "--timing-metadata",
-        "produce" if args.mode.startswith("paired") else "reuse",
+        "produce" if args.mode.startswith("paired") else args.metadata,
     ]
     try:
         case.main()
