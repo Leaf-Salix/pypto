@@ -189,9 +189,21 @@ def test_concurrent_readers_and_bounded_cache():
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda _: str(_source.function_signature(f)), range(100)))
     assert set(results) == {"(x)"}
-    for _ in range(513):
-        _source.function_signature(lambda x: x)
-    assert len(_source._SIGNATURES) <= 512
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 14), reason="Python 3.14 uses inspect fallback")
+def test_cache_clears_at_capacity_and_rebuilds_correct_signatures():
+    # Clear-all is a bounded policy, not LRU. Eviction must only lose reuse.
+    _source._SIGNATURES.clear()
+    functions = [lambda x: x for _ in range(513)]
+    for func in functions[:512]:
+        assert str(_source.function_signature(func)) == "(x)"
+    assert len(_source._SIGNATURES) == 512
+    _source.function_signature(functions[-1])
+    assert set(_source._SIGNATURES) == {functions[-1]}
+    for func in functions[:512]:
+        assert _source.function_signature(func) == inspect.signature(func)
+    assert set(_source._SIGNATURES) == {functions[511]}
 
 
 def test_lazy_annotation_python_falls_back(monkeypatch):

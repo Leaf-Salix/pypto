@@ -552,33 +552,20 @@ def main() -> None:
             "bench",
             "phases",
             "profile",
-            "paired",
             "handoff",
             "counts",
-            "frame-paired",
             "resolver-layers",
-            "adapter-layers",
-            "import-paired",
         ),
         default="smoke",
     )
     parser.add_argument("--samples", type=int, default=500)
     parser.add_argument("--batches", type=int, default=8)
     parser.add_argument("--stages", nargs="+", choices=STAGES, default=STAGES)
-    parser.add_argument("--baseline-root", type=Path)
     args = parser.parse_args()
-    if args.mode in ("paired", "frame-paired", "adapter-layers", "import-paired"):
-        parser.error(
-            f"{args.mode} diagnoses removed optimizations; run the retained benchmark on the bak branch"
-        )
     if args.mode in (
         "bench",
-        "paired",
         "handoff",
-        "frame-paired",
         "resolver-layers",
-        "adapter-layers",
-        "import-paired",
     ) and (os.environ.get("LD_PRELOAD") or os.environ.get("PYPTO_LAUNCH_PROBE_OUTPUT")):
         parser.error("formal bench requires a fresh process without LD_PRELOAD or launch probes")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -624,7 +611,7 @@ def main() -> None:
             "queue": os.environ.get("TASK_QUEUE_ENABLE"),
             "contract": "fixed storage/shape/dtype/offset/stream/scalars; no mutation or concurrency",
             "direct": "bypasses Torch task queue; not a queue-preserving optimization",
-            "paired_control": "paired/handoff/frame-paired restore selected old work, not an old install",
+            "paired_control": "handoff restores selected old work, not an old install",
         }
         (args.output / "identity.json").write_text(json.dumps(identity, indent=2))
         if args.mode == "bench":

@@ -227,17 +227,21 @@ A Python pending ticket owns BorrowedArguments, the Torch stream, callback,
 configuration, Worker and callable before `RunOpApiV2` can enqueue.
 The native `enqueue` function validates the context, records allocator streams
 and captures the native stream; it creates no native ticket or Tensor owners.
-Before queue admission it sets torch_npu's process-wide `g_used_aclop` flag,
-which enables GIL release during subsequent queue drains in the supported 2.6/2.10
-versions. The flag remains set for the process lifetime. It also releases the
-caller GIL during queue admission. Its callback acquires the GIL
+Official torch_npu wheels do not export the queue-drain flag. Before the first
+queue admission, a process-wide `std::call_once` runs an ACL `Identity` through
+the exported `OpCommand` API so torch_npu enables GIL-safe queue drains itself.
+It synchronizes that stream to retain bootstrap tensors until completion and
+propagates initialization failures; a failed initialization can be retried.
+This adds allocation, an operator and synchronization to cold initialization,
+not to successful warm calls. The caller GIL is released before initialization
+and queue admission. Its callback acquires the GIL
 and calls public
 Python `Worker.submit(..., caller_stream=...)`, then publishes the RunHandle.
 It never calls synchronous `Worker.run`, private native submit or a slot API.
 Native queue state contains no owning Python references; pending owners and
 callback closures are released under the GIL only after successful retirement.
 
-Outer JIT return, callback submission and device completion are distinct. Normal
+Outer JIT return, callback submission and device completion are distinct. After successful bootstrap, normal
 enqueue and incomplete-ticket polling never drain, synchronize or wait for a
 callback/run. A completed run still requires `wait()` retirement before releasing
 sources. Explicit shutdown may synchronize the retained Torch stream and wait for runs. Simpler

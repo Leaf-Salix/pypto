@@ -15,7 +15,6 @@ No graph is captured. Each queue setting/seed must run in a fresh process.
 """
 
 import argparse
-import ast
 import hashlib
 import importlib
 import importlib.abc
@@ -28,113 +27,8 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-
-
-class TileAblations:
-    """Restore only the two annotation preparation functions between blocks."""
-
-    def __init__(self, baseline: Path) -> None:
-        from hbg_eager_latency import _DiagnosticPatches  # noqa: PLC0415
-
-        self.patches = _DiagnosticPatches()
-        self.specializer = importlib.import_module("pypto.jit.specializer")
-        self.decorator = importlib.import_module("pypto.jit.decorator")
-        names = ("_eager_tile_annotation_data", "tile_annotation_fingerprints")
-        source = baseline.read_text()
-        tree = ast.parse(source, filename=str(baseline))
-        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
-        assert sorted(node.name for node in nodes) == sorted(names), (baseline, names)
-        self.functions: dict[str, Any] = {}
-        statements: list[ast.stmt] = list(nodes)
-        # Function globals remain the live module, so the restored fingerprint
-        # function sees the restored eager helper and current request snapshots.
-        exec(
-            compile(ast.Module(body=statements, type_ignores=[]), str(baseline), "exec"),
-            vars(self.specializer),
-            self.functions,
-        )
-        self.hashes = {str(baseline): hashlib.sha256(source.encode()).hexdigest()}
-        for module in (self.specializer, self.decorator):
-            assert module.__file__ is not None
-            path = Path(module.__file__)
-            self.hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
-
-    def install(self, stage: str) -> None:
-        assert not self.patches.saved
-        assert stage in ("current_a", "current_b", "off_tile", "off_tile_eager", "off_tile_strings"), stage
-        if stage in ("off_tile", "off_tile_eager"):
-            name = "_eager_tile_annotation_data"
-            self.patches.set(self.specializer, name, self.functions[name])
-        if stage in ("off_tile", "off_tile_strings"):
-            name = "tile_annotation_fingerprints"
-            self.patches.set(self.specializer, name, self.functions[name])
-            # decorator imports this function by value rather than module lookup.
-            self.patches.set(self.decorator, name, self.functions[name])
-
-    def restore(self) -> None:
-        self.patches.restore()
-
-
-class FineAblations:
-    """Separate existing groups without bypassing checks or request snapshots."""
-
-    stages = (
-        "current_a",
-        "current_b",
-        "off_constant_ast",
-        "off_source_serialization",
-        "off_variant_plan",
-        "off_call_nodes",
-        "off_signature",
-        "off_tile_eager",
-        "off_tile_strings",
-        "off_session",
-        "off_resolver",
-        "off_initial_frame",
-        "off_import",
-        "off_source",
-    )
-
-    def __init__(self, baseline_root: Path, tile_baseline: Path) -> None:
-        from hbg_stability_audit import Ablations  # noqa: PLC0415
-
-        self.base = Ablations(baseline_root)
-        self.tile = TileAblations(tile_baseline)
-        # The plan builder and its caller changed their interface together.
-        # Restore that pair together, keeping call-node analysis independent.
-        groups = {
-            "off_constant_ast": {"constant_dependency_names"},
-            "off_source_serialization": {"_get_source_hash"},
-            "off_variant_plan": {"_resolve_constexpr_bindings", "expand_constexpr_variants"},
-            "off_call_nodes": {"_dep_call_nodes"},
-        }
-        for stage, names in groups.items():
-            self.base.plans[stage] = [plan for plan in self.base.plans["off_structure"] if plan[1] in names]
-            assert {plan[1] for plan in self.base.plans[stage]} == names, stage
-        source = importlib.import_module("pypto.jit._source")
-        self.base.modules[source.__name__] = source
-        assert source.__file__ is not None
-        path = Path(source.__file__)
-        self.base.hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
-        self.base.plans["off_signature"] = []
-        self.base.add("off_signature", "fc8248b^", source.__name__, "function_signature")
-        self.hashes = self.base.hashes | self.tile.hashes
-
-    def install(self, stage: str) -> None:
-        assert stage in self.stages, stage
-        if stage in ("off_tile_eager", "off_tile_strings"):
-            self.tile.install(stage)
-        else:
-            self.base.install(stage)
-            if stage == "off_signature":
-                signature = self.base.modules["pypto.jit._source"].function_signature
-                for name in ("pypto.jit._arguments", "pypto.jit.decorator"):
-                    self.base.set(self.base.modules[name], "function_signature", signature)
-
-    def restore(self) -> None:
-        self.tile.restore()
-        self.base.restore()
 
 
 def bind_csa(source: Path, native: Path) -> Any:
@@ -194,9 +88,7 @@ def check_state(
     return {"guards": guards, "comparison": comparisons, "hashes": hashes}
 
 
-def measure_cpu(
-    args: Any, stages: Any, ablations: Any, reset: Any, run: Any, drain: Any, verify: Any
-) -> None:
+def measure_cpu(args: Any, stages: Any, reset: Any, run: Any, drain: Any, verify: Any) -> None:
     """Accumulate call/completion CPU and amortize one real release per group."""
     npu = importlib.import_module("torch_npu").npu
     rng = random.Random(args.seed + 1)
@@ -207,9 +99,6 @@ def measure_cpu(
         orders.append(order)
         for stage in order:
             drain()
-            if ablations:
-                ablations.restore()
-                ablations.install(stage)
             cpu_ns = 0
             for _ in range(args.cpu_samples):
                 reset()
@@ -238,7 +127,7 @@ def measure_cpu(
 
 
 def diagnose_sources(
-    args: Any, stages: Any, ablations: Any, root: Any, reset: Any, run: Any, drain: Any, verify: Any
+    args: Any, stages: Any, root: Any, reset: Any, run: Any, drain: Any, verify: Any
 ) -> dict[str, Any]:
     """Count real source registration/release in a separate, untimed process."""
     from hbg_eager_latency import _DiagnosticPatches  # noqa: PLC0415
@@ -249,9 +138,6 @@ def diagnose_sources(
     rows = []
     for stage in stages:
         drain()
-        if ablations:
-            ablations.restore()
-            ablations.install(stage)
         counters: dict[str, int] = {}
         patches = _DiagnosticPatches()
 
@@ -292,25 +178,13 @@ def diagnose_sources(
     return result | {"us_p50": float("nan")}
 
 
-def select_ablations(args: Any) -> tuple[Any, tuple[str, ...]]:
-    from hbg_stability_audit import STAGES, Ablations  # noqa: PLC0415
-
-    if args.mode == "smoke" or args.suite == "current":
-        return None, ("current_a", "current_b")
-    if args.suite == "tile":
-        return TileAblations(args.tile_baseline), ("current_a", "current_b", "off_tile")
-    if args.suite == "fine":
-        return FineAblations(args.baselines, args.tile_baseline), FineAblations.stages
-    return Ablations(args.baselines), tuple(stage for stage in STAGES if stage != "aclnn")
-
-
 def install_measurement(case: Any, root: Any, args: Any) -> None:
-    from hbg_stability_audit import npu  # noqa: PLC0415
+    from hbg_eager_latency import npu  # noqa: PLC0415
     from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
     from pypto.runtime.kernel.arguments import _load_api  # noqa: PLC0415
     from pypto.runtime.kernel.context import get_process_kernel_state  # noqa: PLC0415
 
-    ablations, stages = select_ablations(args)
+    stages = ("current_a", "current_b")
     rng = random.Random(args.seed)
     calls = 0
     cold_compile = []
@@ -325,8 +199,6 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
             (args.output / "cold-compile.json").write_text(json.dumps(cold_compile))
 
     root._compile = time_compile
-    if ablations:
-        (args.output / "ablation-source-hashes.json").write_text(json.dumps(ablations.hashes, indent=2))
 
     def measure(
         fixture: Any,
@@ -397,16 +269,13 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
 
         try:
             if is_pto and args.mode == "diagnostic":
-                return diagnose_sources(args, stages, ablations, root, reset, run, drain, verify)
+                return diagnose_sources(args, stages, root, reset, run, drain, verify)
             for batch in range(args.blocks if is_pto else 1):
                 order = list(selected)
                 rng.shuffle(order)
                 orders.append(order)
                 for stage in order:
                     drain()
-                    if is_pto and ablations:
-                        ablations.restore()
-                        ablations.install(stage)
                     for _ in range(warmup):
                         reset()
                         run()
@@ -437,15 +306,13 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
                         json.dumps(rows)
                     )
             if is_pto:
-                measure_cpu(args, stages, ablations, reset, run, drain, verify)
+                measure_cpu(args, stages, reset, run, drain, verify)
         finally:
             try:
                 drain()
             finally:
                 if is_pto:
                     del root._compile
-                    if ablations:
-                        ablations.restore()
         result = {
             "method": "eager_host_entry_to_return",
             "scope": (
@@ -466,6 +333,148 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
     case.measure_graph_interval = measure
 
 
+def install_paired_measurement(case: Any, root: Any, args: Any) -> None:
+    """Retain both fixture callbacks, then alternate complete Native/PTO arms.
+
+    The fixture normally restores its Native Top-K hook before measuring PTO.
+    Retain that hook explicitly and install it outside each Native timed arm.
+    Numerical equivalence is checked against each implementation's own reference;
+    known Native/PTO zero-tolerance differences are not silently accepted as equal.
+    """
+    torch = importlib.import_module("torch")
+    npu = importlib.import_module("torch_npu").npu
+    get_process_kernel_state = importlib.import_module(
+        "pypto.runtime.kernel.context"
+    ).get_process_kernel_state
+
+    contexts: dict[str, Any] = {}
+    native_result: dict[str, Any] = {"us_p50": 1.0}
+
+    def capture(fixture: Any, run: Any, output: Any, topk: Any, reference: Any, **kwargs: Any) -> Any:
+        name = "native" if not contexts else "pto"
+        assert name not in contexts
+        contexts[name] = (run, output, topk, reference, kwargs["require_exact"])
+        if name == "native":
+            contexts["native_hook"] = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer
+            return native_result
+        state = get_process_kernel_state()
+        assert len(root._cache) == 1
+        artifact_ids = tuple(id(value) for value in root._cache.values())
+        initial = {
+            key: group["initial"].to(group["allocation"].device) for key, group in fixture["groups"].items()
+        }
+        rows: dict[str, list[Any]] = {"native": [], "pto": []}
+        checks: dict[str, list[Any]] = {"native": [], "pto": []}
+        original_hook = torch.ops._C_ascend.npu_vllm_quant_lightning_indexer
+
+        def reject_compile(*unused: Any, **unused_kwargs: Any) -> Any:
+            raise AssertionError("Paired CSA recompiled after warmup")
+
+        def reset(output: Any) -> None:
+            for key, group in fixture["groups"].items():
+                group["allocation"].copy_(initial[key])
+            output.fill_(float("nan"))
+            npu.synchronize()
+
+        def run_arm(arm: str, batch: int) -> None:
+            state.drain()
+            run, output, topk, reference, exact = contexts[arm]
+            torch.ops._C_ascend.npu_vllm_quant_lightning_indexer = (
+                contexts["native_hook"] if arm == "native" else original_hook
+            )
+            for sample in range(-args.warmup, args.samples):
+                reset(output)
+                begin = time.perf_counter_ns()
+                run()
+                elapsed = (time.perf_counter_ns() - begin) / 1000
+                npu.synchronize()
+                if sample >= 0:
+                    rows[arm].append({"batch": batch, "stage": arm, "sample": sample, "host_us": elapsed})
+            state.drain()
+            checked = check_state(case, fixture, output, topk, reference, exact)
+            if checks[arm]:
+                assert checked["hashes"] == checks[arm][0]["hashes"]
+            checks[arm].append(checked)
+            assert tuple(id(value) for value in root._cache.values()) == artifact_ids
+            for label, values in rows.items():
+                (args.output / f"paired-{label}-host.json").write_text(json.dumps(values))
+            (args.output / "paired-checks.json").write_text(json.dumps(checks))
+            print("CSA_PAIRED_PASS", batch, arm, flush=True)
+
+        root._compile = reject_compile
+        try:
+            # produce builds a new adapter per call, but specialization must hit.
+            # The fixture has compiled it already; this warmup must also hit.
+            reset(contexts["pto"][1])
+            contexts["pto"][0]()
+            npu.synchronize()
+            state.drain()
+            if args.mode == "paired":
+                for batch in range(args.blocks):
+                    order = ("native", "pto") if (batch + args.seed) % 2 else ("pto", "native")
+                    for arm in order:
+                        run_arm(arm, batch)
+            else:
+                Spans = importlib.import_module("hbg_pypto_spans").Spans
+                TorchDispatchMode = importlib.import_module("torch.utils._python_dispatch").TorchDispatchMode
+
+                counts: dict[str, int] = {}
+
+                class CountOps(TorchDispatchMode):
+                    def __torch_dispatch__(
+                        self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+                    ) -> Any:
+                        key = str(func)
+                        counts[key] = counts.get(key, 0) + 1
+                        return func(*args, **(kwargs or {}))
+
+                # Counts and spans are diagnostic only, never Host performance evidence.
+                reset(contexts["native"][1])
+                torch.ops._C_ascend.npu_vllm_quant_lightning_indexer = contexts["native_hook"]
+                with CountOps():
+                    contexts["native"][0]()
+                npu.synchronize()
+                (args.output / "native-op-counts.json").write_text(json.dumps(counts, indent=2))
+                torch.ops._C_ascend.npu_vllm_quant_lightning_indexer = original_hook
+                spans = Spans()
+                spans.install(SimpleNamespace(session=state._worker, worker=state._worker.worker))
+                try:
+                    for sample in range(args.samples):
+                        reset(contexts["pto"][1])
+                        spans.sample = sample
+                        contexts["pto"][0]()
+                        npu.synchronize()
+                        spans.sample = None
+                    state.drain()
+                finally:
+                    spans.restore()
+                (args.output / "pto-spans.json").write_text(json.dumps(spans.events))
+                for arm in ("native", "pto"):
+                    run, output, topk, reference, exact = contexts[arm]
+                    reset(output)
+                    torch.ops._C_ascend.npu_vllm_quant_lightning_indexer = (
+                        contexts["native_hook"] if arm == "native" else original_hook
+                    )
+                    run()
+                    npu.synchronize()
+                    checks[arm].append(check_state(case, fixture, output, topk, reference, exact))
+                (args.output / "paired-checks.json").write_text(json.dumps(checks))
+        finally:
+            torch.ops._C_ascend.npu_vllm_quant_lightning_indexer = original_hook
+            del root._compile
+            npu.synchronize()
+            state.drain()
+        result = {"method": "paired_eager_host", "metadata": "produce", "us_p50": 1.0}
+        if args.mode == "paired":
+            native_result.update(result, us_p50=statistics.median(row["host_us"] for row in rows["native"]))
+            result["us_p50"] = statistics.median(row["host_us"] for row in rows["pto"])
+        else:
+            native_result.update(method="untimed_diagnostic", us_p50=float("nan"))
+        return result
+
+    case.measure_graph_interval = capture
+
+
 def write_identity(args: Any) -> None:
     modules = {}
     for name in (
@@ -484,7 +493,8 @@ def write_identity(args: Any) -> None:
         path = Path(module.__file__).resolve()
         modules[name] = {"file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
     repo = Path(__file__).resolve().parents[2]
-    assert Path(modules["pypto"]["file"]).is_relative_to(repo)
+    source_repo = Path(os.environ.get("CSA_VERSION_ROOT", str(repo))).resolve()
+    assert Path(modules["pypto"]["file"]) == source_repo / "python/pypto/__init__.py"
     assert Path(modules["simpler"]["file"]).is_relative_to(repo / "runtime")
     identity = {
         "modules": modules,
@@ -516,11 +526,11 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--baselines", type=Path)
-    parser.add_argument("--suite", choices=("all", "tile", "fine", "current"), default="current")
-    parser.add_argument("--tile-baseline", type=Path, help="Pre-optimization specializer.py for tile/fine")
+    parser.add_argument("--suite", choices=("current",), default="current")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--mode", choices=("smoke", "bench", "diagnostic"), default="smoke")
+    parser.add_argument(
+        "--mode", choices=("smoke", "bench", "diagnostic", "paired", "paired-diagnostic"), default="smoke"
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--history", type=int, default=8192)
     parser.add_argument("--blocks", type=int, default=8)
@@ -529,13 +539,6 @@ def main() -> None:
     parser.add_argument("--cpu-samples", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
-    if args.mode != "smoke" and args.suite in ("all", "fine"):
-        parser.error("all/fine include removed optimizations; run those historical suites on the bak branch")
-    if args.mode != "smoke":
-        if args.suite in ("all", "fine") and args.baselines is None:
-            parser.error("--suite all/fine with --mode bench/diagnostic requires --baselines")
-        if args.suite in ("tile", "fine") and args.tile_baseline is None:
-            parser.error("--suite tile/fine with --mode bench/diagnostic requires --tile-baseline")
     if min(args.blocks, args.samples, args.warmup, args.cpu_samples) < 1:
         parser.error("All measurement counts must be positive")
     if args.mode == "smoke":
@@ -549,7 +552,10 @@ def main() -> None:
         HCCL_DETERMINISTIC="true",
     )
     case, root = bind_csa(args.source.resolve(), args.native.resolve())
-    install_measurement(case, root, args)
+    if args.mode.startswith("paired"):
+        install_paired_measurement(case, root, args)
+    else:
+        install_measurement(case, root, args)
     # Worker.init snapshots this threshold into native logging. Configure it
     # before the fixture creates the Worker, not merely before timed calls.
     importlib.import_module("simpler_setup.log_config").configure_logging("error")
@@ -583,7 +589,7 @@ def main() -> None:
         "--timing-warmup",
         str(args.warmup),
         "--timing-metadata",
-        "reuse",
+        "produce" if args.mode.startswith("paired") else "reuse",
     ]
     try:
         case.main()
@@ -594,9 +600,10 @@ def main() -> None:
     path = args.output / "report.json"
     report = json.loads(path.read_text(), parse_constant=lambda value: None)
     report["execution_config"]["path"] = "kernel_eager"
-    if args.mode == "diagnostic":
+    if args.mode in ("diagnostic", "paired-diagnostic"):
         report["timing"].pop("native_over_pto_p50", None)
         report["timing"]["pto"].pop("us_p50", None)
+        report["timing"]["native"].pop("us_p50", None)
     report["timing"].update(scope="CSA KERNEL eager Host timing", method="No graph capture or replay")
     path.write_text(json.dumps(report, indent=2, allow_nan=False))
 

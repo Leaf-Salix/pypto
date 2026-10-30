@@ -177,14 +177,17 @@ INOUT 和显式 NONE transfer，Scalar 通过带类型的 ctypes 值传给公开
 `RunOpApiV2` 入队前，Python pending ticket 已持有 BorrowedArguments、Torch stream、
 callback、配置、Worker 和 callable。native `enqueue` 函数校验 context、记录 allocator
 stream 并捕获 native stream，不再创建 native ticket 或持有 Tensor 引用。
-入队前设置 torch_npu 的进程级 `g_used_aclop` 标志，让支持的 2.6/2.10
-版本在后续队列排空时释放 GIL；该标志保持到进程结束。
-入队期间也释放调用线程的 GIL；callback 获取
+正式 torch_npu wheel 不导出队列排空标志。首次入队前，通过进程级
+`std::call_once` 使用导出的 `OpCommand` API 执行 ACL `Identity`，
+让框架自行启用释放 GIL 的队列排空路径，并同步该 stream，保证初始化 Tensor
+存活到完成、初始化错误在首个 callback 入队前传播；初始化失败可重试。
+这为冷启动增加分配、一次算子和同步，成功后的热调用不重复执行。
+初始化及入队期间释放调用线程的 GIL；callback 获取
 GIL 后调用公开 Python `Worker.submit(..., caller_stream=...)`，再发布 RunHandle。
 不使用同步 `Worker.run`、私有 native submit 或 slot API。native 队列状态不拥有
 Python 引用；pending owners 和 callback closure 仅在退休成功后、持有 GIL 时释放。
 
-外层 JIT 返回、callback 提交返回、设备完成是三个不同阶段。普通 enqueue 和未完成
+外层 JIT 返回、callback 提交返回、设备完成是三个不同阶段。初始化成功后的普通 enqueue 和未完成
 ticket 轮询不会 drain、synchronize 或等待 callback/run。已完成的 run 仍需 `wait()`
 退休后才释放 source；显式 shutdown 可以同步保留的 Torch stream 并等待 run。Simpler submit 自身
 可能等待容量或前驱。提交或退休失败、完成状态未知时保留所有者。
