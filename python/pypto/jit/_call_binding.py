@@ -172,16 +172,22 @@ def extract_call_args_for_dep(
     return call_arg_refs(min(calls, key=lambda call: (call.lineno, call.col_offset)))
 
 
-@functools.lru_cache(maxsize=512)
-def _dep_call_nodes(caller_func: Any, dep_call_name: str) -> tuple[ast.Call, ...]:
+def _dep_call_nodes(caller_func: Any, dep_call_name: str) -> list[ast.Call]:
     """Every call to ``dep_call_name`` in ``caller_func``'s body, in source order."""
-    func_def = _ast_analysis.get_func_def(caller_func)
-    calls = [
-        node
-        for node in ast.walk(func_def)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == dep_call_name
-    ]
-    return tuple(sorted(calls, key=lambda call: (call.lineno, call.col_offset)))
+    return list(_calls_in_definition(_ast_analysis.get_func_def(caller_func)).get(dep_call_name, ()))
+
+
+@functools.lru_cache(maxsize=512)
+def _calls_in_definition(definition: ast.FunctionDef) -> dict[str, tuple[ast.Call, ...]]:
+    """Index direct calls once per parsed definition; callers receive fresh lists."""
+    calls: dict[str, list[ast.Call]] = {}
+    for node in ast.walk(definition):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            calls.setdefault(node.func.id, []).append(node)
+    return {
+        name: tuple(sorted(nodes, key=lambda call: (call.lineno, call.col_offset)))
+        for name, nodes in calls.items()
+    }
 
 
 def _fold_call_site_constant(

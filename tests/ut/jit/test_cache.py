@@ -340,6 +340,63 @@ def test_request_signature_released_after_failure():
     assert function_signature(implementation).parameters["scale"].default == 3
 
 
+def test_request_signatures_are_isolated_between_threads():
+    def implementation(value=1):
+        return value
+
+    captured = Event()
+    changed = Event()
+
+    def first_request():
+        with capture_namespaces():
+            before = function_signature(implementation)
+            captured.set()
+            assert changed.wait(timeout=5)
+            assert function_signature(implementation) is before
+            return before.parameters["value"].default
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(first_request)
+        assert captured.wait(timeout=5)
+        try:
+            implementation.__defaults__ = (2,)
+            with capture_namespaces():
+                assert function_signature(implementation).parameters["value"].default == 2
+        finally:
+            changed.set()
+        assert first.result(timeout=5) == 1
+
+
+def test_request_cache_keeps_dynamic_arguments_and_specialization(monkeypatch):
+    torch = pytest.importorskip("torch")
+
+    @pl.jit
+    def entry(x: pl.Tensor, scale: pl.Scalar[pl.INT32], factor: pl.constexpr):
+        return x
+
+    built = []
+
+    def compile_artifact(*args, **kwargs):
+        artifact = object()
+        built.append(artifact)
+        return artifact
+
+    monkeypatch.setattr(entry, "_compile", compile_artifact)
+    sample = torch.zeros(1)
+    first, args, _ = entry._resolve_compiled((sample, 1, 2), {})
+    second, args, _ = entry._resolve_compiled((sample, 7, 2), {})
+    assert second is first and args[1] == 7
+    changed_shape, _, _ = entry._resolve_compiled((torch.zeros(2), 7, 2), {})
+    changed_dtype, _, _ = entry._resolve_compiled((torch.zeros(1, dtype=torch.int32), 7, 2), {})
+    changed_constexpr, _, _ = entry._resolve_compiled((sample, 7, 3), {})
+    assert len({id(first), id(changed_shape), id(changed_dtype), id(changed_constexpr)}) == 4
+    with pytest.raises(TypeError):
+        entry._resolve_compiled((sample,), {})
+    with pytest.raises(TypeError):
+        entry._resolve_compiled((sample, 7, 2), {"scale": 3})
+    assert len(built) == 4
+
+
 def test_structural_source_cache_observes_current_constants(monkeypatch):
     from pypto.jit import _ast_analysis  # noqa: PLC0415
 
@@ -364,6 +421,45 @@ def test_structural_source_cache_observes_current_constants(monkeypatch):
     assert entry._get_source_hash() == folded
     monkeypatch.setattr(ast, "walk", lambda _: pytest.fail("rescanned immutable names"))
     assert _ast_analysis.constant_dependency_names(entry._func) == names
+
+
+def test_structural_indices_follow_replaced_definition(monkeypatch):
+    from pypto.jit import _ast_analysis, _call_binding  # noqa: PLC0415
+
+    def implementation(x):
+        return x
+
+    first = ast.parse("def f(x):\n    return left(x, A)\n").body[0]
+    second = ast.parse("def f(x):\n    return right(x, B)\n").body[0]
+    monkeypatch.setattr(_ast_analysis, "get_func_def", lambda _: first)
+    assert "A" in _ast_analysis.constant_dependency_names(implementation)
+    calls = _call_binding._dep_call_nodes(implementation, "left")
+    assert len(calls) == 1
+    calls.clear()
+    assert len(_call_binding._dep_call_nodes(implementation, "left")) == 1
+    monkeypatch.setattr(_ast_analysis, "get_func_def", lambda _: second)
+    assert "B" in _ast_analysis.constant_dependency_names(implementation)
+    assert "A" not in _ast_analysis.constant_dependency_names(implementation)
+    assert not _call_binding._dep_call_nodes(implementation, "left")
+    assert len(_call_binding._dep_call_nodes(implementation, "right")) == 1
+
+
+def test_call_index_reuses_all_names_without_exposing_cached_lists(monkeypatch):
+    from pypto.jit import _ast_analysis, _call_binding  # noqa: PLC0415
+
+    def implementation(x):
+        return x
+
+    definition = ast.parse("def f(x):\n    left(x); right(x); left(x)\n").body[0]
+    monkeypatch.setattr(_ast_analysis, "get_func_def", lambda _: definition)
+    left = _call_binding._dep_call_nodes(implementation, "left")
+    assert len(left) == 2
+    assert left[0].col_offset < left[1].col_offset
+    left.clear()
+    monkeypatch.setattr(ast, "walk", lambda _: pytest.fail("rescanned indexed definition"))
+    assert len(_call_binding._dep_call_nodes(implementation, "left")) == 2
+    assert len(_call_binding._dep_call_nodes(implementation, "right")) == 1
+    assert _call_binding._dep_call_nodes(implementation, "missing") == []
 
 
 def test_source_record_cache_preserves_hash_encoding():
