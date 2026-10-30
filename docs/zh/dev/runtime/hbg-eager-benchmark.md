@@ -75,3 +75,27 @@ python tests/benchmarks/hbg_csa_aggregate.py --repo "$REPO" \
 要求所有轮次节省为正且 CI 下界超过噪声。不同物理卡分别报告，不混合作为同卡重跑。
 历史 136→11 ms 是作者环境观测；原始外部 fixture 和采集数据未随本仓库发布，
 单凭此源码不能独立复核该数字，也不能视作最新 main 或 ACLNN 的验收结果。
+
+## 单项优化的完整版本消融
+
+优化已落产品时，使用两个完整 Python Git worktree 比较，保持相同 native/runtime；
+不通过关闭 resolver 或替换动态绑定来制造收益。目录仍按
+`h8192-q0-r1-before/current` 等标签命名，每轮平衡版本顺序，每版保留 A/A。
+
+```bash
+python tests/benchmarks/hbg_csa_aggregate.py --repo "$REPO" \
+  --evidence "$EVIDENCE" --device "$RECORDED_PHYSICAL_DEVICE" --repeats 3 \
+  --versions before=41e59f8 current="$PRODUCT_REF" --compare before=current \
+  --harness-ref "$PRODUCT_REF" --cpu-samples 32 --include-cpu --output "$SUMMARY"
+```
+
+这里的 before 已包含此前优化，只关闭本轮普通字面量文本优化；不能与最初
+main+#3194 的基线混淆。每个配置使用 `bench --metadata produce`、6 blocks、
+32 Host samples、5 warmup、32 CPU samples。Host 采样另记录调用线程 CPU，
+两个 thread clock 在原 Host 计时边界之外，不将其称为完整进程 CPU。
+完整生命周期仍用 process clock，包含设备完成及真实 source 释放，单独汇总。
+
+最终字面量实现不持有缓存：精确 None/bool/int/str 直接生成与原 AST writer
+一致的 repr 文本；其他类型回退。当前绑定读取和 AST-producing 路径保持原语义。
+LRU、request memo、调用点缓存等研究原型不作为当前 checkout 的可运行入口；
+历史算法比较保存在研究提交中，产品回归使用本节完整版本入口。

@@ -11,9 +11,12 @@
 
 import ast
 import math
+import random
+import sys
 import textwrap
 import types
 import warnings
+from collections import UserDict
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
@@ -22,6 +25,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto.backend import BackendType
+from pypto.jit import specializer as jit_specializer
 from pypto.jit.specializer import (
     DynDim,
     SpecializeContext,
@@ -688,6 +692,113 @@ class TestRenderFreeValue:
         rendered = _render_free_value(float("nan"))
         assert rendered is not None
         assert math.isnan(eval(ast.unparse(rendered), {"__builtins__": {}}))  # noqa: S307
+
+
+class TestConstantSource:
+    """The key's text must match the existing AST writer without a literal cache."""
+
+    @staticmethod
+    def _ast_text(value: Any) -> str:
+        rendered = _render_free_value(value)
+        assert rendered is not None
+        return ast.unparse(rendered)
+
+    def test_exact_literals_match_ast_encoding(self):
+        rng = random.Random(31)
+        values = [None, True, False, 0, -1, 2**256, "", "\ud800", "\x00\n\\'\"", "\u4e2d\u6587"]
+        values.extend(rng.getrandbits(256) - 2**255 for _ in range(100))
+        values.extend("".join(chr(rng.randrange(0x110000)) for _ in range(20)) for _ in range(100))
+        for value in values:
+            expected = self._ast_text(value)
+            assert jit_specializer.constant_source(value) == expected
+            assert jit_specializer.free_name_source("value", {"value": value}) == expected
+
+    def test_exact_literals_avoid_ast_roundtrip(self, monkeypatch):
+        def reject(value):
+            pytest.fail("Ordinary literal text should not construct an AST")
+
+        monkeypatch.setattr(jit_specializer, "_render_free_value", reject)
+        for value in (None, True, False, 0, -7, 2**256, "hello\n'world"):
+            assert jit_specializer.constant_source(value) == repr(value)
+            assert jit_specializer.free_name_source("n", {"n": value}) == repr(value)
+
+    def test_fallbacks_still_use_original_ast_writer(self, monkeypatch):
+        values = [1.5, -0.0, float("inf"), float("nan"), pl.FP32, pl.NZ, pl.Mem.Vec, [1, 2], (1,)]
+        expected = [self._ast_text(value) for value in values]
+        original = ast.unparse
+        visited = []
+
+        def record(node):
+            visited.append(node)
+            return original(node)
+
+        monkeypatch.setattr(ast, "unparse", record)
+        assert [jit_specializer.constant_source(value) for value in values] == expected
+        assert len(visited) == len(values)
+
+    def test_value_subclass_keeps_current_repr_without_type_equality(self):
+        class Meta(type):
+            __hash__ = type.__hash__
+
+            def __eq__(cls, other):
+                raise AssertionError("Exact-type checks must use identity")
+
+        class MutableRepr(int, metaclass=Meta):
+            text = "16"
+
+            def __repr__(self):
+                return self.text
+
+        value = MutableRepr(16)
+        assert jit_specializer.constant_source(value) == "16"
+        value.text = "32"
+        assert jit_specializer.constant_source(value) == "32"
+
+    def test_name_lookup_remains_current_and_single_read(self):
+        class Namespace(UserDict):
+            reads = 0
+
+            def __contains__(self, key):
+                return key in self.data
+
+            def __getitem__(self, key):
+                self.reads += 1
+                return self.data[key]
+
+        namespace = Namespace({"n": 16})
+        assert jit_specializer.free_name_source("n", namespace) == "16"
+        namespace["n"] = 32
+        assert jit_specializer.free_name_source("n", namespace) == "32"
+        namespace["n"] = None
+        assert jit_specializer.free_name_source("n", namespace) == "None"
+        namespace["n"] = jit_specializer._UNBOUND
+        assert jit_specializer.free_name_source("n", namespace) is None
+        assert jit_specializer.free_name_source("missing", namespace) is None
+        assert namespace.reads == 4
+
+    def test_ast_producing_paths_remain_independent(self):
+        first = jit_specializer.constant_expr(16, ast.Constant(0))
+        second = jit_specializer.constant_expr(16, ast.Constant(0))
+        bound = jit_specializer._bind_free_name("n", {"n": 16})
+        assert isinstance(first, ast.Constant) and isinstance(second, ast.Constant)
+        assert isinstance(bound, ast.Constant)
+        assert first is not second and first is not bound
+        first.value = 32
+        assert second.value == bound.value == 16
+
+    @pytest.mark.skipif(not hasattr(sys, "set_int_max_str_digits"), reason="No digit-limit API")
+    def test_integer_rendering_observes_current_limit(self):
+        previous = sys.get_int_max_str_digits()
+        value = 10**1000
+        try:
+            sys.set_int_max_str_digits(0)
+            assert jit_specializer.constant_source(value) == ast.unparse(ast.Constant(value))
+            sys.set_int_max_str_digits(640)
+            for render in (jit_specializer.constant_source, lambda v: ast.unparse(ast.Constant(v))):
+                with pytest.raises(ValueError):
+                    render(value)
+        finally:
+            sys.set_int_max_str_digits(previous)
 
 
 # ---------------------------------------------------------------------------

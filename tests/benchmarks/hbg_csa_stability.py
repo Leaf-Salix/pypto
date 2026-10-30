@@ -99,8 +99,6 @@ def measure_cpu(args: Any, stages: Any, reset: Any, run: Any, drain: Any, verify
         orders.append(order)
         for stage in order:
             drain()
-            if experiment := getattr(args, "_experiment", None):
-                experiment.install(stage)
             cpu_ns = 0
             for _ in range(args.cpu_samples):
                 reset()
@@ -186,8 +184,7 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
     from pypto.runtime.kernel.arguments import _load_api  # noqa: PLC0415
     from pypto.runtime.kernel.context import get_process_kernel_state  # noqa: PLC0415
 
-    experiment = getattr(args, "_experiment", None)
-    stages = experiment.stages if experiment is not None else ("current_a", "current_b")
+    stages = ("current_a", "current_b")
     rng = random.Random(args.seed)
     calls = 0
     cold_compile = []
@@ -279,17 +276,17 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
                 orders.append(order)
                 for stage in order:
                     drain()
-                    if is_pto and experiment is not None:
-                        experiment.install(stage)
                     for _ in range(warmup):
                         reset()
                         run()
                         npu.synchronize()
                     for sample in range(iters):
                         reset()
+                        thread_begin = time.thread_time_ns()
                         begin = time.perf_counter_ns()
                         run()
                         end = time.perf_counter_ns()
+                        thread_ns = time.thread_time_ns() - thread_begin
                         npu.synchronize()
                         rows.append(
                             {
@@ -297,6 +294,7 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
                                 "stage": stage,
                                 "sample": sample,
                                 "host_us": (end - begin) / 1000,
+                                "thread_cpu_us": thread_ns / 1000,
                             }
                         )
                     drain()
@@ -318,8 +316,6 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
             finally:
                 if is_pto:
                     del root._compile
-                    if experiment is not None:
-                        experiment.restore()
         result = {
             "method": "eager_host_entry_to_return",
             "scope": (
@@ -502,7 +498,7 @@ def write_identity(args: Any) -> None:
     repo = Path(__file__).resolve().parents[2]
     source_repo = Path(os.environ.get("CSA_VERSION_ROOT", str(repo))).resolve()
     assert Path(modules["pypto"]["file"]) == source_repo / "python/pypto/__init__.py"
-    assert Path(modules["simpler"]["file"]).is_relative_to(repo / "runtime")
+    assert Path(modules["simpler"]["file"]).is_relative_to((repo / "runtime").resolve())
     identity = {
         "modules": modules,
         "pid": os.getpid(),

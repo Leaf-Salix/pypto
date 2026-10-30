@@ -425,15 +425,20 @@ def _render_free_value(value: Any) -> ast.expr | None:
     return ast.parse(path, mode="eval").body if path else None
 
 
+def _free_name_value(name: str, py_globals: Mapping[str, Any]) -> Any:
+    """Read the current binding once, preserving missing and unbound semantics."""
+    if name not in py_globals:
+        return _UNBOUND
+    return py_globals[name]
+
+
 def _bind_free_name(name: str, py_globals: Mapping[str, Any]) -> ast.expr | None:
     """Render what ``name`` is bound to in ``py_globals``, or None if it does not fold.
 
     None covers all three ways a name can fail to fold: it is not bound here, it
     is an unbound closure cell, or its value has no source form.
     """
-    if name not in py_globals:
-        return None
-    value = py_globals[name]
+    value = _free_name_value(name, py_globals)
     if value is _UNBOUND:
         return None
     return _render_free_value(value)
@@ -484,15 +489,20 @@ def _reject_constexpr_rebinding(func_def: ast.FunctionDef, ctx: SpecializeContex
                     )
 
 
-def constant_source(value: Any) -> str | None:
+def constant_source(value: object) -> str | None:
     """The generated-source text ``value`` folds to, or None when it does not fold.
 
     The value-keyed sibling of :func:`free_name_source`, for a constant the call
     site supplies directly rather than binds to a name — a ``pl.constexpr``
-    argument. Sharing :func:`_render_free_value` is the point: a constexpr
-    parameter folds by exactly the rule a module-level constant follows, so the
-    two can never admit different value types.
+    argument. Both paths use this writer, so the same value always contributes
+    the same text to generated source and cache identity.
     """
+    kind = type(value)
+    # Ordinary literals use the same repr spelling as ast.unparse(Constant).
+    # Keep subclasses and floats on the AST path: subclasses can customize
+    # rendering, while non-finite floats require evaluable expressions.
+    if value is None or kind is bool or kind is int or kind is str:
+        return repr(value)
     rendered = _render_free_value(value)
     return None if rendered is None else ast.unparse(rendered)
 
@@ -514,8 +524,8 @@ def free_name_source(name: str, py_globals: Mapping[str, Any]) -> str | None:
     extent does. Hashing the rendered *text* rather than the value keeps the two
     definitions from drifting — the key depends on precisely what gets emitted.
     """
-    rendered = _bind_free_name(name, py_globals)
-    return None if rendered is None else ast.unparse(rendered)
+    value = _free_name_value(name, py_globals)
+    return None if value is _UNBOUND else constant_source(value)
 
 
 def _fold_free_name(name: str, py_globals: Mapping[str, Any], node: ast.expr) -> ast.expr | None:

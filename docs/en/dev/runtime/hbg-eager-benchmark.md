@@ -89,3 +89,30 @@ The historical 136→11 ms result is an author-environment observation. External
 fixtures and collected evidence are not published with this repository, so the
 source alone does not independently verify that number. It is not acceptance
 against latest main or ACLNN.
+
+## Full-version ablation of one optimization
+
+Compare two complete Python Git worktrees with common native/runtime modules.
+Do not bypass the resolver or dynamic bindings. Keep directory labels such as
+`h8192-q0-r1-before/current`, balance version order and retain A/A in each process.
+
+```bash
+python tests/benchmarks/hbg_csa_aggregate.py --repo "$REPO" \
+  --evidence "$EVIDENCE" --device "$RECORDED_PHYSICAL_DEVICE" --repeats 3 \
+  --versions before=41e59f8 current="$PRODUCT_REF" --compare before=current \
+  --harness-ref "$PRODUCT_REF" --cpu-samples 32 --include-cpu --output "$SUMMARY"
+```
+
+This before version already contains earlier optimizations; it isolates the
+ordinary-literal text change, not the original main+#3194 baseline. Each
+configuration uses `bench --metadata produce`, 6 blocks, 32 Host samples,
+5 warmups and 32 CPU samples. Host rows also record caller-thread CPU; both
+thread clocks are outside the original Host timing boundary. Caller-thread
+CPU is not total process CPU. Lifecycle process-clock measurements still
+include device completion and real source release, and are reported separately.
+
+The literal implementation has no cache: exact None/bool/int/str use repr text
+matching the old AST writer; other values retain the fallback. Current binding
+reads and AST-producing paths keep their semantics. LRU, request-memo and
+callsite-cache prototypes are historical research, not current entry points;
+use the full-version runner for final product validation.
