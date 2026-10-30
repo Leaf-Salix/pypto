@@ -249,8 +249,9 @@ def diagnose_sources(
     rows = []
     for stage in stages:
         drain()
-        ablations.restore()
-        ablations.install(stage)
+        if ablations:
+            ablations.restore()
+            ablations.install(stage)
         counters: dict[str, int] = {}
         patches = _DiagnosticPatches()
 
@@ -294,7 +295,7 @@ def diagnose_sources(
 def select_ablations(args: Any) -> tuple[Any, tuple[str, ...]]:
     from hbg_stability_audit import STAGES, Ablations  # noqa: PLC0415
 
-    if args.mode == "smoke":
+    if args.mode == "smoke" or args.suite == "current":
         return None, ("current_a", "current_b")
     if args.suite == "tile":
         return TileAblations(args.tile_baseline), ("current_a", "current_b", "off_tile")
@@ -306,6 +307,7 @@ def select_ablations(args: Any) -> tuple[Any, tuple[str, ...]]:
 def install_measurement(case: Any, root: Any, args: Any) -> None:
     from hbg_stability_audit import npu  # noqa: PLC0415
     from pypto._artifact_contract import ArtifactExecutionMode  # noqa: PLC0415
+    from pypto.runtime.kernel.arguments import _load_api  # noqa: PLC0415
     from pypto.runtime.kernel.context import get_process_kernel_state  # noqa: PLC0415
 
     ablations, stages = select_ablations(args)
@@ -378,7 +380,7 @@ def install_measurement(case: Any, root: Any, args: Any) -> None:
                 worker = session.worker
                 # Complete lazy registry revocations as well as source leases.
                 with worker._child_prov_worker_lock(0), worker._child_prov_lock:
-                    assert worker._attach_source_buffers_locked(session._api.arguments.TaskArgs()) == ()
+                    assert worker._attach_source_buffers_locked(_load_api().TaskArgs()) == ()
                     assert not worker._source_attachments
                     assert not worker._device_buffer_source._records
                 assert not session.sources._sources
@@ -515,7 +517,7 @@ def main() -> None:
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--baselines", type=Path)
-    parser.add_argument("--suite", choices=("all", "tile", "fine"), default="all")
+    parser.add_argument("--suite", choices=("all", "tile", "fine", "current"), default="current")
     parser.add_argument("--tile-baseline", type=Path, help="Pre-optimization specializer.py for tile/fine")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mode", choices=("smoke", "bench", "diagnostic"), default="smoke")
@@ -527,6 +529,8 @@ def main() -> None:
     parser.add_argument("--cpu-samples", type=int, default=16)
     parser.add_argument("--seed", type=int, default=1)
     args = parser.parse_args()
+    if args.mode != "smoke" and args.suite in ("all", "fine"):
+        parser.error("all/fine include removed optimizations; run those historical suites on the bak branch")
     if args.mode != "smoke":
         if args.suite in ("all", "fine") and args.baselines is None:
             parser.error("--suite all/fine with --mode bench/diagnostic requires --baselines")

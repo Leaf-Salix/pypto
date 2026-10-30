@@ -46,6 +46,10 @@ class Ablations:
     """Install exact function bodies only between fully drained blocks."""
 
     def __init__(self, baseline_root: Path) -> None:
+        if not hasattr(importlib.import_module("pypto.jit._kernel"), "_kernel_signature"):
+            raise ValueError(
+                "This historical ablation includes removed optimizations; run it on the bak branch"
+            )
         self.root = baseline_root
         self.patches = _DiagnosticPatches()
         self.hashes: dict[str, str] = {}

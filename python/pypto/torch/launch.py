@@ -9,13 +9,13 @@
 
 """Submit eager kernels at the Torch host-queue boundary using public Worker APIs."""
 
+import importlib
 from typing import Any
 
 
 def _load_native() -> Any:
     try:
-        # A nonempty fromlist returns the submodule, not its parent attribute.
-        native = __import__("pypto._torch_npu", fromlist=("__name__",))
+        native = importlib.import_module("pypto._torch_npu")
     except ModuleNotFoundError as exc:
         if exc.name != "pypto._torch_npu":
             raise
@@ -88,9 +88,7 @@ def invoke(artifact: Any, frame: Any, config: Any) -> Any:
     def prepare(session: Any) -> PendingTicket:
         call_config = make_call_config(config, session._api.CallConfig)
         tensors = [arg.tensor for arg in frame.tensors]
-        arguments = BorrowedArguments(
-            frame, session.sources, session.device_location, api=session._api.arguments
-        )
+        arguments = BorrowedArguments(frame, session.sources, session.device_location)
 
         def enqueue(ticket: PendingTicket) -> None:
             def submit(caller_stream: int) -> None:

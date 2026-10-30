@@ -32,28 +32,23 @@ naming a new CSV. Never enable the launch probe for formal bench measurements.
 
 import argparse
 import cProfile
-import hashlib
 import importlib
-import importlib.util
 import json
 import os
 import statistics
-import sys
 import time
-from functools import lru_cache
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pypto
 import pypto.language as pl
 import pypto.torch
 import torch
-from pypto.jit._kernel import _kernel_signature
 from pypto.runtime.kernel.arguments import BorrowedArguments, _load_api
 from pypto.runtime.kernel.context import get_process_kernel_state
 from pypto.runtime.kernel.session import make_call_config
 from pypto.torch import launch
+from pypto.torch.interop import CallSignature
 
 # Optional hardware packages are imported dynamically, as in the Torch adapter.
 torch_npu = importlib.import_module("torch_npu")
@@ -123,7 +118,9 @@ class FixedProbe:
         assert len(observed) == 1
         self.artifact = observed[0]
         metadata = self.artifact.metadata
-        self.signature = _kernel_signature(metadata.parameters, metadata.return_aliases, "a2a3")
+        self.signature = CallSignature(
+            metadata.parameters, return_aliases=metadata.return_aliases, platform="a2a3"
+        )
         self.frame = self.signature.describe_call(self.inputs)
         self.session = self.state._worker
         self.source_api = _load_api()
@@ -133,7 +130,7 @@ class FixedProbe:
         self.callable_id = self.worker._resolve_handle(
             self.registration.handle, expected_namespace="LOCAL_CHIP"
         ).slot_id
-        self.call_config = make_call_config(self.config, self.session._api.CallConfig)
+        self.call_config = make_call_config(self.config, self.source_api.CallConfig)
         self.arguments = None
         self.chip_args = None
         self.identities = ()
@@ -348,41 +345,6 @@ def profile_calls(probe: FixedProbe, output: Path, samples: int) -> None:
             probe.finish()
 
 
-def measure_session_resources(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
-    """Alternate old session-resource work and reuse within one process.
-
-    This is a counterfactual hot-path control, not a second installed version:
-    restore the old location getter and the argument packer's existing API-load
-    fallback. Both variants execute the complete JIT path with the same session.
-    Run only in this single-caller diagnostic; finish all work before switching.
-    """
-    session = probe.session
-    session_type = type(session)
-    location = session_type.device_location
-    interface = session._api.arguments
-    prepare = probe.prepare
-
-    def prepare_variant(stage: str) -> None:
-        if stage == "baseline":
-            session_type.device_location = property(lambda owner: owner.worker.device_location)
-            session._api.arguments = None
-        else:
-            session_type.device_location = location
-            session._api.arguments = interface
-        prepare("aclnn" if stage == "aclnn" else "jit")
-
-    probe.prepare = prepare_variant
-    try:
-        measure(probe, output, samples, batches, ("baseline", "candidate", "aclnn"))
-    finally:
-        try:
-            probe.finish()
-        finally:
-            probe.prepare = prepare
-            session_type.device_location = location
-            session._api.arguments = interface
-
-
 def measure_source_handoff(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
     """Isolate admission handoff with the same complete JIT and fresh frames."""
     pool = probe.session.sources
@@ -453,55 +415,6 @@ def count_source_lifecycle(probe: FixedProbe, output: Path, samples: int) -> Non
             worker._record_device_alloc, worker._drop_device_alloc = record, drop
             probe.finish()
     (output / "source-counts.json").write_text(json.dumps(result, indent=2))
-
-
-def measure_frame_snapshot(
-    probe: FixedProbe, output: Path, baseline: Path, samples: int, batches: int
-) -> None:
-    """Compare old frame/packer code with the same resolver and source handoff."""
-    from pypto.jit import _kernel  # noqa: PLC0415
-    from pypto.runtime.kernel import arguments  # noqa: PLC0415
-
-    def load(name: str, path: Path) -> Any:
-        spec = importlib.util.spec_from_file_location(name, path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        return module
-
-    (output / "frame-baseline.json").write_text(
-        json.dumps(
-            {
-                name: hashlib.sha256((baseline / name).read_bytes()).hexdigest()
-                for name in ("python/pypto/torch/interop.py", "python/pypto/runtime/kernel/arguments.py")
-            },
-            indent=2,
-        )
-    )
-    old_frame = load("_hbg_baseline_interop", baseline / "python/pypto/torch/interop.py")
-    old_args = load("_hbg_baseline_arguments", baseline / "python/pypto/runtime/kernel/arguments.py")
-
-    @lru_cache(maxsize=128)
-    def old_signature(parameters: tuple[Any, ...], aliases: tuple[int, ...], platform: str) -> Any:
-        return old_frame.CallSignature(parameters, return_aliases=aliases, platform=platform)
-
-    signature, packer, prepare = _kernel._kernel_signature, arguments.BorrowedArguments, probe.prepare
-
-    def prepare_variant(stage: str) -> None:
-        _kernel._kernel_signature = old_signature if stage == "baseline" else signature
-        arguments.BorrowedArguments = old_args.BorrowedArguments if stage == "baseline" else packer
-        prepare("aclnn" if stage == "aclnn" else "jit")
-
-    probe.prepare = prepare_variant
-    try:
-        measure(probe, output, samples, batches, ("baseline", "candidate", "aclnn"))
-    finally:
-        try:
-            probe.finish()
-        finally:
-            probe.prepare = prepare
-            _kernel._kernel_signature, arguments.BorrowedArguments = signature, packer
 
 
 class _DiagnosticPatches:
@@ -628,115 +541,6 @@ def measure_resolver_layers(probe: FixedProbe, output: Path, samples: int, batch
             probe.prepare = prepare
 
 
-def measure_adapter_layers(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
-    """Cumulative adapter bounds with the real resolver, tickets and Worker.submit.
-
-    Only imports is a warm-path implementation alternative. Later stages freeze
-    config/frame/TaskArgs or omit the early gate under this fixed contract; they
-    are upper bounds, not permission to remove guards in a product path.
-    """
-    from pypto.runtime.kernel import arguments, session  # noqa: PLC0415
-    from pypto.torch import interop  # noqa: PLC0415
-
-    def native_import() -> Any:
-        from pypto import _torch_npu as native  # noqa: PLC0415
-
-        for name in ("check_call", "borrow_context", "bind_context", "framework_alive", "retain_until_exit"):
-            if not callable(getattr(native, name, None)):
-                raise NotImplementedError(f"Torch lifecycle adapter requires {name}; rebuild the adapter")
-        return native
-
-    stages = ("baseline", "imports", "config", "frame", "task_args", "early_gate", "aclnn")
-    metadata = probe.artifact.metadata
-    assert probe.signature is _kernel_signature(metadata.parameters, metadata.return_aliases, "a2a3")
-    patches = _DiagnosticPatches()
-    prepare = probe.prepare
-
-    def prepare_variant(stage: str) -> None:
-        patches.restore()
-        prepare("aclnn" if stage == "aclnn" else "jit")
-        (probe.aclnn_out if stage == "aclnn" else probe.out).fill_(float("nan"))
-        npu.synchronize()
-        if stage in ("baseline", "aclnn"):
-            return
-        level = stages.index(stage)
-        patches.set(launch, "_load_native", native_import)
-        patches.set(interop, "_load_torch_npu", lambda: __import__("torch_npu"))
-        if level >= 2:
-            patches.set(session, "make_call_config", lambda *args: probe.call_config)
-        if level >= 3:
-            patches.set(probe.signature, "describe_call", lambda *args, **kwargs: probe.frame)
-        if level >= 4:
-            # One real lease owns the fixed inputs through every callback/run.
-            # Tickets still retire normally; finish performs the actual release.
-            probe.arguments = BorrowedArguments(
-                probe.frame, probe.session.sources, probe.session.device_location, api=probe.source_api
-            )
-            retained = SimpleNamespace(task_args=probe.arguments.task_args, release=lambda: None)
-            patches.set(arguments, "BorrowedArguments", lambda *args, **kwargs: retained)
-        if level >= 5:
-            # Only a bound: keep the final frame capture gate and all later checks.
-            patches.set(launch, "check_eager_call", lambda *args: False)
-
-    probe.prepare = prepare_variant
-    try:
-        measure(probe, output, samples, batches, stages)
-    finally:
-        try:
-            probe.finish()
-        finally:
-            patches.restore()
-            probe.prepare = prepare
-
-
-def measure_imports(probe: FixedProbe, output: Path, samples: int, batches: int) -> None:
-    """Compare the installed loaders with their original dynamic-import work."""
-    from pypto.torch import interop  # noqa: PLC0415
-
-    def dynamic_native() -> Any:
-        try:
-            native = importlib.import_module("pypto._torch_npu")
-        except ModuleNotFoundError as exc:
-            if exc.name != "pypto._torch_npu":
-                raise
-            raise RuntimeError(
-                "Torch kernel initialization requires the optional pypto._torch_npu adapter; "
-                "build with PYPTO_BUILD_TORCH_NPU=ON and matching torch/torch_npu/CANN"
-            ) from exc
-        for name in ("check_call", "borrow_context", "bind_context", "framework_alive", "retain_until_exit"):
-            if not callable(getattr(native, name, None)):
-                raise NotImplementedError(f"Torch lifecycle adapter requires {name}; rebuild the adapter")
-        return native
-
-    def dynamic_torch_npu() -> Any:
-        try:
-            return importlib.import_module("torch_npu")
-        except ImportError as exc:
-            raise RuntimeError("Describing NPU calls requires a compatible torch_npu installation") from exc
-
-    patches = _DiagnosticPatches()
-    prepare = probe.prepare
-
-    def prepare_variant(stage: str) -> None:
-        patches.restore()
-        prepare("aclnn" if stage == "aclnn" else "jit")
-        (probe.aclnn_out if stage == "aclnn" else probe.out).fill_(float("nan"))
-        npu.synchronize()
-        if stage == "dynamic_imports":
-            patches.set(launch, "_load_native", dynamic_native)
-            patches.set(interop, "_load_torch_npu", dynamic_torch_npu)
-
-    probe.prepare = prepare_variant
-    try:
-        measure(probe, output, samples, batches, ("dynamic_imports", "local_imports", "aclnn"))
-    finally:
-        try:
-            probe.finish()
-        finally:
-            patches.restore()
-            probe.prepare = prepare
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, required=True)
@@ -763,8 +567,10 @@ def main() -> None:
     parser.add_argument("--stages", nargs="+", choices=STAGES, default=STAGES)
     parser.add_argument("--baseline-root", type=Path)
     args = parser.parse_args()
-    if args.mode == "frame-paired" and args.baseline_root is None:
-        parser.error("frame-paired requires --baseline-root containing the old frame and argument source")
+    if args.mode in ("paired", "frame-paired", "adapter-layers", "import-paired"):
+        parser.error(
+            f"{args.mode} diagnoses removed optimizations; run the retained benchmark on the bak branch"
+        )
     if args.mode in (
         "bench",
         "paired",
@@ -827,18 +633,13 @@ def main() -> None:
             phases(probe, args.output, args.samples)
         elif args.mode == "profile":
             profile_calls(probe, args.output, args.samples)
-        elif args.mode in ("paired", "handoff", "resolver-layers", "adapter-layers", "import-paired"):
+        elif args.mode in ("handoff", "resolver-layers"):
             {
-                "paired": measure_session_resources,
                 "handoff": measure_source_handoff,
                 "resolver-layers": measure_resolver_layers,
-                "adapter-layers": measure_adapter_layers,
-                "import-paired": measure_imports,
             }[args.mode](probe, args.output, args.samples, args.batches)
         elif args.mode == "counts":
             count_source_lifecycle(probe, args.output, args.samples)
-        elif args.mode == "frame-paired":
-            measure_frame_snapshot(probe, args.output, args.baseline_root, args.samples, args.batches)
     finally:
         probe.finish()
         probe.state.close()

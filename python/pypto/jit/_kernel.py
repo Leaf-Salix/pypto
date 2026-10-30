@@ -9,24 +9,10 @@
 
 """Eager JIT policy over the shared specialization, compiler and artifact cache."""
 
-from functools import lru_cache
 from typing import Any
 
 from pypto._artifact_contract import ArtifactExecutionMode
 from pypto.runtime.kernel.context import get_process_kernel_state
-
-
-@lru_cache(maxsize=128)
-def _kernel_signature(parameters: tuple[Any, ...], aliases: tuple[int, ...], platform: str) -> Any:
-    """Reuse only immutable parameter declarations, never a call's frame or owners.
-
-    Metadata snapshots include shapes, dtypes, directions and layouts. Aliases
-    and platform are also part of the key. Bound the cache so discarded artifact
-    signatures cannot accumulate indefinitely; eviction only repeats parsing.
-    """
-    from pypto.torch.interop import CallSignature  # noqa: PLC0415
-
-    return CallSignature(parameters, return_aliases=aliases, platform=platform)
 
 
 def invoke_jit(jit: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -69,10 +55,8 @@ def invoke_jit(jit: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     if metadata is None:
         raise ValueError("Kernel artifact has no validated parameter metadata; recompile it")
     assert metadata.return_aliases is not None
-    frame = _kernel_signature(metadata.parameters, metadata.return_aliases, bound.platform).describe_call(
-        ordered
-    )
-    # invoke validates this exact frame before registration/admission. Keep the
-    # early capture gate and cold compiler preflight, but do not validate the
-    # final frame twice on every cache hit.
+    frame = CallSignature(
+        metadata.parameters, return_aliases=metadata.return_aliases, platform=bound.platform
+    ).describe_call(ordered)
+    launch.check_frame(frame, bound)
     return launch.invoke(artifact, frame, bound)

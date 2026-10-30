@@ -114,11 +114,12 @@ def test_real_compiler_cache_callback_and_retirement(eager_env, copy_kernel, stu
     stub_device_runner._compile_and_assemble.assert_called_once()
 
 
-def test_warm_call_reuses_signature_but_not_values(eager_env, copy_kernel, stub_device_runner, monkeypatch):
-    from pypto.jit import _kernel  # noqa: PLC0415
+def test_warm_call_keeps_values_streams_and_aliases_independent(
+    eager_env, copy_kernel, stub_device_runner, monkeypatch
+):
     from pypto.torch import launch  # noqa: PLC0415
+    from pypto.torch.interop import CallSignature  # noqa: PLC0415
 
-    _kernel._kernel_signature.cache_clear()
     env = eager_env
     env.init()
     checked = []
@@ -131,34 +132,30 @@ def test_warm_call_reuses_signature_but_not_values(eager_env, copy_kernel, stub_
     monkeypatch.setattr(launch, "check_frame", checked_frame)
     x, out = env.tensor(), env.tensor()
     copy_kernel(x, 3, out)
-    # The cold compiler preflight and final submission each validate once.
-    assert len(checked) == 2
-    misses = _kernel._kernel_signature.cache_info().misses
+    # Cold preflight and both frame admission checks must validate.
+    assert len(checked) == 3
     other_x, other_out = env.tensor(), env.tensor()
     first_stream = env.stream_id
     env.stream_id += 1
     assert copy_kernel(other_x, 9, other_out) == (other_out, other_out)
-    assert len(checked) == 3
-    assert _kernel._kernel_signature.cache_info().misses == misses
-    assert _kernel._kernel_signature.cache_info().hits == 1
+    assert len(checked) == 5
     # Queue both calls before executing either callback: reuse must not replace
     # the first call's arguments with the second call's values or owners.
-    assert checked[-2] is not checked[-1]
-    assert checked[-2].tensors[0].tensor is x
+    assert checked[-3] is not checked[-1]
+    assert checked[-3].tensors[0].tensor is x
     assert checked[-1].tensors[0].tensor is other_x
-    assert checked[-2].stream.stream_id == first_stream
+    assert checked[-3].stream.stream_id == first_stream
     assert checked[-1].stream.stream_id == env.stream_id
     # Identical parameter declarations can describe different return contracts.
     artifact = next(iter(copy_kernel._cache.values()))
     parameters = artifact.metadata.parameters
-    single = _kernel._kernel_signature(parameters, (2,), env.state.require_config().platform)
+    single = CallSignature(parameters, return_aliases=(2,), platform=env.state.require_config().platform)
     assert single.describe_call([other_x, 9, other_out]).alias_result() is other_out
     assert checked[-1].alias_result() == (other_out, other_out)
     env.run_queue()
     submitted = [e for e in env.events if isinstance(e, tuple) and e[0] == "submit"]
     assert [event[2].scalars[0].value for event in submitted] == [3, 9]
     env.state.close()
-    _kernel._kernel_signature.cache_clear()
 
 
 def test_compile_keeps_program_contract_and_separate_cache(eager_env, copy_kernel, stub_device_runner):

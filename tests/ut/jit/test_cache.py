@@ -22,7 +22,7 @@ import pypto.language as pl
 import pytest
 from pypto.ir import DistributedConfig, OptimizationStrategy
 from pypto.jit import _arguments
-from pypto.jit._source import capture_namespaces, function_namespace, function_parameters, function_signature
+from pypto.jit._source import capture_namespaces, function_namespace, function_signature
 from pypto.jit.cache import (
     SCALAR_SEMANTICS,
     compute_source_hash,
@@ -74,51 +74,7 @@ def test_request_signature_shared_by_parameter_readers(monkeypatch):
     assert len(calls) == 2
 
 
-def test_parameter_structure_reuses_guarded_signature_and_refreshes_changes(monkeypatch):
-    def implementation(x: int):
-        return x
-
-    def replacement(x, y):
-        return x, y
-
-    with capture_namespaces():
-        first = function_parameters(implementation, function_signature(implementation))
-        assert first is not None and first.names == ("x",)
-    with capture_namespaces():
-        assert function_parameters(implementation, function_signature(implementation)) is first
-    implementation.__annotations__["x"] = pl.constexpr
-    with capture_namespaces():
-        annotated = function_parameters(implementation, function_signature(implementation))
-        assert annotated is not None and annotated is not first
-        assert annotated.declarations[0][1].annotation is pl.constexpr
-    implementation.__code__ = replacement.__code__
-    with capture_namespaces():
-        replaced = function_parameters(implementation, function_signature(implementation))
-        assert replaced is not None and replaced is not annotated
-        assert replaced.names == ("x", "y")
-    implementation.__defaults__ = (3,)
-    with capture_namespaces():
-        defaulted = function_parameters(implementation, function_signature(implementation))
-        assert defaulted is not None and defaulted is not replaced
-        assert defaulted.declarations[1][1].default == 3
-
-    # Explicit signatures bypass the function-metadata cache, so their exact
-    # object identity must also be checked before reusing parameter structure.
-    signature = inspect.Signature([inspect.Parameter("named", inspect.Parameter.KEYWORD_ONLY)])
-    monkeypatch.setattr(implementation, "__signature__", signature, raising=False)
-    with capture_namespaces():
-        explicit = function_parameters(implementation, function_signature(implementation))
-        assert explicit is not None and explicit.names == ("named",)
-        assert not explicit.all_positional
-    with capture_namespaces():
-        assert function_parameters(implementation, function_signature(implementation)) is explicit
-    monkeypatch.setattr(implementation, "__signature__", signature.replace(parameters=[]))
-    with capture_namespaces():
-        empty = function_parameters(implementation, function_signature(implementation))
-        assert empty is not None and empty is not explicit and empty.names == ()
-
-
-def test_parameter_structure_does_not_cache_dynamic_annotation_classification(monkeypatch):
+def test_parameter_readers_observe_dynamic_annotation_classification(monkeypatch):
     namespaces = []
 
     class Annotation:
@@ -145,18 +101,16 @@ def test_parameter_structure_does_not_cache_dynamic_annotation_classification(mo
 
     monkeypatch.setattr(_arguments, "func_name_lookup", namespace)
     with capture_namespaces():
-        first = function_parameters(implementation, function_signature(implementation))
         assert _arguments.param_layouts(implementation, "implementation") == {"x": pl.NZ}
     assert not namespaces
     annotation.as_string = True
     annotation.layout = pl.DN
     with capture_namespaces():
-        assert function_parameters(implementation, function_signature(implementation)) is first
         assert _arguments.param_layouts(implementation, "implementation") == {"x": pl.DN}
     assert namespaces == [implementation]
 
 
-def test_parameter_structure_preserves_annotation_evaluation_and_mutation():
+def test_parameter_readers_preserve_annotation_evaluation_and_mutation():
     def implementation(x):
         return x
 
@@ -306,7 +260,7 @@ def test_declaration_reader_uses_one_dynamic_signature_without_request(reader):
     assert reads == [0]
 
 
-def test_direct_binding_keeps_original_dynamic_signature_read_order():
+def test_binding_keeps_dynamic_signature_read_order():
     reads = []
 
     class CustomSignature(inspect.Signature):
@@ -421,7 +375,7 @@ def test_source_record_cache_preserves_hash_encoding():
     )
 
 
-def test_no_constexpr_plan_rechecks_declarations_and_helper(monkeypatch):
+def test_constexpr_plan_rechecks_declarations_and_helper(monkeypatch):
     from pypto.jit import _call_binding  # noqa: PLC0415
 
     @pl.jit.inline
@@ -447,11 +401,11 @@ def test_no_constexpr_plan_rechecks_declarations_and_helper(monkeypatch):
 
     first = resolve()
     second = resolve()
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert second.call_targets == first.call_targets
     helper._func.__annotations__["n"] = pl.constexpr
     plan = resolve()
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert plan.binding[(id(helper._func), (("n", "16"),))] == {"n": "16"}
     helper._func.__annotations__["n"] = pl.Scalar[pl.INT32]
     assert resolve().call_targets == first.call_targets
@@ -461,7 +415,7 @@ def test_no_constexpr_plan_rechecks_declarations_and_helper(monkeypatch):
         return pl.add(x, x)
 
     rebound = resolve()
-    assert len(calls) == 3
+    assert len(calls) == 5
     assert helper in rebound.jit_func.values()
     assert rebound.call_targets != first.call_targets
 

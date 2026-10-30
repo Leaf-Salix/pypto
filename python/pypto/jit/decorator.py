@@ -84,7 +84,7 @@ from pypto.pypto_core import passes as _passes
 from pypto.pypto_core.passes import runtime_kind_to_name
 
 from . import _arguments, _ast_analysis, _call_binding, _tensor_meta
-from ._source import cache_in_snapshot, capture_namespaces, function_parameters, function_signature
+from ._source import cache_in_snapshot, capture_namespaces, function_signature
 from .cache import CacheKey, compute_source_hash, make_cache_key
 from .specializer import (
     DynDim,
@@ -383,7 +383,6 @@ class _CachedDepGraph:
     layout_dependencies: tuple[tuple[Any, tuple[str, ...]], ...]
     layouts: _CachedLayouts | None = None
     persistent_source_hash: str | None = None
-    no_constexpr_plan: _call_binding.VariantPlan | None = None
 
 
 @functools.lru_cache(maxsize=512)
@@ -703,31 +702,8 @@ class JITFunction:
         Returns:
             The request's :class:`VariantPlan`
         """
-        state = self._get_dep_graph_state()
-        deps_topo, callers_by_id, _, _ = state.graph
-        # Always read current declarations, including postponed annotations.
-        # Caching only graph identity would miss a parameter becoming constexpr.
-        signatures: dict[int, tuple[list[str], list[str]]] = {}
-        reusable = not entry_constexpr
-        if reusable:
-            for index in range(len(deps_topo) - 1, -1, -1):
-                dep = deps_topo[index]
-                signature = (_arguments.constexpr_params(dep._func), dep._param_names())
-                signatures[index] = signature
-                if signature[0]:
-                    # Stop before later annotations: constexpr expressions may
-                    # affect their evaluation. The ordinary walk resumes here.
-                    reusable = False
-                    break
-        if reusable and state.no_constexpr_plan is not None:
-            return state.no_constexpr_plan
-        plan = _call_binding.expand_constexpr_variants(
-            self, deps_topo, callers_by_id, entry_constexpr, signatures=signatures
-        )
-        if reusable:
-            # Construct completely before publication; readers never mutate plans.
-            state.no_constexpr_plan = plan
-        return plan
+        deps_topo, callers_by_id, _, _ = self._get_dep_graph()
+        return _call_binding.expand_constexpr_variants(self, deps_topo, callers_by_id, entry_constexpr)
 
     def _constexpr_identity_records(self, plan: _call_binding.VariantPlan) -> list[tuple[Any, ...]]:
         """Flatten a variant plan into deterministic cache-identity records.
@@ -824,11 +800,7 @@ class JITFunction:
     # ------------------------------------------------------------------
 
     def _param_names(self) -> list[str]:
-        sig = function_signature(self._func)
-        structure = function_parameters(self._func, sig)
-        if structure is not None:
-            return [name for name, _ in structure.declarations]
-        return [p for p in sig.parameters if p != "self"]
+        return [p for p in function_signature(self._func).parameters if p != "self"]
 
     def _bind_args(
         self, args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -863,24 +835,13 @@ class JITFunction:
         """
         param_names = self._param_names()
         sig = function_signature(self._func)
-        structure = function_parameters(self._func, sig)
-        if (
-            structure is not None
-            and structure.all_positional
-            and not kwargs
-            and len(args) == len(structure.names)
-        ):
-            # Every declared slot is supplied exactly once. No defaults or
-            # keyword/variadic rules remain to resolve; retain inspect.bind for
-            # all other forms and for its existing error diagnostics.
-            arguments = dict(zip(structure.names, args, strict=True))
-        else:
-            try:
-                bound = sig.bind(*args, **kwargs)
-                bound.apply_defaults()
-            except TypeError as e:
-                raise TypeError(f"@pl.jit function '{self.__name__}': {e}") from e
-            arguments = dict(bound.arguments)
+        try:
+            bound = sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+        except TypeError as e:
+            raise TypeError(f"@pl.jit function '{self.__name__}': {e}") from e
+
+        arguments = dict(bound.arguments)
 
         deps, callers_by_id, _, call_args_cache = self._get_dep_graph()
         per_func_dyn_maps = _call_binding.compute_per_func_dyndim_maps(

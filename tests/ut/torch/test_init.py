@@ -9,7 +9,6 @@
 
 """Public initialization preflight and optional-dependency isolation."""
 
-import builtins
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -169,7 +168,7 @@ def test_native_loader_reports_missing_and_incomplete_adapter(monkeypatch):
 
 
 def test_native_loader_preserves_internal_dependency_error(monkeypatch):
-    original = builtins.__import__
+    original = launch.importlib.import_module
     error = ModuleNotFoundError("Missing adapter dependency", name="adapter_dependency")
 
     def import_module(name, *args, **kwargs):
@@ -177,7 +176,7 @@ def test_native_loader_preserves_internal_dependency_error(monkeypatch):
             raise error
         return original(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", import_module)
+    monkeypatch.setattr(launch.importlib, "import_module", import_module)
     with pytest.raises(ModuleNotFoundError, match="Missing adapter dependency") as caught:
         launch._load_native()
     assert caught.value is error

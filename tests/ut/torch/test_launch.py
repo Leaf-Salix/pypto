@@ -336,7 +336,7 @@ def test_close_can_finish_queued_callback_without_admission_lock_deadlock(eager_
     assert env.state.state is KernelState.CLOSED
 
 
-def test_previous_failure_prevents_preparation_with_reused_session_resources(eager_env, prepared):
+def test_previous_failure_prevents_argument_preparation(eager_env, prepared):
     env = eager_env
     _invoke(env, prepared)
     env.run_queue()

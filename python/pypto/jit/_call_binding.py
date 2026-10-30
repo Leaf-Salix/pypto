@@ -323,9 +323,8 @@ class VariantPlan:
     A ``pl.constexpr`` argument is folded into the callee's body, so two call
     sites passing different constants need two different generated functions.
     This plan is the expansion of the (constexpr-independent, cached) dep graph
-    into those per-binding functions. Plans are read-only after construction;
-    constexpr bindings are resolved per request, while a validated dependency
-    graph may reuse a plan when no constexpr is declared.
+    into those per-binding functions, computed fresh per request because the
+    entry's own binding seeds it.
 
     Attributes:
         order: Every variant in leaf-first order, entry last — the order the
@@ -381,8 +380,6 @@ def expand_constexpr_variants(
     deps_topo: "Sequence[JITFunction]",
     callers_by_id: Mapping[int, Sequence[tuple[Any, str]]],
     entry_constexpr: Mapping[str, str],
-    *,
-    signatures: Mapping[int, tuple[list[str], list[str]]] | None = None,
 ) -> VariantPlan:
     """Expand the dep graph into one generated function per compile-time binding.
 
@@ -398,7 +395,6 @@ def expand_constexpr_variants(
         deps_topo: Every reachable dep, leaf-first
         callers_by_id: ``id(dep func) -> [(caller func, call name), ...]``
         entry_constexpr: The entry's own resolved binding
-        signatures: Already resolved declarations keyed by deps_topo index
 
     Returns:
         The full :class:`VariantPlan` for this request
@@ -417,17 +413,12 @@ def expand_constexpr_variants(
     )
     variants_by_func: dict[int, list[VariantKey]] = {id(entry._func): [entry_key]}
 
-    for index in range(len(deps_topo) - 1, -1, -1):
-        dep = deps_topo[index]
+    for dep in reversed(deps_topo):
         # Both lists cost a full ``inspect.signature`` with annotation
         # resolution, so they are derived once per dep rather than per call
         # site. A dep declaring no constexpr parameter cannot split at all, and
         # skips call-site folding entirely.
-        signature = (
-            signatures[index]
-            if signatures is not None and index in signatures
-            else (_arguments.constexpr_params(dep._func), dep._param_names())
-        )
+        signature = (_arguments.constexpr_params(dep._func), dep._param_names())
         splits = bool(signature[0])
         for caller_func, call_name in callers_by_id.get(id(dep._func), ()):
             caller_globals = func_name_lookup(caller_func)
