@@ -77,11 +77,14 @@ for h in (8192, 131072):
                     report["execution_config"]["path"] == "kernel_eager"
                     and report["execution_config"]["pto_runtime"] == "host_build_graph"
                 )
-                for n, x in m["loaded_modules"].items():
-                    if x["path"].endswith(".py"):
-                        prefix = f"/versions/{v}/python/"
-                        assert prefix in x["path"]
-                        assert x["sha256"] == expected[v][x["path"].split(prefix)[1]]
+                init_path = Path(m["loaded_modules"]["pypto"]["path"])
+                assert init_path.as_posix().endswith("/pypto/__init__.py")
+                source_root = init_path.parents[1]
+                for x in m["loaded_modules"].values():
+                    path = Path(x["path"])
+                    if path.suffix == ".py":
+                        assert path.is_relative_to(source_root), (path, source_root)
+                        assert x["sha256"] == expected[v][str(path.relative_to(source_root))]
                 ident = json.loads((p / "identity.json").read_text())
                 assert ident["environment"]["ASCEND_RT_VISIBLE_DEVICES"] == args.device
                 assert int(ident["environment"]["TASK_QUEUE_ENABLE"]) == q

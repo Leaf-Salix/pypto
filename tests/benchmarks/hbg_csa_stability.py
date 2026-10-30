@@ -348,7 +348,7 @@ def install_paired_measurement(case: Any, root: Any, args: Any) -> None:
     ).get_process_kernel_state
 
     contexts: dict[str, Any] = {}
-    native_result: dict[str, Any] = {"us_p50": 1.0}
+    native_result: dict[str, Any] = {"us_p50": float("nan")}
 
     def capture(fixture: Any, run: Any, output: Any, topk: Any, reference: Any, **kwargs: Any) -> Any:
         name = "native" if not contexts else "pto"
@@ -464,7 +464,7 @@ def install_paired_measurement(case: Any, root: Any, args: Any) -> None:
             del root._compile
             npu.synchronize()
             state.drain()
-        result = {"method": "paired_eager_host", "metadata": "produce", "us_p50": 1.0}
+        result = {"method": "paired_eager_host", "metadata": "produce", "us_p50": float("nan")}
         if args.mode == "paired":
             native_result.update(result, us_p50=statistics.median(row["host_us"] for row in rows["native"]))
             result["us_p50"] = statistics.median(row["host_us"] for row in rows["pto"])
